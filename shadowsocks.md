@@ -51,16 +51,16 @@ Shadowsocks-Rust
 安装或配置时会依次询问端口、加密方式、传输模式和预共享密钥（PSK）；回车保持当前值或使用默认 PSK。
 
 ```text
-加密(2022) [2022-blake3-aes-128-gcm]
-[1] AES-128-GCM (16B PSK)
-[2] AES-256-GCM (32B PSK)
-[3] ChaCha20 (32B PSK)
+加密 [2022-blake3-aes-128-gcm]
+[1] AES-128-GCM
+[2] AES-256-GCM
+[3] ChaCha20
 选择 [回车不变]:
 
 确认卸载
 [1] 确认
 [0] 取消
-选择:
+选择 [1/0]:
 ```
 
 仅使用 Shadowsocks 2022 的三种加密方式：

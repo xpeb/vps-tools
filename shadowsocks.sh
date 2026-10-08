@@ -310,10 +310,10 @@ valid_key() {
 choose_method() {
     local current="${1:-$DEFAULT_METHOD}" choice
     is_2022_method "$current" || current="$DEFAULT_METHOD"
-    printf '\n加密(2022) [%s]\n' "$current"
-    printf '[1] AES-128-GCM (16B PSK)\n'
-    printf '[2] AES-256-GCM (32B PSK)\n'
-    printf '[3] ChaCha20 (32B PSK)\n'
+    printf '\n加密 [%s]\n' "$current"
+    printf '[1] AES-128-GCM\n'
+    printf '[2] AES-256-GCM\n'
+    printf '[3] ChaCha20\n'
     while :; do
         read -r -p '选择 [回车不变]: ' choice || return 1
         case "$choice" in
@@ -321,7 +321,7 @@ choose_method() {
             1) SET_METHOD='2022-blake3-aes-128-gcm'; return 0 ;;
             2) SET_METHOD='2022-blake3-aes-256-gcm'; return 0 ;;
             3) SET_METHOD='2022-blake3-chacha20-poly1305'; return 0 ;;
-            *) printf '无效选择，请输入 1-3。\n' ;;
+            *) printf '无效选项。\n' ;;
         esac
     done
 }
@@ -339,13 +339,13 @@ choose_mode() {
             1) SET_MODE='tcp_only'; return 0 ;;
             2) SET_MODE='udp_only'; return 0 ;;
             3) SET_MODE='tcp_and_udp'; return 0 ;;
-            *) printf '无效选择，请输入 1-3。\n' ;;
+            *) printf '无效选项。\n' ;;
         esac
     done
 }
 
 ask_config() {
-    local old_port old_password old_method old_mode value default_key current_method
+    local old_port old_password old_method old_mode value default_key current_method key_hint
     old_port=$(cfg server_port)
     old_password=$(cfg password)
     old_method=$(cfg method)
@@ -366,12 +366,14 @@ ask_config() {
     choose_mode "${old_mode:-$DEFAULT_MODE}" || return 1
     if valid_key "$SET_METHOD" "$old_password"; then
         default_key="$old_password"
+        key_hint='保持'
     else
         default_key=$(generate_key "$SET_METHOD") || return 1
+        key_hint='生成'
     fi
 
     while :; do
-        read -r -s -p 'PSK [回车默认]: ' value || return 1
+        read -r -s -p "PSK [回车$key_hint]: " value || return 1
         printf '\n'
         value=${value:-$default_key}
         if valid_key "$SET_METHOD" "$value"; then
@@ -536,10 +538,10 @@ show_info() {
     fi
     [ -n "$ip4" ] || ip4='-'
 
-    printf '\n配置\n状态  %s\n版本  %s\n地址  %s\n' \
-        "$(svc status && printf '运行中' || printf '已停止')" "$(version)" "$ip4"
+    printf '\n状态  %s  %s\n' \
+        "$(svc status && printf '运行中' || printf '已停止')" "$(version)"
+    printf '地址  %s\n端口  %s\n加密  %s\n模式  %s\n' "$ip4" "$port" "$method" "$mode"
     [ -n "$ip6" ] && printf 'IPv6  %s\n' "$ip6"
-    printf '端口  %s（TCP/UDP）\n加密  %s\n模式  %s\n' "$port" "$method" "$mode"
 
     if [ "$ip4" != '-' ]; then
         host="$ip4"
@@ -567,7 +569,7 @@ uninstall_app() {
     printf '\n确认卸载\n'
     printf '[1] 确认\n'
     printf '[0] 取消\n'
-    read -r -p '选择: ' value || return 1
+    read -r -p '选择 [1/0]: ' value || return 1
     case "$value" in
         1|y|Y|yes|YES) ;;
         0|''|n|N|no|NO) printf '已取消。\n'; return ;;
@@ -591,7 +593,7 @@ status_line() {
 
 pause_menu() {
     printf '\n'
-    read -r -p '回车继续: ' _ || true
+    read -r -p '回车返回: ' _ || true
 }
 
 menu() {
@@ -604,7 +606,7 @@ menu() {
         printf '[4] 启动  [5] 停止  [6] 重启\n'
         printf '[7] 信息  [8] 日志  [9] 卸载\n'
         printf '[0] 退出\n\n'
-        read -r -p '选择: ' choice || break
+        read -r -p '选择 [0-9]: ' choice || break
         case "$choice" in
             1) install_app; pause_menu ;;
             2) configure_app; pause_menu ;;
@@ -616,7 +618,7 @@ menu() {
             8) show_logs; pause_menu ;;
             9) uninstall_app; pause_menu ;;
             0) break ;;
-            *) printf '无效选择。\n'; pause_menu ;;
+            *) printf '无效选项。\n'; pause_menu ;;
         esac
     done
 }
