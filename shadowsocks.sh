@@ -499,9 +499,11 @@ menu() {
         [ -t 1 ] && printf '\033[2J\033[H'
         printf '\nShadowsocks-Rust\n'
         status_line
-        printf '\n[1] 安装/配置  [2] 更新  [3] 启动  [4] 停止\n'
-        printf '[5] 重启       [6] 配置    [7] 日志  [8] 卸载\n'
-        printf '[0] 退出\n\n'
+        printf '\n  [1] 安装/配置     [2] 更新\n'
+        printf '  [3] 启动          [4] 停止\n'
+        printf '  [5] 重启          [6] 配置\n'
+        printf '  [7] 日志          [8] 卸载\n'
+        printf '  [0] 退出\n\n'
         read -r -p '选择: ' choice || break
         case "$choice" in
             1) setup; pause_menu ;;
