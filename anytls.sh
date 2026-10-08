@@ -48,6 +48,7 @@ cfg() {
     case "$1" in
         port) sed -n 's/^ANYTLS_PORT=//p' "$ENV_FILE" ;;
         password) sed -n 's/^ANYTLS_PASSWORD=//p' "$ENV_FILE" ;;
+        sni) sed -n 's/^ANYTLS_SNI=//p' "$ENV_FILE" ;;
     esac
 }
 
@@ -66,7 +67,8 @@ save_config() {
     local temp
     mkdir -p "$BASE_DIR" || return 1
     temp=$(mktemp "$BASE_DIR/config.XXXXXX") || return 1
-    if ! printf 'ANYTLS_PORT=%s\nANYTLS_PASSWORD=%s\n' "$1" "$2" > "$temp"; then
+    if ! printf 'ANYTLS_PORT=%s\nANYTLS_SNI=%s\nANYTLS_PASSWORD=%s\n' \
+        "$1" "$2" "$3" > "$temp"; then
         rm -f "$temp"
         return 1
     fi
@@ -91,6 +93,20 @@ valid_tag() {
 
 valid_password() {
     [[ "${1:-}" =~ ^[A-Za-z0-9._~-]{8,128}$ ]]
+}
+
+valid_sni() {
+    local value="${1:-}" label
+    local -a labels
+    [ -z "$value" ] && return 0
+    ((${#value} <= 253)) || return 1
+    [[ "$value" != .* && "$value" != *. && "$value" != *..* ]] || return 1
+    local IFS=.
+    read -r -a labels <<< "$value"
+    for label in "${labels[@]}"; do
+        ((${#label} <= 63)) || return 1
+        [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+    done
 }
 
 random_password() {
@@ -180,8 +196,9 @@ version_newer() {
 }
 
 choose_config() {
-    local old_port old_password value default_password
+    local old_port old_sni old_password value default_password
     old_port=$(cfg port)
+    old_sni=$(cfg sni)
     old_password=$(cfg password)
 
     while :; do
@@ -192,6 +209,24 @@ choose_config() {
             break
         fi
         printf '端口无效（1-65535）。\n'
+    done
+
+    while :; do
+        if [ -n "$old_sni" ]; then
+            read -r -p "SNI [$old_sni]（回车保持，- 清除）: " value || return 1
+            if [ "$value" = '-' ]; then
+                value=''
+            elif [ -z "$value" ]; then
+                value="$old_sni"
+            fi
+        else
+            read -r -p 'SNI [可选，回车关闭]: ' value || return 1
+        fi
+        if valid_sni "$value"; then
+            SET_SNI="$value"
+            break
+        fi
+        printf 'SNI 无效，请输入合法域名（例如 www.example.com）。\n'
     done
 
     default_password=${old_password:-$(random_password)}
@@ -324,7 +359,7 @@ apply_config() {
             return 1
         fi
     fi
-    save_config "$SET_PORT" "$SET_PASSWORD" || {
+    save_config "$SET_PORT" "$SET_SNI" "$SET_PASSWORD" || {
         clean_tmp
         error '配置文件写入失败。'
         return 1
@@ -436,11 +471,15 @@ restart_app() {
 }
 
 show_info() {
-    local port password ip4 ip6 host
+    local port sni password ip4 ip6 host query
     [ -r "$ENV_FILE" ] || { error '配置文件不存在。'; return 1; }
     port=$(cfg port)
+    sni=$(cfg sni)
     password=$(cfg password)
-    ip4=''; ip6=''
+    ip4=''; ip6=''; query=''
+    if [ -n "$sni" ]; then
+        query="/?sni=$sni"
+    fi
     if has curl; then
         ip4=$(curl -4fsS --max-time 3 https://api.ipify.org 2>/dev/null || true)
         ip6=$(curl -6fsS --max-time 3 https://api64.ipify.org 2>/dev/null || true)
@@ -451,13 +490,14 @@ show_info() {
     [ -n "$ip4" ] && printf 'IPv4  %s\n' "$ip4"
     [ -n "$ip6" ] && printf 'IPv6  %s\n' "$ip6"
     [ -n "$ip4" ] || [ -n "$ip6" ] || printf '地址  未知\n'
-    printf '端口  %s\n协议  AnyTLS\n密码  %s\n' "$port" "$password"
+    printf '端口  %s\nSNI   %s\n协议  AnyTLS\n密码  %s\n' \
+        "$port" "${sni:-未设置}" "$password"
     if [ -n "$ip4" ]; then
-        printf 'IPv4链接  anytls://%s@%s:%s\n' "$password" "$ip4" "$port"
+        printf 'IPv4链接  anytls://%s@%s:%s%s\n' "$password" "$ip4" "$port" "$query"
     fi
     if [ -n "$ip6" ]; then
         host="[$ip6]"
-        printf 'IPv6链接  anytls://%s@%s:%s\n' "$password" "$host" "$port"
+        printf 'IPv6链接  anytls://%s@%s:%s%s\n' "$password" "$host" "$port" "$query"
     fi
     [ -n "$ip4" ] || [ -n "$ip6" ] || printf '链接  无公网地址，请手动替换服务器 IP。\n'
     printf '提示  请确认云防火墙已放行 %s/tcp。\n' "$port"
