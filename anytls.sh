@@ -66,6 +66,7 @@ cfg() {
     case "$1" in
         port) sed -n 's/^ANYTLS_PORT=//p' "$ENV_FILE" ;;
         password) sed -n 's/^ANYTLS_PASSWORD=//p' "$ENV_FILE" ;;
+        tls_mode) sed -n 's/^ANYTLS_TLS_MODE=//p' "$ENV_FILE" ;;
         domain) sed -n 's/^ANYTLS_DOMAIN=//p' "$ENV_FILE" ;;
         email) sed -n 's/^ANYTLS_EMAIL=//p' "$ENV_FILE" ;;
         backend_port) sed -n 's/^ANYTLS_BACKEND_PORT=//p' "$ENV_FILE" ;;
@@ -87,8 +88,8 @@ save_config() {
     local temp
     mkdir -p "$BASE_DIR" || return 1
     temp=$(mktemp "$BASE_DIR/config.XXXXXX") || return 1
-    if ! printf 'ANYTLS_PORT=%s\nANYTLS_DOMAIN=%s\nANYTLS_EMAIL=%s\nANYTLS_BACKEND_PORT=%s\nANYTLS_PASSWORD=%s\n' \
-        "$1" "$2" "$3" "$4" "$5" > "$temp"; then
+    if ! printf 'ANYTLS_PORT=%s\nANYTLS_TLS_MODE=%s\nANYTLS_DOMAIN=%s\nANYTLS_EMAIL=%s\nANYTLS_BACKEND_PORT=%s\nANYTLS_PASSWORD=%s\n' \
+        "$1" "$2" "$3" "$4" "$5" "$6" > "$temp"; then
         rm -f "$temp"
         return 1
     fi
@@ -231,11 +232,16 @@ version_newer() {
 }
 
 choose_config() {
-    local old_port old_domain old_email old_password value default_password
+    local old_port old_mode old_domain old_email old_password value default_password default_mode
     old_port=$(cfg port)
+    old_mode=$(cfg tls_mode)
     old_domain=$(cfg domain)
     old_email=$(cfg email)
     old_password=$(cfg password)
+    if [ -z "$old_mode" ]; then
+        [ -n "$old_domain" ] && old_mode='acme' || old_mode='self_signed'
+    fi
+    [ "$old_mode" = acme ] && default_mode=2 || default_mode=1
 
     while :; do
         read -r -p "端口 [${old_port:-$DEFAULT_PORT}]: " value || return 1
@@ -248,36 +254,55 @@ choose_config() {
     done
 
     while :; do
-        if [ -n "$old_domain" ]; then
-            read -r -p "域名 [$old_domain]（回车保持）: " value || return 1
-            value=${value:-$old_domain}
-        else
-            read -r -p '域名（必须已解析到本机）: ' value || return 1
-        fi
-        if valid_domain "$value"; then
-            SET_DOMAIN="$value"
-            break
-        fi
-        printf '域名无效，请输入已解析到本机的合法域名。\n'
+        printf '证书方式\n'
+        printf '[1] 自签名（官方自动生成）\n'
+        printf '[2] ACME（Let\x27s Encrypt）\n'
+        read -r -p "选择 [1/2] [$default_mode]: " value || return 1
+        value=${value:-$default_mode}
+        case "$value" in
+            1) SET_TLS_MODE='self_signed'; break ;;
+            2) SET_TLS_MODE='acme'; break ;;
+            *) printf '无效选项，请选择 1 或 2。\n' ;;
+        esac
     done
 
-    while :; do
-        if [ -n "$old_email" ]; then
-            read -r -p "ACME 邮箱 [$old_email]（回车保持，- 清除）: " value || return 1
-            if [ "$value" = '-' ]; then
-                value=''
-            elif [ -z "$value" ]; then
-                value="$old_email"
+    SET_DOMAIN=''
+    SET_EMAIL=''
+    SET_BACKEND_PORT=''
+    if [ "$SET_TLS_MODE" = acme ]; then
+        while :; do
+            if [ -n "$old_domain" ]; then
+                read -r -p "域名 [$old_domain]（回车保持）: " value || return 1
+                value=${value:-$old_domain}
+            else
+                read -r -p '域名（必须已解析到本机）: ' value || return 1
             fi
-        else
-            read -r -p 'ACME 邮箱（可选，回车跳过）: ' value || return 1
-        fi
-        if valid_email "$value"; then
-            SET_EMAIL="$value"
-            break
-        fi
-        printf '邮箱格式无效。\n'
-    done
+            if valid_domain "$value"; then
+                SET_DOMAIN="$value"
+                break
+            fi
+            printf '域名无效，请输入已解析到本机的合法域名。\n'
+        done
+
+        while :; do
+            if [ -n "$old_email" ]; then
+                read -r -p "ACME 邮箱 [$old_email]（回车保持，- 清除）: " value || return 1
+                if [ "$value" = '-' ]; then
+                    value=''
+                elif [ -z "$value" ]; then
+                    value="$old_email"
+                fi
+            else
+                read -r -p 'ACME 邮箱（可选，回车跳过）: ' value || return 1
+            fi
+            if valid_email "$value"; then
+                SET_EMAIL="$value"
+                break
+            fi
+            printf '邮箱格式无效。\n'
+        done
+        SET_BACKEND_PORT=$(backend_port_for "$SET_PORT")
+    fi
 
     default_password=${old_password:-$(random_password)}
     while :; do
@@ -289,7 +314,6 @@ choose_config() {
         fi
         printf '密码无效，请使用 8-128 位字母、数字或 . _ ~ -。\n'
     done
-    SET_BACKEND_PORT=$(backend_port_for "$SET_PORT")
 }
 
 ensure_haproxy() {
@@ -518,6 +542,22 @@ issue_certificate() {
     }
 }
 
+tls_mode() {
+    local mode
+    mode=$(cfg tls_mode)
+    case "$mode" in
+        acme) printf 'acme' ;;
+        self_signed) printf 'self_signed' ;;
+        *)
+            [ -n "$(cfg domain)" ] && printf 'acme' || printf 'self_signed'
+            ;;
+    esac
+}
+
+service_uses_proxy() {
+    [ "$(tls_mode)" = acme ]
+}
+
 proxy_pid() {
     local pid cmd
     [ -s "$PROXY_PID_FILE" ] || return 1
@@ -545,21 +585,38 @@ stop_direct_pid() {
 }
 
 svc() {
-    local action="$1" b port backend password
+    local action="$1" b port backend password listen
     b=$(backend)
     case "$action/$b" in
         status/systemd)
-            systemctl is-active --quiet "$APP" && systemctl is-active --quiet "$PROXY_APP"
+            if service_uses_proxy; then
+                systemctl is-active --quiet "$APP" && systemctl is-active --quiet "$PROXY_APP"
+            else
+                systemctl is-active --quiet "$APP"
+            fi
             ;;
         status/openrc)
-            rc-service "$APP" status >/dev/null 2>&1 && rc-service "$PROXY_APP" status >/dev/null 2>&1
+            if service_uses_proxy; then
+                rc-service "$APP" status >/dev/null 2>&1 && rc-service "$PROXY_APP" status >/dev/null 2>&1
+            else
+                rc-service "$APP" status >/dev/null 2>&1
+            fi
             ;;
         status/direct)
-            server_pid >/dev/null && proxy_pid >/dev/null
+            if service_uses_proxy; then
+                server_pid >/dev/null && proxy_pid >/dev/null
+            else
+                server_pid >/dev/null
+            fi
             ;;
 
         install/systemd)
-            ensure_haproxy || return 1
+            if service_uses_proxy; then
+                ensure_haproxy || return 1
+                listen="127.0.0.1:\${ANYTLS_BACKEND_PORT}"
+            else
+                listen=":\${ANYTLS_PORT}"
+            fi
             cat > "$SYSTEMD_UNIT" <<EOF
 [Unit]
 Description=AnyTLS Server
@@ -569,7 +626,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=$ENV_FILE
-ExecStart=$BIN -l 127.0.0.1:\${ANYTLS_BACKEND_PORT} -p \${ANYTLS_PASSWORD}
+ExecStart=$BIN -l $listen -p \${ANYTLS_PASSWORD}
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=512000
@@ -577,7 +634,8 @@ LimitNOFILE=512000
 [Install]
 WantedBy=multi-user.target
 EOF
-            cat > "$PROXY_SYSTEMD_UNIT" <<EOF
+            if service_uses_proxy; then
+                cat > "$PROXY_SYSTEMD_UNIT" <<EOF
 [Unit]
 Description=AnyTLS TLS Frontend
 Requires=$APP.service
@@ -594,17 +652,30 @@ LimitNOFILE=512000
 [Install]
 WantedBy=multi-user.target
 EOF
+            else
+                systemctl disable --now "$PROXY_APP" >/dev/null 2>&1 || true
+                rm -f "$PROXY_SYSTEMD_UNIT"
+            fi
             systemctl daemon-reload || return 1
-            systemctl enable "$APP" "$PROXY_APP" >/dev/null 2>&1 || return 1
+            if service_uses_proxy; then
+                systemctl enable "$APP" "$PROXY_APP" >/dev/null 2>&1 || return 1
+            else
+                systemctl enable "$APP" >/dev/null 2>&1 || return 1
+            fi
             ;;
         install/openrc)
-            ensure_haproxy || return 1
+            if service_uses_proxy; then
+                ensure_haproxy || return 1
+                listen="127.0.0.1:\${ANYTLS_BACKEND_PORT}"
+            else
+                listen=":\${ANYTLS_PORT}"
+            fi
             cat > "$OPENRC_UNIT" <<EOF
 #!/sbin/openrc-run
 . "$ENV_FILE"
 name="AnyTLS"
 command="$BIN"
-command_args="-l 127.0.0.1:\${ANYTLS_BACKEND_PORT} -p \${ANYTLS_PASSWORD}"
+command_args="-l $listen -p \${ANYTLS_PASSWORD}"
 supervisor="supervise-daemon"
 supervise_daemon_args="--stdout $LOG_FILE --stderr $LOG_FILE"
 pidfile="$PID_FILE"
@@ -613,7 +684,10 @@ depend() {
     need net
 }
 EOF
-            cat > "$PROXY_OPENRC_UNIT" <<EOF
+            chmod 755 "$OPENRC_UNIT" || return 1
+            rc-update add "$APP" default >/dev/null 2>&1 || return 1
+            if service_uses_proxy; then
+                cat > "$PROXY_OPENRC_UNIT" <<EOF
 #!/sbin/openrc-run
 name="AnyTLS TLS Frontend"
 command="$HAPROXY_BIN"
@@ -627,39 +701,67 @@ depend() {
     need $APP
 }
 EOF
-            chmod 755 "$OPENRC_UNIT" "$PROXY_OPENRC_UNIT" || return 1
-            rc-update add "$APP" default >/dev/null 2>&1 || return 1
-            rc-update add "$PROXY_APP" default >/dev/null 2>&1 || return 1
+                chmod 755 "$PROXY_OPENRC_UNIT" || return 1
+                rc-update add "$PROXY_APP" default >/dev/null 2>&1 || return 1
+            else
+                rc-service "$PROXY_APP" stop >/dev/null 2>&1 || true
+                rc-update del "$PROXY_APP" default >/dev/null 2>&1 || true
+                rm -f "$PROXY_OPENRC_UNIT"
+            fi
             ;;
         install/direct)
-            ensure_haproxy
+            if service_uses_proxy; then
+                ensure_haproxy
+            else
+                stop_direct_pid "$PROXY_PID_FILE" proxy_pid
+            fi
             ;;
 
         start/systemd)
-            systemctl start "$APP" && systemctl start "$PROXY_APP" && svc status
+            systemctl start "$APP" || return 1
+            if service_uses_proxy; then
+                systemctl start "$PROXY_APP" || return 1
+            else
+                systemctl stop "$PROXY_APP" >/dev/null 2>&1 || true
+            fi
+            svc status
             ;;
         start/openrc)
-            rc-service "$APP" start && rc-service "$PROXY_APP" start && svc status
+            rc-service "$APP" start || return 1
+            if service_uses_proxy; then
+                rc-service "$PROXY_APP" start || return 1
+            else
+                rc-service "$PROXY_APP" stop >/dev/null 2>&1 || true
+            fi
+            svc status
             ;;
         start/direct)
-            ensure_haproxy || return 1
+            if service_uses_proxy; then
+                ensure_haproxy || return 1
+            else
+                stop_direct_pid "$PROXY_PID_FILE" proxy_pid
+            fi
             svc status && return 0
             port=$(cfg port)
-            backend=$(cfg backend_port)
             password=$(cfg password)
-            [ -n "$port" ] && [ -n "$backend" ] && [ -n "$password" ] || return 1
+            [ -n "$port" ] && [ -n "$password" ] || return 1
+            if service_uses_proxy; then
+                backend=$(cfg backend_port)
+                [ -n "$backend" ] || return 1
+                listen="127.0.0.1:$backend"
+            else
+                listen=":$port"
+            fi
             if ! server_pid >/dev/null; then
                 rm -f "$PID_FILE"
                 mkdir -p "${LOG_FILE%/*}" "${PID_FILE%/*}"
-                nohup "$BIN" -l "127.0.0.1:$backend" -p "$password" \
+                nohup "$BIN" -l "$listen" -p "$password" \
                     >>"$LOG_FILE" 2>&1 &
                 printf '%s\n' "$!" > "$PID_FILE"
                 sleep 1
             fi
-            if ! server_pid >/dev/null; then
-                return 1
-            fi
-            if ! proxy_pid >/dev/null; then
+            server_pid >/dev/null || return 1
+            if service_uses_proxy && ! proxy_pid >/dev/null; then
                 rm -f "$PROXY_PID_FILE"
                 mkdir -p "${PROXY_LOG_FILE%/*}" "${PROXY_PID_FILE%/*}"
                 nohup "$HAPROXY_BIN" -db -f "$HAPROXY_CFG" \
@@ -710,7 +812,7 @@ apply_config() {
             return 1
         fi
     fi
-    save_config "$SET_PORT" "$SET_DOMAIN" "$SET_EMAIL" "$SET_BACKEND_PORT" "$SET_PASSWORD" || {
+    save_config "$SET_PORT" "$SET_TLS_MODE" "$SET_DOMAIN" "$SET_EMAIL" "$SET_BACKEND_PORT" "$SET_PASSWORD" || {
         clean_tmp
         error '配置文件写入失败。'
         return 1
@@ -722,9 +824,14 @@ apply_config() {
             return 1
         }
     fi
-    ensure_haproxy || { clean_tmp; return 1; }
-    issue_certificate "$SET_DOMAIN" "$SET_EMAIL" || { clean_tmp; return 1; }
-    write_proxy_config || { clean_tmp; return 1; }
+    if [ "$SET_TLS_MODE" = acme ]; then
+        acme_packages || { clean_tmp; return 1; }
+        issue_certificate "$SET_DOMAIN" "$SET_EMAIL" || { clean_tmp; return 1; }
+        write_proxy_config || { clean_tmp; return 1; }
+    else
+        remove_acme_schedule
+        rm -f "$HAPROXY_CFG"
+    fi
     clean_tmp
     svc install || { error '服务配置写入失败。'; return 1; }
     if svc start; then
@@ -757,15 +864,19 @@ configure_app() {
 }
 
 update_app() {
-    local latest current
+    local latest current mode
     packages || return 1
     if [ ! -x "$BIN" ] || [ ! -r "$ENV_FILE" ]; then
         error '尚未安装，请先选择“安装”。'
         return 1
     fi
-    if [ -z "$(cfg domain)" ] || [ -z "$(cfg backend_port)" ]; then
-        error '当前安装缺少 ACME 配置，请先选择“配置”。'
-        return 1
+    mode=$(tls_mode)
+    if [ "$mode" = acme ]; then
+        acme_packages || return 1
+        if [ -z "$(cfg domain)" ] || [ -z "$(cfg backend_port)" ]; then
+            error '当前 ACME 配置不完整，请先选择“配置”。'
+            return 1
+        fi
     fi
     release_info || return 1
     latest="$RELEASE_TAG"
@@ -797,18 +908,27 @@ update_app() {
 }
 
 start_app() {
+    local mode
     packages || return 1
-    if [ ! -x "$BIN" ] || [ ! -r "$ENV_FILE" ] || [ -z "$(cfg domain)" ]; then
+    if [ ! -x "$BIN" ] || [ ! -r "$ENV_FILE" ]; then
         error '尚未完成安装，请先选择“安装”或“配置”。'
         return 1
     fi
-    ensure_haproxy || return 1
-    if [ ! -s "$CERT_FILE" ] || [ ! -s "$KEY_FILE" ]; then
-        error 'ACME 证书不存在，请先选择“配置”。'
-        return 1
+    mode=$(tls_mode)
+    if [ "$mode" = acme ]; then
+        acme_packages || return 1
+        if [ -z "$(cfg domain)" ]; then
+            error 'ACME 域名未配置，请先选择“配置”。'
+            return 1
+        fi
+        ensure_haproxy || return 1
+        if [ ! -s "$CERT_FILE" ] || [ ! -s "$KEY_FILE" ]; then
+            error 'ACME 证书不存在，请先选择“配置”。'
+            return 1
+        fi
+        build_haproxy_pem || return 1
+        write_proxy_config || return 1
     fi
-    build_haproxy_pem || return 1
-    write_proxy_config || return 1
     svc install || { error '服务配置写入失败。'; return 1; }
     if svc start; then
         printf '服务已启动。\n'
@@ -824,14 +944,19 @@ stop_app() {
 }
 
 restart_app() {
+    local mode
     packages || return 1
-    if [ ! -x "$BIN" ] || [ ! -r "$ENV_FILE" ] || [ -z "$(cfg domain)" ]; then
+    if [ ! -x "$BIN" ] || [ ! -r "$ENV_FILE" ]; then
         error '尚未完成安装，请先选择“安装”或“配置”。'
         return 1
     fi
-    ensure_haproxy || return 1
-    build_haproxy_pem || return 1
-    write_proxy_config || return 1
+    mode=$(tls_mode)
+    if [ "$mode" = acme ]; then
+        acme_packages || return 1
+        ensure_haproxy || return 1
+        build_haproxy_pem || return 1
+        write_proxy_config || return 1
+    fi
     svc stop || { error '服务停止失败。'; return 1; }
     svc install || { error '服务配置写入失败。'; return 1; }
     if svc start; then
@@ -843,15 +968,21 @@ restart_app() {
 }
 
 show_info() {
-    local port domain password ip4 ip6 cert_expiry
+    local port mode domain password ip4 ip6 cert_expiry host
     [ -r "$ENV_FILE" ] || { error '配置文件不存在。'; return 1; }
     port=$(cfg port)
+    mode=$(tls_mode)
     domain=$(cfg domain)
     password=$(cfg password)
-    ip4=''; ip6=''; cert_expiry='未安装'
-    if [ -s "$CERT_FILE" ] && has openssl; then
-        cert_expiry=$(openssl x509 -in "$CERT_FILE" -noout -enddate 2>/dev/null || printf '无效')
-        cert_expiry=${cert_expiry#notAfter=}
+    ip4=''; ip6=''
+    if [ "$mode" = acme ]; then
+        cert_expiry='未安装'
+        if [ -s "$CERT_FILE" ] && has openssl; then
+            cert_expiry=$(openssl x509 -in "$CERT_FILE" -noout -enddate 2>/dev/null || printf '无效')
+            cert_expiry=${cert_expiry#notAfter=}
+        fi
+    else
+        cert_expiry='官方自动生成的自签名证书'
     fi
     if has curl; then
         ip4=$(curl -4fsS --max-time 3 https://api.ipify.org 2>/dev/null || true)
@@ -863,14 +994,24 @@ show_info() {
     [ -n "$ip4" ] && printf 'IPv4  %s\n' "$ip4"
     [ -n "$ip6" ] && printf 'IPv6  %s\n' "$ip6"
     [ -n "$ip4" ] || [ -n "$ip6" ] || printf '地址  未知\n'
-    printf '域名  %s\n端口  %s\n证书  %s\n协议  AnyTLS\n密码  %s\n' \
-        "${domain:-未设置}" "$port" "$cert_expiry" "$password"
-    if [ -n "$domain" ]; then
+    if [ "$mode" = acme ]; then
+        printf '模式  ACME\n域名  %s\n端口  %s\n证书  %s\n协议  AnyTLS\n密码  %s\n' \
+            "$domain" "$port" "$cert_expiry" "$password"
         printf '链接  anytls://%s@%s:%s\n' "$password" "$domain" "$port"
+        printf '提示  请确认 DNS 已指向本机，并放行 %s/tcp、80/tcp。\n' "$port"
     else
-        printf '链接  无域名配置，请先选择“配置”。\n'
+        printf '模式  自签名\n端口  %s\n证书  %s\n协议  AnyTLS\n密码  %s\n' \
+            "$port" "$cert_expiry" "$password"
+        if [ -n "$ip4" ]; then
+            printf 'IPv4链接  anytls://%s@%s:%s\n' "$password" "$ip4" "$port"
+        fi
+        if [ -n "$ip6" ]; then
+            host="[$ip6]"
+            printf 'IPv6链接  anytls://%s@%s:%s\n' "$password" "$host" "$port"
+        fi
+        [ -n "$ip4" ] || [ -n "$ip6" ] || printf '链接  无公网地址，请手动替换服务器 IP。\n'
+        printf '提示  请确认云防火墙已放行 %s/tcp。\n' "$port"
     fi
-    printf '提示  请确认 DNS 已指向本机，并放行 %s/tcp、80/tcp。\n' "$port"
 }
 
 show_logs() {
@@ -903,21 +1044,44 @@ uninstall_app() {
 
 packages() {
     local missing='' c
-    for c in curl jq unzip sha256sum haproxy openssl; do
+    for c in curl jq unzip sha256sum; do
         has "$c" || missing="$missing $c"
     done
     [ -z "$missing" ] && return 0
 
     if has apk; then
-        apk add --no-cache curl jq unzip coreutils haproxy openssl
+        apk add --no-cache curl jq unzip coreutils
     elif has apt-get; then
-        apt-get update -qq && apt-get install -y curl jq unzip coreutils haproxy openssl
+        apt-get update -qq && apt-get install -y curl jq unzip coreutils
     elif has dnf; then
-        dnf install -y curl jq unzip coreutils haproxy openssl
+        dnf install -y curl jq unzip coreutils
     elif has yum; then
-        yum install -y curl jq unzip coreutils haproxy openssl
+        yum install -y curl jq unzip coreutils
     elif has pacman; then
-        pacman -Sy --noconfirm curl jq unzip coreutils haproxy openssl
+        pacman -Sy --noconfirm curl jq unzip coreutils
+    else
+        error "缺少依赖:$missing，且未找到包管理器。"
+        return 1
+    fi
+}
+
+acme_packages() {
+    local missing='' c
+    for c in haproxy openssl; do
+        has "$c" || missing="$missing $c"
+    done
+    [ -z "$missing" ] && return 0
+
+    if has apk; then
+        apk add --no-cache haproxy openssl
+    elif has apt-get; then
+        apt-get update -qq && apt-get install -y haproxy openssl
+    elif has dnf; then
+        dnf install -y haproxy openssl
+    elif has yum; then
+        yum install -y haproxy openssl
+    elif has pacman; then
+        pacman -Sy --noconfirm haproxy openssl
     else
         error "缺少依赖:$missing，且未找到包管理器。"
         return 1
