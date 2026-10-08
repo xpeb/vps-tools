@@ -536,24 +536,25 @@ show_info() {
         ip4=$(curl -4fsS --max-time 3 https://api.ipify.org 2>/dev/null || true)
         ip6=$(curl -6fsS --max-time 3 https://api64.ipify.org 2>/dev/null || true)
     fi
-    [ -n "$ip4" ] || ip4='-'
 
     printf '\n状态  %s  %s\n' \
         "$(svc status && printf '运行中' || printf '已停止')" "$(version)"
-    printf '地址  %s\n端口  %s\n加密  %s\n模式  %s\n' "$ip4" "$port" "$method" "$mode"
+    [ -n "$ip4" ] && printf 'IPv4  %s\n' "$ip4"
     [ -n "$ip6" ] && printf 'IPv6  %s\n' "$ip6"
+    [ -n "$ip4" ] || [ -n "$ip6" ] || printf '地址  未知\n'
+    printf '端口  %s\n加密  %s\n模式  %s\n' "$port" "$method" "$mode"
 
-    if [ "$ip4" != '-' ]; then
+    if [ -n "$ip4" ]; then
         host="$ip4"
         raw="$method:$password@$host:$port"
-        printf '链接  ss://%s#ss-rust\n' "$(encode "$raw")"
+        printf 'IPv4链接  ss://%s#ss-rust-ipv4\n' "$(encode "$raw")"
     fi
     if [ -n "$ip6" ]; then
         host="[$ip6]"
         raw="$method:$password@$host:$port"
-        printf 'IPv6  ss://%s#ss-rust-ipv6\n' "$(encode "$raw")"
+        printf 'IPv6链接  ss://%s#ss-rust-ipv6\n' "$(encode "$raw")"
     fi
-    [ "$ip4" != '-' ] || [ -n "$ip6" ] || printf '链接  无法获取公网地址，请手动替换服务器 IP。\n'
+    [ -n "$ip4" ] || [ -n "$ip6" ] || printf '链接  无公网地址，请手动替换服务器 IP。\n'
     printf '提示  请确认云防火墙已放行 %s/tcp、udp。\n' "$port"
 }
 
@@ -587,10 +588,14 @@ status_line() {
     fi
 }
 
-menu() {
-    local choice
+clear_screen() {
     [ -t 1 ] && printf '\033[2J\033[H'
+}
+
+menu() {
+    local choice action refresh=1
     while :; do
+        [ "$refresh" -eq 1 ] && clear_screen
         printf '\nShadowsocks-Rust\n'
         status_line
         printf '\n[1] 安装  [2] 配置  [3] 更新\n'
@@ -599,18 +604,21 @@ menu() {
         printf '[0] 退出\n\n'
         read -r -p '选择 [0-9]: ' choice || break
         case "$choice" in
-            1) install_app ;;
-            2) configure_app ;;
-            3) update_app ;;
-            4) start_app ;;
-            5) stop_app ;;
-            6) restart_app ;;
-            7) show_info ;;
-            8) show_logs ;;
-            9) uninstall_app ;;
+            1) action=install_app ;;
+            2) action=configure_app ;;
+            3) action=update_app ;;
+            4) action=start_app ;;
+            5) action=stop_app ;;
+            6) action=restart_app ;;
+            7) action=show_info ;;
+            8) action=show_logs ;;
+            9) action=uninstall_app ;;
             0) break ;;
-            *) printf '无效选项。\n' ;;
+            *) printf '无效选项。\n'; refresh=0; continue ;;
         esac
+        clear_screen
+        "$action"
+        refresh=0
     done
 }
 
