@@ -601,8 +601,7 @@ menu() {
         printf '\n[1] 安装  [2] 配置  [3] 更新\n'
         printf '[4] 启动  [5] 停止  [6] 重启\n'
         printf '[7] 信息  [8] 日志  [9] 卸载\n'
-        printf '[0] 退出\n\n'
-        read -r -p '选择 [0-9]: ' choice || break
+        read -r -p '选择 [q退出]: ' choice || break
         case "$choice" in
             1) action=install_app ;;
             2) action=configure_app ;;
@@ -613,7 +612,7 @@ menu() {
             7) action=show_info ;;
             8) action=show_logs ;;
             9) action=uninstall_app ;;
-            0) break ;;
+            q|Q) break ;;
             *) printf '无效选项。\n'; refresh=0; continue ;;
         esac
         clear_screen
