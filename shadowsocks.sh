@@ -310,7 +310,7 @@ valid_key() {
 choose_method() {
     local current="${1:-$DEFAULT_METHOD}" choice
     is_2022_method "$current" || current="$DEFAULT_METHOD"
-    printf '\n加密方式 [%s]\n' "$current"
+    printf '\n加密方式\n'
     printf '[1] 2022-blake3-aes-128-gcm\n'
     printf '[2] 2022-blake3-aes-256-gcm\n'
     printf '[3] 2022-blake3-chacha20-poly1305\n'
