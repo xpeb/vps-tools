@@ -52,9 +52,9 @@ Shadowsocks-Rust
 
 ```text
 加密方式 [2022-blake3-aes-128-gcm]
-[1] AES-128-GCM
-[2] AES-256-GCM
-[3] ChaCha20
+[1] 2022-blake3-aes-128-gcm
+[2] 2022-blake3-aes-256-gcm
+[3] 2022-blake3-chacha20-poly1305
 选择 [回车不变]:
 
 确认卸载？[y/N]

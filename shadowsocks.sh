@@ -311,9 +311,9 @@ choose_method() {
     local current="${1:-$DEFAULT_METHOD}" choice
     is_2022_method "$current" || current="$DEFAULT_METHOD"
     printf '\n加密方式 [%s]\n' "$current"
-    printf '[1] AES-128-GCM\n'
-    printf '[2] AES-256-GCM\n'
-    printf '[3] ChaCha20\n'
+    printf '[1] 2022-blake3-aes-128-gcm\n'
+    printf '[2] 2022-blake3-aes-256-gcm\n'
+    printf '[3] 2022-blake3-chacha20-poly1305\n'
     while :; do
         read -r -p '选择 [回车不变]: ' choice || return 1
         case "$choice" in
@@ -587,15 +587,10 @@ status_line() {
     fi
 }
 
-pause_menu() {
-    printf '\n'
-    read -r -p '回车返回: ' _ || true
-}
-
 menu() {
     local choice
+    [ -t 1 ] && printf '\033[2J\033[H'
     while :; do
-        [ -t 1 ] && printf '\033[2J\033[H'
         printf '\nShadowsocks-Rust\n'
         status_line
         printf '\n[1] 安装  [2] 配置  [3] 更新\n'
@@ -604,17 +599,17 @@ menu() {
         printf '[0] 退出\n\n'
         read -r -p '选择 [0-9]: ' choice || break
         case "$choice" in
-            1) install_app; pause_menu ;;
-            2) configure_app; pause_menu ;;
-            3) update_app; pause_menu ;;
-            4) start_app; pause_menu ;;
-            5) stop_app; pause_menu ;;
-            6) restart_app; pause_menu ;;
-            7) show_info; pause_menu ;;
-            8) show_logs; pause_menu ;;
-            9) uninstall_app; pause_menu ;;
+            1) install_app ;;
+            2) configure_app ;;
+            3) update_app ;;
+            4) start_app ;;
+            5) stop_app ;;
+            6) restart_app ;;
+            7) show_info ;;
+            8) show_logs ;;
+            9) uninstall_app ;;
             0) break ;;
-            *) printf '无效选项。\n'; pause_menu ;;
+            *) printf '无效选项。\n' ;;
         esac
     done
 }
