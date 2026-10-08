@@ -14,7 +14,7 @@ OPENRC_UNIT="/etc/init.d/$APP"
 PID_FILE="/run/$APP.pid"
 LOG_FILE="/var/log/$APP.log"
 DEFAULT_PORT="56789"
-DEFAULT_METHOD="aes-128-gcm"
+DEFAULT_METHOD="2022-blake3-aes-128-gcm"
 DEFAULT_MODE="tcp_and_udp"
 
 TMP_DIR=""
@@ -236,7 +236,7 @@ verify_archive() {
 }
 
 fetch() {
-    local tag="${1:-}" arch url archive
+    local tag="${1:-}" arch url archive help method
     TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/shadowsocks.XXXXXX") || return 1
     [ -n "$tag" ] || tag=$(latest_tag) || return 1
     arch=$(asset_arch) || return 1
@@ -255,10 +255,13 @@ fetch() {
         return 1
     }
     chmod +x "$TMP_DIR/ssserver"
-    "$TMP_DIR/ssserver" --help 2>&1 | grep -qi 'aes-128-gcm' || {
-        error '最新版本不支持 aes-128-gcm。'
-        return 1
-    }
+    help=$("$TMP_DIR/ssserver" --help 2>&1 || true)
+    for method in 2022-blake3-aes-128-gcm 2022-blake3-aes-256-gcm 2022-blake3-chacha20-poly1305; do
+        printf '%s' "$help" | grep -Fqi "$method" || {
+            error "最新版本缺少 $method。"
+            return 1
+        }
+    done
     NEW_BIN="$TMP_DIR/ssserver"
     NEW_VERSION="$tag"
 }
@@ -270,21 +273,54 @@ cfg() {
     jq -r ".${1} // empty" "$CONF" 2>/dev/null || true
 }
 
-random_password() {
-    tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16
+is_2022_method() {
+    case "$1" in
+        2022-blake3-aes-128-gcm|2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+key_bytes() {
+    case "$1" in
+        2022-blake3-aes-128-gcm) printf '16' ;;
+        2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) printf '32' ;;
+        *) return 1 ;;
+    esac
+}
+
+generate_key() {
+    head -c "$(key_bytes "$1")" /dev/urandom | base64 | tr -d '\n'
+}
+
+valid_key() {
+    local method="$1" key="$2" expected decoded encoded tmp
+    expected=$(key_bytes "$method") || return 1
+    [ -n "$key" ] || return 1
+    tmp=$(mktemp "${TMPDIR:-/tmp}/ss-key.XXXXXX") || return 1
+    if ! printf '%s' "$key" | base64 -d > "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        return 1
+    fi
+    decoded=$(wc -c < "$tmp")
+    encoded=$(base64 < "$tmp" | tr -d '\n')
+    rm -f "$tmp"
+    [ "$decoded" -eq "$expected" ] && [ "$encoded" = "$key" ]
 }
 
 choose_method() {
     local current="${1:-$DEFAULT_METHOD}" choice
-    printf '\n常用加密方式（当前：%s）\n' "$current"
-    printf '  1) aes-128-gcm\n  2) aes-256-gcm\n  3) chacha20-ietf-poly1305\n'
+    is_2022_method "$current" || current="$DEFAULT_METHOD"
+    printf '\n2022-Blake3 加密方式（当前：%s）\n' "$current"
+    printf '  1) 2022-blake3-aes-128-gcm       16 字节 PSK\n'
+    printf '  2) 2022-blake3-aes-256-gcm       32 字节 PSK\n'
+    printf '  3) 2022-blake3-chacha20-poly1305 32 字节 PSK\n'
     while :; do
         read -r -p '选择 [回车保持当前]: ' choice || return 1
         case "$choice" in
             '') SET_METHOD="$current"; return 0 ;;
-            1) SET_METHOD='aes-128-gcm'; return 0 ;;
-            2) SET_METHOD='aes-256-gcm'; return 0 ;;
-            3) SET_METHOD='chacha20-ietf-poly1305'; return 0 ;;
+            1) SET_METHOD='2022-blake3-aes-128-gcm'; return 0 ;;
+            2) SET_METHOD='2022-blake3-aes-256-gcm'; return 0 ;;
+            3) SET_METHOD='2022-blake3-chacha20-poly1305'; return 0 ;;
             *) printf '无效选择，请输入 1-3。\n' ;;
         esac
     done
@@ -309,7 +345,7 @@ choose_mode() {
 }
 
 ask_config() {
-    local old_port old_password old_method old_mode value default_password
+    local old_port old_password old_method old_mode value default_key current_method
     old_port=$(cfg server_port)
     old_password=$(cfg password)
     old_method=$(cfg method)
@@ -325,12 +361,25 @@ ask_config() {
         printf '请输入 1-65535 之间的端口。\n'
     done
 
-    default_password=${old_password:-$(random_password)}
-    read -r -s -p '密码 [回车使用默认]: ' value || return 1
-    printf '\n'
-    SET_PASSWORD=${value:-$default_password}
-    choose_method "${old_method:-$DEFAULT_METHOD}" || return 1
+    is_2022_method "$old_method" && current_method="$old_method" || current_method="$DEFAULT_METHOD"
+    choose_method "$current_method" || return 1
     choose_mode "${old_mode:-$DEFAULT_MODE}" || return 1
+    if valid_key "$SET_METHOD" "$old_password"; then
+        default_key="$old_password"
+    else
+        default_key=$(generate_key "$SET_METHOD") || return 1
+    fi
+
+    while :; do
+        read -r -s -p '预共享密钥 PSK [回车自动生成/保留当前]: ' value || return 1
+        printf '\n'
+        value=${value:-$default_key}
+        if valid_key "$SET_METHOD" "$value"; then
+            SET_PASSWORD="$value"
+            break
+        fi
+        printf '密钥无效：%s 需要 %s 字节的标准 Base64 PSK。\n' "$SET_METHOD" "$(key_bytes "$SET_METHOD")"
+    done
 }
 
 save_config() {
