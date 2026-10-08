@@ -22,4 +22,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xpeb/vps-tools/main/singbox.
 bash <(curl -fsSL https://raw.githubusercontent.com/xpeb/vps-tools/main/shadowsocks.sh)
 ```
 
-详细说明见 [shadowsocks.md](shadowsocks.md)。
+
+# anytls.sh
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/xpeb/vps-tools/main/anytls.sh)
+```
+
+详细说明见 [anytls.md](anytls.md)。
