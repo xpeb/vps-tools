@@ -274,6 +274,40 @@ random_password() {
     tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16
 }
 
+choose_method() {
+    local current="${1:-$DEFAULT_METHOD}" choice
+    printf '\n加密方式（当前：%s）\n' "$current"
+    printf '  1) aes-128-gcm\n  2) aes-256-gcm\n  3) chacha20-ietf-poly1305\n'
+    while :; do
+        read -r -p '选择 [回车保持当前]: ' choice || return 1
+        case "$choice" in
+            '') SET_METHOD="$current"; return 0 ;;
+            1) SET_METHOD='aes-128-gcm'; return 0 ;;
+            2) SET_METHOD='aes-256-gcm'; return 0 ;;
+            3) SET_METHOD='chacha20-ietf-poly1305'; return 0 ;;
+            *) printf '无效选择，请输入 1-3。\n' ;;
+        esac
+    done
+}
+
+choose_mode() {
+    local current="${1:-$DEFAULT_MODE}" choice
+    printf '\n传输模式（当前：%s）\n' "$current"
+    printf '  1) tcp_only       仅 TCP\n'
+    printf '  2) udp_only       仅 UDP\n'
+    printf '  3) tcp_and_udp    TCP + UDP\n'
+    while :; do
+        read -r -p '选择 [回车保持当前]: ' choice || return 1
+        case "$choice" in
+            '') SET_MODE="$current"; return 0 ;;
+            1) SET_MODE='tcp_only'; return 0 ;;
+            2) SET_MODE='udp_only'; return 0 ;;
+            3) SET_MODE='tcp_and_udp'; return 0 ;;
+            *) printf '无效选择，请输入 1-3。\n' ;;
+        esac
+    done
+}
+
 ask_config() {
     local old_port old_password old_method old_mode value default_password
     old_port=$(cfg server_port)
@@ -295,8 +329,8 @@ ask_config() {
     read -r -s -p '密码 [回车使用默认]: ' value || return 1
     printf '\n'
     SET_PASSWORD=${value:-$default_password}
-    SET_METHOD=${old_method:-$DEFAULT_METHOD}
-    SET_MODE=${old_mode:-$DEFAULT_MODE}
+    choose_method "${old_method:-$DEFAULT_METHOD}" || return 1
+    choose_mode "${old_mode:-$DEFAULT_MODE}" || return 1
 }
 
 save_config() {
@@ -339,14 +373,8 @@ encode() {
 
 # ---------- 操作层 ----------
 
-setup() {
-    local new_bin=""
-    packages || return 1
-    if [ ! -x "$BIN" ]; then
-        fetch || { clean_tmp; return 1; }
-        new_bin="$NEW_BIN"
-    fi
-    ask_config || { clean_tmp; return 1; }
+apply_config() {
+    local new_bin="${1:-}" done="${2:-配置完成。}"
     svc stop || { clean_tmp; error '无法停止当前服务。'; return 1; }
     if [ -n "$new_bin" ]; then
         mkdir -p "${BIN%/*}"
@@ -364,18 +392,35 @@ setup() {
     clean_tmp
     svc install || { error '服务配置写入失败。'; return 1; }
     if svc start; then
-        printf '完成：%s\n' "$(version)"
+        printf '%s\n' "$done"
         show_info
     else
-        error '配置完成，但服务启动失败。'
+        error "$done，但服务启动失败。"
         return 1
     fi
+}
+
+install_app() {
+    local new_bin
+    packages || return 1
+    [ ! -x "$BIN" ] || { error '已经安装，请选择“配置”。'; return 1; }
+    fetch || { clean_tmp; return 1; }
+    new_bin="$NEW_BIN"
+    ask_config || { clean_tmp; return 1; }
+    apply_config "$new_bin" '安装完成。'
+}
+
+configure_app() {
+    packages || return 1
+    [ -x "$BIN" ] || { error '尚未安装，请先选择“安装”。'; return 1; }
+    ask_config || { clean_tmp; return 1; }
+    apply_config '' '配置完成。'
 }
 
 update_app() {
     local latest current
     packages || return 1
-    [ -x "$BIN" ] || { error '尚未安装，请先选择“安装 / 配置”。'; return 1; }
+    [ -x "$BIN" ] || { error '尚未安装，请先选择“安装”。'; return 1; }
     latest=$(latest_tag) || return 1
     current=$(version)
     if [ -n "$current" ] && ! version_newer "$latest" "$current"; then
@@ -427,8 +472,8 @@ restart_app() {
 
 show_info() {
     local port password method mode ip4 ip6 host raw
-    has jq || { error '缺少 jq，请先选择“安装 / 配置”。'; return 1; }
-    has base64 || { error '缺少 base64，请先选择“安装 / 配置”。'; return 1; }
+    has jq || { error '缺少 jq，请先选择“安装”。'; return 1; }
+    has base64 || { error '缺少 base64，请先选择“安装”。'; return 1; }
     [ -f "$CONF" ] || { error '配置文件不存在。'; return 1; }
 
     port=$(cfg server_port)
@@ -499,21 +544,23 @@ menu() {
         [ -t 1 ] && printf '\033[2J\033[H'
         printf '\nShadowsocks-Rust\n'
         status_line
-        printf '\n  [1] 安装/配置     [2] 更新\n'
-        printf '  [3] 启动          [4] 停止\n'
-        printf '  [5] 重启          [6] 配置\n'
-        printf '  [7] 日志          [8] 卸载\n'
+        printf '\n  [1] 安装          [2] 配置\n'
+        printf '  [3] 更新          [4] 启动\n'
+        printf '  [5] 停止          [6] 重启\n'
+        printf '  [7] 信息          [8] 日志\n'
+        printf '  [9] 卸载\n'
         printf '  [0] 退出\n\n'
         read -r -p '选择: ' choice || break
         case "$choice" in
-            1) setup; pause_menu ;;
-            2) update_app; pause_menu ;;
-            3) start_app; pause_menu ;;
-            4) stop_app; pause_menu ;;
-            5) restart_app; pause_menu ;;
-            6) show_info; pause_menu ;;
-            7) show_logs; pause_menu ;;
-            8) uninstall_app; pause_menu ;;
+            1) install_app; pause_menu ;;
+            2) configure_app; pause_menu ;;
+            3) update_app; pause_menu ;;
+            4) start_app; pause_menu ;;
+            5) stop_app; pause_menu ;;
+            6) restart_app; pause_menu ;;
+            7) show_info; pause_menu ;;
+            8) show_logs; pause_menu ;;
+            9) uninstall_app; pause_menu ;;
             0) break ;;
             *) printf '无效选择。\n'; pause_menu ;;
         esac
