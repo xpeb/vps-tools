@@ -276,7 +276,7 @@ random_password() {
 
 choose_method() {
     local current="${1:-$DEFAULT_METHOD}" choice
-    printf '\n加密方式（当前：%s）\n' "$current"
+    printf '\n常用加密方式（当前：%s）\n' "$current"
     printf '  1) aes-128-gcm\n  2) aes-256-gcm\n  3) chacha20-ietf-poly1305\n'
     while :; do
         read -r -p '选择 [回车保持当前]: ' choice || return 1
