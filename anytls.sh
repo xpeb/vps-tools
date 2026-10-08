@@ -213,14 +213,14 @@ choose_config() {
 
     while :; do
         if [ -n "$old_sni" ]; then
-            read -r -p "SNI [$old_sni]（回车保持，- 清除）: " value || return 1
+            read -r -p "客户端 SNI [$old_sni]（回车保持，- 清除）: " value || return 1
             if [ "$value" = '-' ]; then
                 value=''
             elif [ -z "$value" ]; then
                 value="$old_sni"
             fi
         else
-            read -r -p 'SNI [可选，回车关闭]: ' value || return 1
+            read -r -p '客户端 SNI [可选，回车关闭]: ' value || return 1
         fi
         if valid_sni "$value"; then
             SET_SNI="$value"
