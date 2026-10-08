@@ -311,9 +311,9 @@ choose_method() {
     local current="${1:-$DEFAULT_METHOD}" choice
     is_2022_method "$current" || current="$DEFAULT_METHOD"
     printf '\n加密(2022) [%s]\n' "$current"
-    printf '  1) AES-128-GCM  16B PSK\n'
-    printf '  2) AES-256-GCM  32B PSK\n'
-    printf '  3) ChaCha20     32B PSK\n'
+    printf '[1] AES-128-GCM (16B PSK)\n'
+    printf '[2] AES-256-GCM (32B PSK)\n'
+    printf '[3] ChaCha20 (32B PSK)\n'
     while :; do
         read -r -p '选择 [回车不变]: ' choice || return 1
         case "$choice" in
@@ -329,7 +329,9 @@ choose_method() {
 choose_mode() {
     local current="${1:-$DEFAULT_MODE}" choice
     printf '\n模式 [%s]\n' "$current"
-    printf '  1) TCP  2) UDP  3) TCP+UDP\n'
+    printf '[1] TCP\n'
+    printf '[2] UDP\n'
+    printf '[3] TCP+UDP\n'
     while :; do
         read -r -p '选择 [回车不变]: ' choice || return 1
         case "$choice" in
@@ -562,8 +564,15 @@ show_logs() {
 
 uninstall_app() {
     [ -e "$BIN" ] || [ -e "$CONF_DIR" ] || { error '尚未安装。'; return 1; }
-    read -r -p '删除程序、配置和服务？[y/N] ' value || return 1
-    case "$value" in y|Y|yes|YES) ;; *) printf '已取消。\n'; return ;; esac
+    printf '\n确认卸载\n'
+    printf '[1] 确认\n'
+    printf '[0] 取消\n'
+    read -r -p '选择: ' value || return 1
+    case "$value" in
+        1|y|Y|yes|YES) ;;
+        0|''|n|N|no|NO) printf '已取消。\n'; return ;;
+        *) printf '已取消。\n'; return ;;
+    esac
     svc remove || { error '服务移除失败，已停止卸载。'; return 1; }
     rm -f "$BIN" "$CONF" "$CONF.tmp."* "$PID_FILE" "$LOG_FILE"
     rmdir "$CONF_DIR" 2>/dev/null || true
@@ -591,10 +600,10 @@ menu() {
         [ -t 1 ] && printf '\033[2J\033[H'
         printf '\nShadowsocks-Rust\n'
         status_line
-        printf '\n  [1] 安装    [2] 配置    [3] 更新\n'
-        printf '  [4] 启动    [5] 停止    [6] 重启\n'
-        printf '  [7] 信息    [8] 日志    [9] 卸载\n'
-        printf '  [0] 退出\n\n'
+        printf '\n[1] 安装  [2] 配置  [3] 更新\n'
+        printf '[4] 启动  [5] 停止  [6] 重启\n'
+        printf '[7] 信息  [8] 日志  [9] 卸载\n'
+        printf '[0] 退出\n\n'
         read -r -p '选择: ' choice || break
         case "$choice" in
             1) install_app; pause_menu ;;
