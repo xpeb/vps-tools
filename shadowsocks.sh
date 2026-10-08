@@ -546,7 +546,7 @@ show_info() {
     [ -n "$ip4" ] && printf 'IPv4  %s\n' "$ip4"
     [ -n "$ip6" ] && printf 'IPv6  %s\n' "$ip6"
     [ -n "$ip4" ] || [ -n "$ip6" ] || printf '地址  未知\n'
-    printf '端口  %s\n加密  %s\n模式  %s\n' "$port" "$method" "$mode"
+    printf '端口  %s\n加密  %s\nPSK   %s\n模式  %s\n' "$port" "$method" "$password" "$mode"
 
     if [ -n "$ip4" ]; then
         host="$ip4"
@@ -593,7 +593,7 @@ status_line() {
 }
 
 clear_screen() {
-    [ -t 1 ] && printf '\033[2J\033[H'
+    printf '\033[2J\033[H'
 }
 
 menu() {
