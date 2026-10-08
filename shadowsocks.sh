@@ -310,7 +310,7 @@ valid_key() {
 choose_method() {
     local current="${1:-$DEFAULT_METHOD}" choice
     is_2022_method "$current" || current="$DEFAULT_METHOD"
-    printf '\n加密 [%s]\n' "$current"
+    printf '\n加密方式 [%s]\n' "$current"
     printf '[1] AES-128-GCM\n'
     printf '[2] AES-256-GCM\n'
     printf '[3] ChaCha20\n'
@@ -566,13 +566,9 @@ show_logs() {
 
 uninstall_app() {
     [ -e "$BIN" ] || [ -e "$CONF_DIR" ] || { error '尚未安装。'; return 1; }
-    printf '\n确认卸载\n'
-    printf '[1] 确认\n'
-    printf '[0] 取消\n'
-    read -r -p '选择 [1/0]: ' value || return 1
+    read -r -p '确认卸载？[y/N] ' value || return 1
     case "$value" in
-        1|y|Y|yes|YES) ;;
-        0|''|n|N|no|NO) printf '已取消。\n'; return ;;
+        y|Y|yes|YES) ;;
         *) printf '已取消。\n'; return ;;
     esac
     svc remove || { error '服务移除失败，已停止卸载。'; return 1; }
