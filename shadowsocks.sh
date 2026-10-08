@@ -310,12 +310,12 @@ valid_key() {
 choose_method() {
     local current="${1:-$DEFAULT_METHOD}" choice
     is_2022_method "$current" || current="$DEFAULT_METHOD"
-    printf '\n2022-Blake3 加密方式（当前：%s）\n' "$current"
-    printf '  1) 2022-blake3-aes-128-gcm       16 字节 PSK\n'
-    printf '  2) 2022-blake3-aes-256-gcm       32 字节 PSK\n'
-    printf '  3) 2022-blake3-chacha20-poly1305 32 字节 PSK\n'
+    printf '\n加密(2022) [%s]\n' "$current"
+    printf '  1) AES-128-GCM  16B PSK\n'
+    printf '  2) AES-256-GCM  32B PSK\n'
+    printf '  3) ChaCha20     32B PSK\n'
     while :; do
-        read -r -p '选择 [回车保持当前]: ' choice || return 1
+        read -r -p '选择 [回车不变]: ' choice || return 1
         case "$choice" in
             '') SET_METHOD="$current"; return 0 ;;
             1) SET_METHOD='2022-blake3-aes-128-gcm'; return 0 ;;
@@ -328,12 +328,10 @@ choose_method() {
 
 choose_mode() {
     local current="${1:-$DEFAULT_MODE}" choice
-    printf '\n传输模式（当前：%s）\n' "$current"
-    printf '  1) tcp_only       仅 TCP\n'
-    printf '  2) udp_only       仅 UDP\n'
-    printf '  3) tcp_and_udp    TCP + UDP\n'
+    printf '\n模式 [%s]\n' "$current"
+    printf '  1) TCP  2) UDP  3) TCP+UDP\n'
     while :; do
-        read -r -p '选择 [回车保持当前]: ' choice || return 1
+        read -r -p '选择 [回车不变]: ' choice || return 1
         case "$choice" in
             '') SET_MODE="$current"; return 0 ;;
             1) SET_MODE='tcp_only'; return 0 ;;
@@ -358,7 +356,7 @@ ask_config() {
             SET_PORT="$value"
             break
         fi
-        printf '请输入 1-65535 之间的端口。\n'
+        printf '端口无效（1-65535）。\n'
     done
 
     is_2022_method "$old_method" && current_method="$old_method" || current_method="$DEFAULT_METHOD"
@@ -371,14 +369,14 @@ ask_config() {
     fi
 
     while :; do
-        read -r -s -p '预共享密钥 PSK [回车自动生成/保留当前]: ' value || return 1
+        read -r -s -p 'PSK [回车默认]: ' value || return 1
         printf '\n'
         value=${value:-$default_key}
         if valid_key "$SET_METHOD" "$value"; then
             SET_PASSWORD="$value"
             break
         fi
-        printf '密钥无效：%s 需要 %s 字节的标准 Base64 PSK。\n' "$SET_METHOD" "$(key_bytes "$SET_METHOD")"
+        printf 'PSK 无效，需要 %sB Base64。\n' "$(key_bytes "$SET_METHOD")"
     done
 }
 
@@ -584,7 +582,7 @@ status_line() {
 
 pause_menu() {
     printf '\n'
-    read -r -p '回车继续…' _ || true
+    read -r -p '回车继续: ' _ || true
 }
 
 menu() {
@@ -593,11 +591,9 @@ menu() {
         [ -t 1 ] && printf '\033[2J\033[H'
         printf '\nShadowsocks-Rust\n'
         status_line
-        printf '\n  [1] 安装          [2] 配置\n'
-        printf '  [3] 更新          [4] 启动\n'
-        printf '  [5] 停止          [6] 重启\n'
-        printf '  [7] 信息          [8] 日志\n'
-        printf '  [9] 卸载\n'
+        printf '\n  [1] 安装    [2] 配置    [3] 更新\n'
+        printf '  [4] 启动    [5] 停止    [6] 重启\n'
+        printf '  [7] 信息    [8] 日志    [9] 卸载\n'
         printf '  [0] 退出\n\n'
         read -r -p '选择: ' choice || break
         case "$choice" in
