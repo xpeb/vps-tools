@@ -95,7 +95,7 @@ sudo ./shadowsocks.sh
 
 ```text
 入口
- ├─ 配置层：端口、密码、config.json
+ ├─ 配置层：端口、PSK、config.json
  ├─ 下载层：最新 Release、架构匹配、二进制校验
  └─ 服务层：svc(action) → systemd / OpenRC / direct
 ```

@@ -60,16 +60,13 @@ server_pid() {
     pid=$(cat "$PID_FILE" 2>/dev/null) || return 1
     case "$pid" in ''|*[!0-9]*) return 1 ;; esac
     kill -0 "$pid" 2>/dev/null || return 1
-    if [ -r "/proc/$pid/cmdline" ]; then
-        cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline")
-        case "$cmd" in *"$BIN"*) printf '%s' "$pid"; return 0 ;; esac
-        return 1
-    fi
-    printf '%s' "$pid"
+    [ -r "/proc/$pid/cmdline" ] || return 1
+    cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline")
+    case "$cmd" in *"$BIN"*) printf '%s' "$pid" ;; *) return 1 ;; esac
 }
 
 svc() {
-    local action="$1" b pid
+    local action="$1" b
     b=$(backend)
     case "$action/$b" in
         status/systemd) systemctl is-active --quiet "$APP" 2>/dev/null ;;
@@ -202,6 +199,10 @@ asset_arch() {
     esac
 }
 
+valid_tag() {
+    [[ "${1:-}" =~ ^v[0-9]+(\.[0-9]+){2}$ ]]
+}
+
 latest_tag() {
     local api tag url
     api=$(curl -fsSL --max-time 15 \
@@ -209,18 +210,21 @@ latest_tag() {
         -H 'User-Agent: shadowsocks.sh' \
         "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null || true)
     tag=$(printf '%s' "$api" | jq -r '.tag_name // empty' 2>/dev/null || true)
-    case "$tag" in
-        v[0-9]*.[0-9]*) printf '%s' "$tag"; return 0 ;;
-    esac
+    if valid_tag "$tag"; then
+        printf '%s' "$tag"
+        return 0
+    fi
 
     url=$(curl -fsSIL --max-time 15 -o /dev/null -w '%{url_effective}' \
         -H 'User-Agent: shadowsocks.sh' \
         "https://github.com/$REPO/releases/latest" 2>/dev/null || true)
     url=${url##*/tag/}
-    case "$url" in
-        v[0-9]*.[0-9]*) printf '%s' "$url" ;;
-        *) error '无法获取最新 Release 版本。'; return 1 ;;
-    esac
+    if valid_tag "$url"; then
+        printf '%s' "$url"
+    else
+        error '无法获取最新 Release 版本。'
+        return 1
+    fi
 }
 
 verify_archive() {
@@ -385,19 +389,19 @@ ask_config() {
 }
 
 save_config() {
-    local temp="$CONF.tmp.$$"
-    mkdir -p "$CONF_DIR"
+    local temp
+    mkdir -p "$CONF_DIR" || return 1
+    temp=$(mktemp "$CONF_DIR/config.json.XXXXXX") || return 1
     if ! jq -n --arg port "$1" --arg password "$2" --arg method "$3" --arg mode "$4" \
         '{server:"::",server_port:($port|tonumber),password:$password,method:$method,mode:$mode,fast_open:false}' \
         > "$temp"; then
         rm -f "$temp"
         return 1
     fi
-    if ! mv "$temp" "$CONF"; then
+    if ! chmod 600 "$temp" || ! mv "$temp" "$CONF"; then
         rm -f "$temp"
         return 1
     fi
-    chmod 600 "$CONF"
 }
 
 version() {
@@ -425,7 +429,7 @@ encode() {
 # ---------- 操作层 ----------
 
 apply_config() {
-    local new_bin="${1:-}" done="${2:-配置完成。}"
+    local new_bin="${1:-}" message="${2:-配置完成。}"
     svc stop || { clean_tmp; error '无法停止当前服务。'; return 1; }
     if [ -n "$new_bin" ]; then
         mkdir -p "${BIN%/*}"
@@ -443,10 +447,10 @@ apply_config() {
     clean_tmp
     svc install || { error '服务配置写入失败。'; return 1; }
     if svc start; then
-        printf '%s\n' "$done"
+        printf '%s\n' "$message"
         show_info
     else
-        error "$done，但服务启动失败。"
+        error "$message，但服务启动失败。"
         return 1
     fi
 }
@@ -573,7 +577,7 @@ uninstall_app() {
         *) printf '已取消。\n'; return ;;
     esac
     svc remove || { error '服务移除失败，已停止卸载。'; return 1; }
-    rm -f "$BIN" "$CONF" "$CONF.tmp."* "$PID_FILE" "$LOG_FILE"
+    rm -f "$BIN" "$CONF" "$CONF_DIR"/config.json.* "$PID_FILE" "$LOG_FILE"
     rmdir "$CONF_DIR" 2>/dev/null || true
     printf '已卸载。\n'
 }
