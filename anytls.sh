@@ -756,25 +756,6 @@ configure_app() {
     apply_config '' '配置完成。'
 }
 
-certificate_app() {
-    packages || return 1
-    if [ ! -x "$BIN" ] || [ ! -r "$ENV_FILE" ] || [ -z "$(cfg domain)" ]; then
-        error '尚未完成安装，请先选择“安装”或“配置”。'
-        return 1
-    fi
-    svc stop || { error '无法停止当前服务。'; return 1; }
-    issue_certificate "$(cfg domain)" "$(cfg email)" || return 1
-    write_proxy_config || return 1
-    svc install || { error '服务配置写入失败。'; return 1; }
-    if svc start; then
-        printf 'ACME 证书已申请/续期。\n'
-        show_info
-    else
-        error '证书已更新，但服务启动失败。'
-        return 1
-    fi
-}
-
 update_app() {
     local latest current
     packages || return 1
@@ -823,7 +804,7 @@ start_app() {
     fi
     ensure_haproxy || return 1
     if [ ! -s "$CERT_FILE" ] || [ ! -s "$KEY_FILE" ]; then
-        error 'ACME 证书不存在，请先选择“ACME”。'
+        error 'ACME 证书不存在，请先选择“配置”。'
         return 1
     fi
     build_haproxy_pem || return 1
@@ -965,7 +946,7 @@ menu() {
         status_line
         printf '\n[1] 安装  [2] 配置  [3] 更新\n'
         printf '[4] 启动  [5] 停止  [6] 重启\n'
-        printf '[7] 信息  [8] 日志  [9] ACME  [10] 卸载\n'
+        printf '[7] 信息  [8] 日志  [9] 卸载\n'
         read -r -p '选择 [q退出]: ' choice || break
         case "$choice" in
             1) action=install_app ;;
@@ -976,8 +957,7 @@ menu() {
             6) action=restart_app ;;
             7) action=show_info ;;
             8) action=show_logs ;;
-            9) action=certificate_app ;;
-            10) action=uninstall_app ;;
+            9) action=uninstall_app ;;
             q|Q) break ;;
             *) printf '无效选项。\n'; refresh=0; continue ;;
         esac
