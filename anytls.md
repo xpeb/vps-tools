@@ -72,7 +72,7 @@ AnyTLS 不使用 Shadowsocks 的加密方式或传输模式选项；客户端和
 - **自签名**：官方服务端直接监听公网端口，启动时自动生成短期自签名证书。不需要域名、HAProxy 或 TCP 80。
 - **ACME**：通过 HTTP-01 申请 Let’s Encrypt 证书，由 HAProxy 使用证书接收公网 TLS，再加密转发到本机的官方 AnyTLS 服务端。
 
-ACME 模式通过 systemd timer 或 cron 自动续期。证书申请期间，域名必须已经解析到本机，TCP 80 必须可以从公网访问，且不能有其他程序占用 80 端口。公网 AnyTLS 端口默认为 `8443`，也可以输入 `443`。
+ACME 模式通过 systemd timer 或 cron 自动续期，并使用固定版本且经过 SHA256 校验的 `acme.sh`。证书申请使用 standalone HTTP-01，需要 `socat`、域名已解析到本机、TCP 80 可从公网访问，且不能有其他程序占用 80 端口。为避免续期时与验证端口冲突，ACME 模式不能选择公网端口 `80`；可以使用默认的 `8443` 或 `443`。使用 OpenRC 或 direct 模式时，系统还必须已有正在运行的 cron/crond 服务。
 
 自签名模式生成的链接示例：
 

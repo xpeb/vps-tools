@@ -17,6 +17,9 @@ HAPROXY_PEM="$CERT_DIR/haproxy.pem"
 HAPROXY_CFG="$BASE_DIR/haproxy.cfg"
 ACME_HOME="$BASE_DIR/acme"
 ACME_BIN="$ACME_HOME/acme.sh"
+ACME_VERSION='3.1.6'
+ACME_URL="https://raw.githubusercontent.com/acmesh-official/acme.sh/$ACME_VERSION/acme.sh"
+ACME_SHA256='c7d68b021cfd6380ea83a82962abde5b484779fee0b97d38681dfa1396bbc8d7'
 RELOAD_SCRIPT="$BASE_DIR/reload-cert"
 PID_FILE='/run/anytls.pid'
 PROXY_PID_FILE='/run/anytls-proxy.pid'
@@ -29,8 +32,10 @@ ACME_TIMER_UNIT="/etc/systemd/system/$APP-acme.timer"
 OPENRC_UNIT="/etc/init.d/$APP"
 PROXY_OPENRC_UNIT="/etc/init.d/$PROXY_APP"
 ACME_CRON_FILE="/etc/cron.d/$APP-acme"
+ACME_CRON_MARKER='# anytls-acme-renewal'
 HAPROXY_BIN=''
 TMP_DIR=''
+ROLLBACK_DIR=''
 NEW_BIN=''
 NEW_VERSION=''
 RELEASE_TAG=''
@@ -46,7 +51,9 @@ root() {
 
 clean_tmp() {
     [ -z "$TMP_DIR" ] || rm -rf "$TMP_DIR"
+    [ -z "$ROLLBACK_DIR" ] || rm -rf "$ROLLBACK_DIR"
     TMP_DIR=''
+    ROLLBACK_DIR=''
     NEW_BIN=''
 }
 trap clean_tmp EXIT
@@ -133,7 +140,7 @@ valid_domain() {
 }
 
 valid_email() {
-    [ -z "${1:-}" ] || [[ "$1" =~ ^[^[:space:]@]+@[^[:space:]@.]+(\.[^[:space:]@.]+)+$ ]]
+    [ -z "${1:-}" ] || [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._%+-]*@[A-Za-z0-9][A-Za-z0-9-]*(\.[A-Za-z0-9][A-Za-z0-9-]*)+$ ]]
 }
 
 backend_port_for() {
@@ -266,6 +273,11 @@ choose_config() {
         esac
     done
 
+    if [ "$SET_TLS_MODE" = acme ] && [ "$SET_PORT" -eq 80 ]; then
+        error 'ACME standalone 模式不能使用公网端口 80，请选择其他端口。'
+        return 1
+    fi
+
     SET_DOMAIN=''
     SET_EMAIL=''
     SET_BACKEND_PORT=''
@@ -359,7 +371,7 @@ defaults
     timeout server 1h
 
 frontend anytls_front
-    bind :$port ssl crt $HAPROXY_PEM
+    bind :::${port} v4v6 ssl crt $HAPROXY_PEM
     default_backend anytls_backend
 
 backend anytls_backend
@@ -451,23 +463,38 @@ Persistent=true
 WantedBy=timers.target
 EOF
             systemctl daemon-reload || return 1
-            systemctl enable --now "$(basename "$ACME_TIMER_UNIT")" >/dev/null 2>&1 || return 1
+            systemctl enable --now "$(basename "$ACME_TIMER_UNIT")" >/dev/null 2>&1 || {
+                error 'ACME systemd 定时器启动失败。'
+                return 1
+            }
             ;;
         openrc|direct)
-            if has crontab; then
-                "$ACME_BIN" --home "$ACME_HOME" --install-cronjob >/dev/null 2>&1 || true
+            if [ -x "$ACME_BIN" ] && (has crontab || has fcrontab); then
+                "$ACME_BIN" --home "$ACME_HOME" --uninstall-cronjob >/dev/null 2>&1 || true
             fi
             if [ -d /etc/cron.d ]; then
+                if ! has cron && ! has crond; then
+                    error '未找到 cron/crond，无法配置 ACME 自动续期。'
+                    return 1
+                fi
                 temp=$(mktemp /etc/cron.d/anytls-acme.XXXXXX) || return 1
-                printf '17 3 * * * root %s --cron --home %s >/dev/null 2>&1\\n' \
-                    "$ACME_BIN" "$ACME_HOME" > "$temp" || {
+                if ! printf '%s\n17 3 * * * root %s --cron --home %s >/dev/null 2>&1\n' \
+                    "$ACME_CRON_MARKER" "$ACME_BIN" "$ACME_HOME" > "$temp"; then
                     rm -f "$temp"
                     return 1
-                }
+                fi
                 if ! chmod 644 "$temp" || ! mv "$temp" "$ACME_CRON_FILE"; then
                     rm -f "$temp"
                     return 1
                 fi
+            elif has crontab || has fcrontab; then
+                "$ACME_BIN" --home "$ACME_HOME" --install-cronjob >/dev/null 2>&1 || {
+                    error 'ACME crontab 安装失败。'
+                    return 1
+                }
+            else
+                error '未找到 cron/crontab，无法配置 ACME 自动续期。'
+                return 1
             fi
             ;;
     esac
@@ -480,22 +507,39 @@ remove_acme_schedule() {
             rm -f "$ACME_SYSTEMD_UNIT" "$ACME_TIMER_UNIT"
             systemctl daemon-reload >/dev/null 2>&1 || true
             ;;
-        openrc|direct) rm -f "$ACME_CRON_FILE" ;;
+        openrc|direct)
+            rm -f "$ACME_CRON_FILE"
+            if [ -x "$ACME_BIN" ] && (has crontab || has fcrontab); then
+                "$ACME_BIN" --home "$ACME_HOME" --uninstall-cronjob >/dev/null 2>&1 || true
+            fi
+            ;;
     esac
 }
 
 install_acme_client() {
-    local temp
+    local temp actual
     mkdir -p "$ACME_HOME" || return 1
-    if [ ! -x "$ACME_BIN" ]; then
+    actual=''
+    if [ -x "$ACME_BIN" ]; then
+        actual=$(sha256sum "$ACME_BIN" 2>/dev/null) || actual=''
+        actual=${actual%% *}
+    fi
+    if [ "$actual" != "$ACME_SHA256" ]; then
         temp=$(mktemp "$ACME_HOME/acme.sh.XXXXXX") || return 1
         curl -fLsS --connect-timeout 10 --max-time 90 \
             -H 'User-Agent: anytls.sh' \
-            -o "$temp" https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh 2>/dev/null || {
+            -o "$temp" "$ACME_URL" 2>/dev/null || {
             rm -f "$temp"
-            error '下载 acme.sh 失败。'
+            error "下载 acme.sh $ACME_VERSION 失败。"
             return 1
         }
+        actual=$(sha256sum "$temp" 2>/dev/null) || actual=''
+        actual=${actual%% *}
+        if [ "$actual" != "$ACME_SHA256" ]; then
+            rm -f "$temp"
+            error 'acme.sh SHA256 校验失败。'
+            return 1
+        fi
         if ! chmod 700 "$temp" || ! mv "$temp" "$ACME_BIN"; then
             rm -f "$temp"
             return 1
@@ -536,10 +580,6 @@ issue_certificate() {
         return 1
     }
     build_haproxy_pem || return 1
-    install_acme_schedule || {
-        error 'ACME 自动续期任务配置失败。'
-        return 1
-    }
 }
 
 tls_mode() {
@@ -801,44 +841,140 @@ EOF
     esac
 }
 
+backup_apply_state() {
+    local dir="$1"
+    if [ -r "$ENV_FILE" ] && ! cp -p "$ENV_FILE" "$dir/config"; then
+        return 1
+    fi
+    if [ -e "$CERT_DIR" ] && ! cp -a "$CERT_DIR" "$dir/certs"; then
+        return 1
+    fi
+    if [ -e "$HAPROXY_CFG" ] && ! cp -p "$HAPROXY_CFG" "$dir/haproxy.cfg"; then
+        return 1
+    fi
+    if [ -e "$RELOAD_SCRIPT" ] && ! cp -p "$RELOAD_SCRIPT" "$dir/reload-cert"; then
+        return 1
+    fi
+}
+
+restore_apply_state() {
+    local had_config="$1" had_bin="$2" was_running="$3"
+    if [ "$had_config" -eq 1 ]; then
+        cp -p "$ROLLBACK_DIR/config" "$ENV_FILE"
+        chmod 600 "$ENV_FILE"
+    else
+        rm -f "$ENV_FILE"
+    fi
+    if [ -e "$ROLLBACK_DIR/certs" ]; then
+        rm -rf "$CERT_DIR"
+        cp -a "$ROLLBACK_DIR/certs" "$CERT_DIR"
+    else
+        rm -rf "$CERT_DIR"
+    fi
+    if [ -e "$ROLLBACK_DIR/haproxy.cfg" ]; then
+        cp -p "$ROLLBACK_DIR/haproxy.cfg" "$HAPROXY_CFG"
+    else
+        rm -f "$HAPROXY_CFG"
+    fi
+    if [ -e "$ROLLBACK_DIR/reload-cert" ]; then
+        cp -p "$ROLLBACK_DIR/reload-cert" "$RELOAD_SCRIPT"
+        chmod 700 "$RELOAD_SCRIPT"
+    else
+        rm -f "$RELOAD_SCRIPT"
+    fi
+    if [ "$had_bin" -eq 0 ]; then
+        rm -f "$BIN" "$VERSION_FILE"
+        remove_acme_schedule
+        svc remove >/dev/null 2>&1 || true
+    else
+        if [ "$had_config" -eq 1 ] && [ "$(tls_mode)" = acme ]; then
+            install_acme_schedule >/dev/null 2>&1 || true
+        else
+            remove_acme_schedule
+        fi
+        svc install >/dev/null 2>&1 || true
+        if [ "$was_running" -eq 1 ]; then
+            svc start >/dev/null 2>&1 || true
+        fi
+    fi
+    rm -rf "$ROLLBACK_DIR"
+    ROLLBACK_DIR=''
+}
+
 apply_config() {
     local new_bin="${1:-}" message="${2:-配置完成。}"
-    svc stop || { clean_tmp; error '无法停止当前服务。'; return 1; }
+    local had_config=0 had_bin=0 was_running=0
+    mkdir -p "$BASE_DIR" || { clean_tmp; error 'AnyTLS 目录创建失败。'; return 1; }
+    ROLLBACK_DIR=$(mktemp -d "$BASE_DIR/rollback.XXXXXX") || {
+        clean_tmp
+        error '回滚目录创建失败。'
+        return 1
+    }
+    [ -r "$ENV_FILE" ] && had_config=1
+    [ -x "$BIN" ] && had_bin=1
+    if [ "$had_config" -eq 1 ] && svc status; then
+        was_running=1
+    fi
+    backup_apply_state "$ROLLBACK_DIR" || {
+        clean_tmp
+        error '旧配置备份失败。'
+        return 1
+    }
+    svc stop || {
+        if [ "$was_running" -eq 1 ]; then
+            svc start >/dev/null 2>&1 || true
+        fi
+        clean_tmp
+        error '无法停止当前服务。'
+        return 1
+    }
     if [ -n "$new_bin" ]; then
-        mkdir -p "${BIN%/*}"
         if ! cp "$new_bin" "$BIN" || ! chmod 755 "$BIN"; then
+            restore_apply_state "$had_config" "$had_bin" "$was_running"
             clean_tmp
             error '程序文件写入失败。'
             return 1
         fi
     fi
     save_config "$SET_PORT" "$SET_TLS_MODE" "$SET_DOMAIN" "$SET_EMAIL" "$SET_BACKEND_PORT" "$SET_PASSWORD" || {
+        restore_apply_state "$had_config" "$had_bin" "$was_running"
         clean_tmp
         error '配置文件写入失败。'
         return 1
     }
-    if [ -n "$new_bin" ]; then
-        save_version "$NEW_VERSION" || {
-            clean_tmp
-            error '版本文件写入失败。'
-            return 1
-        }
+    if [ -n "$new_bin" ] && ! save_version "$NEW_VERSION"; then
+        restore_apply_state "$had_config" "$had_bin" "$was_running"
+        clean_tmp
+        error '版本文件写入失败。'
+        return 1
     fi
     if [ "$SET_TLS_MODE" = acme ]; then
-        acme_packages || { clean_tmp; return 1; }
-        issue_certificate "$SET_DOMAIN" "$SET_EMAIL" || { clean_tmp; return 1; }
-        write_proxy_config || { clean_tmp; return 1; }
+        if ! acme_packages || ! issue_certificate "$SET_DOMAIN" "$SET_EMAIL" || ! write_proxy_config || ! install_acme_schedule; then
+            restore_apply_state "$had_config" "$had_bin" "$was_running"
+            clean_tmp
+            error 'ACME 配置失败，已恢复原配置。'
+            return 1
+        fi
     else
         remove_acme_schedule
-        rm -f "$HAPROXY_CFG"
+        rm -f "$HAPROXY_CFG" "$RELOAD_SCRIPT"
     fi
-    clean_tmp
-    svc install || { error '服务配置写入失败。'; return 1; }
+    svc install || {
+        restore_apply_state "$had_config" "$had_bin" "$was_running"
+        clean_tmp
+        error '服务配置写入失败，已恢复原配置。'
+        return 1
+    }
     if svc start; then
+        rm -rf "$ROLLBACK_DIR"
+        ROLLBACK_DIR=''
+        clean_tmp
         printf '%s\n' "$message"
         show_info
     else
-        error "$message，但服务启动失败。"
+        restore_apply_state "$had_config" "$had_bin" "$was_running"
+        clean_tmp
+        error "$message，但服务启动失败，已恢复原配置。"
         return 1
     fi
 }
@@ -1067,21 +1203,21 @@ packages() {
 
 acme_packages() {
     local missing='' c
-    for c in haproxy openssl; do
+    for c in haproxy openssl socat; do
         has "$c" || missing="$missing $c"
     done
     [ -z "$missing" ] && return 0
 
     if has apk; then
-        apk add --no-cache haproxy openssl
+        apk add --no-cache haproxy openssl socat
     elif has apt-get; then
-        apt-get update -qq && apt-get install -y haproxy openssl
+        apt-get update -qq && apt-get install -y haproxy openssl socat
     elif has dnf; then
-        dnf install -y haproxy openssl
+        dnf install -y haproxy openssl socat
     elif has yum; then
-        yum install -y haproxy openssl
+        yum install -y haproxy openssl socat
     elif has pacman; then
-        pacman -Sy --noconfirm haproxy openssl
+        pacman -Sy --noconfirm haproxy openssl socat
     else
         error "缺少依赖:$missing，且未找到包管理器。"
         return 1
