@@ -15,3 +15,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xpeb/vps-tools/main/bbr.sh)
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/xpeb/vps-tools/main/sing-box.sh)
 ```
+
+# xray.sh
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/xpeb/vps-tools/main/xray.sh)
+```
