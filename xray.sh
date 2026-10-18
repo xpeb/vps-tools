@@ -11,7 +11,6 @@ CERT_DIR="${CONF_DIR}/certs"
 ASSET_DIR="/usr/local/share/xray"
 LOG_DIR="/var/log/xray"
 RELEASE_BASE="https://github.com/XTLS/Xray-core/releases/latest/download"
-GEODATA_BASE="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download"
 
 OS=""
 INIT=""
@@ -22,36 +21,43 @@ SERVER_IP=""
 TMP_DIR=""
 FG=""
 BG=""
+DIM=""
+BOLD=""
+OFF=""
 RST=""
-
-HR="──────────────────────────────────────────"
+OSC_RESET=""
+W=42
+HR=""
 
 cleanup() {
     if [ -n "${TMP_DIR:-}" ]; then
         rm -rf "$TMP_DIR"
         TMP_DIR=""
     fi
-    printf '%s' "${RST:-}"
+    printf '%s%s' "${OSC_RESET:-}" "${RST:-}"
 }
 trap 'cleanup; exit 130' INT TERM
 trap 'cleanup' EXIT
 
 init_color() {
-    colors=0
-    if command -v tput >/dev/null 2>&1; then
-        colors=$(tput colors 2>/dev/null || printf '0')
-    fi
-    case "$colors" in
-        '' | *[!0-9]*) colors=0 ;;
-    esac
-    if [ "$colors" -gt 0 ] && [ "$colors" -lt 256 ]; then
-        FG=$(printf '\033[32m')
-        BG=
-    else
-        FG=$(printf '\033[38;5;78m')
-        BG=$(printf '\033[48;5;17m')
-    fi
+    BOLD=$(printf '\033[1m')
+    OFF=$(printf '\033[22m')
     RST=$(printf '\033[0m')
+    HR=$(awk -v n="$W" 'BEGIN {for (i = 0; i < n; i++) printf "─"}')
+    case "${TERM:-}" in
+        linux | dumb | vt100 | vt220 | cons25)
+            FG=$(printf '\033[32m')
+            BG=
+            DIM=$(printf '\033[2m')
+            ;;
+        *)
+            FG=$(printf '\033[38;2;109;206;154m')
+            BG=$(printf '\033[48;2;11;18;32m')
+            DIM=$(printf '\033[38;2;61;120;98m')
+            printf '\033]11;#0B1220\007\033]10;#6DCE9A\007'
+            OSC_RESET=$(printf '\033]111\007\033]110\007')
+            ;;
+    esac
 }
 
 paint() {
@@ -63,9 +69,86 @@ cls() {
     printf '\033[H\033[2J'
 }
 
+dwidth() {
+    printf '%s' "$1" | LC_ALL=C awk '
+        BEGIN {
+            w = 0
+            for (i = 0; i < 256; i++) {
+                byte[sprintf("%c", i)] = i
+            }
+        }
+        {
+            i = 1
+            n = length($0)
+            while (i <= n) {
+                b = byte[substr($0, i, 1)]
+                if (b < 128) {
+                    w++
+                    i++
+                } else if (b >= 228 && b <= 233) {
+                    w += 2
+                    i += 3
+                } else if (b >= 240) {
+                    w += 2
+                    i += 4
+                } else if (b >= 224) {
+                    w++
+                    i += 3
+                } else if (b >= 192) {
+                    w++
+                    i += 2
+                } else {
+                    i++
+                }
+            }
+        }
+        END { printf "%d", w }
+    '
+}
+
+pad() {
+    text=$1
+    width=$2
+    have=$(dwidth "$text")
+    need=$((width - have))
+    [ "$need" -lt 0 ] && need=0
+    printf '%s%*s' "$text" "$need" ""
+}
+
+line3() {
+    left=$1
+    mid=$2
+    right=$3
+    gap=$((W - $(dwidth "$left") - $(dwidth "$mid") - $(dwidth "$right")))
+    [ "$gap" -lt 2 ] && gap=2
+    g1=$((gap / 2))
+    g2=$((gap - g1))
+    printf '%s%*s%s%*s%s\n' "$left" "$g1" "" "$mid" "$g2" "" "$right"
+}
+
+rule() {
+    printf '%s%s%s\n' "$DIM" "$HR" "$FG"
+}
+
 title() {
-    printf '\033[1mXray 管理面板\033[22m\n'
-    printf '%s\n' "$HR"
+    printf '%s' "$BOLD"
+    if [ -n "$1" ]; then
+        line3 "Xray 管理面板" "" "$1"
+    else
+        printf 'Xray 管理面板\n'
+    fi
+    printf '%s' "$OFF"
+    rule
+}
+
+pair() {
+    left=$(printf '%-3s%s' "$1" "$2")
+    right=$(printf '%-3s%s' "$3" "$4")
+    printf '%s%s\n' "$(pad "$left" 22)" "$right"
+}
+
+kv() {
+    printf '%s%s\n' "$(pad "$1" 8)" "$2"
 }
 
 pause_back() {
@@ -118,16 +201,12 @@ json_escape() {
     '
 }
 
-b64() {
+b64url() {
     if printf '' | base64 -w 0 >/dev/null 2>&1; then
         printf '%s' "$1" | base64 -w 0
     else
         printf '%s' "$1" | base64 | tr -d '\n'
-    fi
-}
-
-b64url() {
-    b64 "$1" | tr '+/' '-_' | tr -d '='
+    fi | tr '+/' '-_' | tr -d '='
 }
 
 urlencode() {
@@ -232,12 +311,28 @@ detect_arch() {
     return 0
 }
 
+private_ip() {
+    case "$1" in
+        10.* | 127.* | 192.168.* | 169.254.* | 0.*) return 0 ;;
+        172.1[6-9].* | 172.2[0-9].* | 172.3[0-1].*) return 0 ;;
+        100.6[4-9].* | 100.[7-9][0-9].* | 100.1[0-1][0-9].* | 100.12[0-7].*) return 0 ;;
+    esac
+    return 1
+}
+
 detect_ip() {
     SERVER_IP=
     if command -v ip >/dev/null 2>&1; then
         SERVER_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "src") {print $(i + 1); exit}}')
     fi
-    if [ -z "$SERVER_IP" ] && command -v hostname >/dev/null 2>&1; then
+    if [ -z "$SERVER_IP" ] || private_ip "$SERVER_IP"; then
+        pub=$(curl -4 -fsS --max-time 4 https://api.ipify.org 2>/dev/null || true)
+        case "$pub" in
+            '' | *[!0-9.]*) ;;
+            *) SERVER_IP=$pub ;;
+        esac
+    fi
+    if { [ -z "$SERVER_IP" ] || private_ip "$SERVER_IP"; } && command -v hostname >/dev/null 2>&1; then
         SERVER_IP=$(hostname -i 2>/dev/null | awk '{print $1}')
     fi
     case "$SERVER_IP" in
@@ -251,15 +346,36 @@ prepare_user() {
     return 0
 }
 
-svc_active() {
-    if [ ! -x "$XRAY_BIN" ]; then
-        return 1
-    fi
+svc() {
+    op=$1
     if [ "$INIT" = systemd ]; then
-        systemctl is-active --quiet xray
+        case "$op" in
+            active) systemctl is-active --quiet xray ;;
+            enabled) systemctl is-enabled --quiet xray ;;
+            enable) systemctl enable xray >/dev/null 2>&1 ;;
+            disable) systemctl disable xray >/dev/null 2>&1 ;;
+            start) systemctl start xray ;;
+            restart) systemctl restart xray ;;
+            stop) systemctl stop xray ;;
+            reload) systemctl daemon-reload ;;
+        esac
         return $?
     fi
-    rc-service xray status 2>/dev/null | grep -qi started
+    case "$op" in
+        active) rc-service xray status 2>/dev/null | grep -qi started ;;
+        enabled) [ -e /etc/runlevels/default/xray ] ;;
+        enable) rc-update add xray default >/dev/null 2>&1 ;;
+        disable) rc-update del xray >/dev/null 2>&1 ;;
+        start) rc-service xray start ;;
+        restart) rc-service xray restart ;;
+        stop) rc-service xray stop ;;
+        reload) return 0 ;;
+    esac
+}
+
+svc_active() {
+    [ -x "$XRAY_BIN" ] || return 1
+    svc active
 }
 
 status_word() {
@@ -275,16 +391,22 @@ status_word() {
 }
 
 version_word() {
+    if [ -n "${VER_CACHE:-}" ]; then
+        printf '%s' "$VER_CACHE"
+        return
+    fi
     if [ ! -x "$XRAY_BIN" ]; then
-        printf '-'
+        VER_CACHE='-'
+        printf '%s' "$VER_CACHE"
         return
     fi
     ver=$("$XRAY_BIN" version 2>/dev/null | awk 'NR == 1 {print $2; exit}')
     case "$ver" in
-        '') printf '-' ;;
-        v*) printf '%s' "$ver" ;;
-        *) printf 'v%s' "$ver" ;;
+        '') VER_CACHE='-' ;;
+        v*) VER_CACHE=$ver ;;
+        *) VER_CACHE="v${ver}" ;;
     esac
+    printf '%s' "$VER_CACHE"
 }
 
 inbound_count() {
@@ -302,35 +424,25 @@ draw_main() {
     st=$(status_word)
     ver=$(version_word)
     n=$(inbound_count)
-    left="● ${st}"
-    right="入站 ${n}"
-    lw=8
-    rw=$((5 + ${#n}))
-    gap=$((42 - lw - ${#ver} - rw))
-    [ "$gap" -lt 2 ] && gap=2
-    g1=$((gap / 2))
-    g2=$((gap - g1))
-    printf '%s%*s%s%*s%s\n' "$left" "$g1" "" "$ver" "$g2" "" "$right"
-    printf '%s\n' "$HR"
+    case "$st" in
+        运行中) mark='●' ;;
+        *) mark='○' ;;
+    esac
+    line3 "${mark} ${st}" "$ver" "入站 ${n}"
+    rule
     printf '\n'
-    printf '1  安装内核                    6  查看日志\n'
-    printf '2  升级内核                    7  添加入站\n'
-    printf '3  启动内核                    8  修改入站\n'
-    printf '4  停止内核                    9  分享入站\n'
-    printf '5  卸载内核                    10 删除入站\n'
+    pair 1 安装内核 6 查看日志
+    pair 2 升级内核 7 添加入站
+    pair 3 启动内核 8 修改入站
+    pair 4 停止内核 9 分享入站
+    pair 5 卸载内核 10 删除入站
     read_choice "回车退出"
 }
 
 page_head() {
     cls
-    title
-    printf '%s\n' "$1"
-    printf '%s\n' "$HR"
+    title "$1"
     printf '\n'
-}
-
-need_root() {
-    [ "$(id -u)" -eq 0 ]
 }
 
 need_kernel() {
@@ -342,22 +454,32 @@ need_kernel() {
     return 1
 }
 
+pkg_install() {
+    if [ "$OS" = debian ]; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq && apt-get install -y "$@"
+    else
+        apk add --no-cache "$@"
+    fi
+}
+
 install_packages() {
     if command -v curl >/dev/null 2>&1 && command -v unzip >/dev/null 2>&1 \
         && command -v openssl >/dev/null 2>&1 && command -v sha256sum >/dev/null 2>&1; then
         return 0
     fi
     printf '正在安装依赖...\n'
-    if [ "$OS" = debian ]; then
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get update -qq && apt-get install -y curl unzip ca-certificates openssl
-    else
-        apk add --no-cache curl unzip ca-certificates openssl
-    fi
+    pkg_install curl unzip ca-certificates openssl
 }
 
 download() {
     curl -fL --retry 5 --retry-delay 2 -o "$2" "$1"
+}
+
+abort_dl() {
+    rm -rf "$TMP_DIR"
+    TMP_DIR=
+    notice "$1"
 }
 
 install_binary() {
@@ -374,30 +496,22 @@ install_binary() {
     url="${RELEASE_BASE}/Xray-linux-${MACHINE}.zip"
     printf '正在下载内核...\n'
     if ! download "$url" "$zip"; then
-        rm -rf "$TMP_DIR"
-        TMP_DIR=
-        notice "下载失败"
+        abort_dl "下载失败"
         return 1
     fi
     printf '正在校验...\n'
     if ! download "${url}.dgst" "${zip}.dgst"; then
-        rm -rf "$TMP_DIR"
-        TMP_DIR=
-        notice "校验文件下载失败"
+        abort_dl "校验文件下载失败"
         return 1
     fi
     expect=$(awk -F '= ' '/256=/ {print $2; exit}' "${zip}.dgst" | tr -d ' \r' | tr 'A-F' 'a-f')
     got=$(sha256sum "$zip" | awk '{print $1}' | tr 'A-F' 'a-f')
     if [ -z "$expect" ] || [ "$expect" != "$got" ]; then
-        rm -rf "$TMP_DIR"
-        TMP_DIR=
-        notice "SHA256 校验失败"
+        abort_dl "SHA256 校验失败"
         return 1
     fi
     if ! unzip -qo "$zip" -d "$TMP_DIR/xray"; then
-        rm -rf "$TMP_DIR"
-        TMP_DIR=
-        notice "解压失败"
+        abort_dl "解压失败"
         return 1
     fi
     install -m 755 "${TMP_DIR}/xray/xray" "$XRAY_BIN"
@@ -406,15 +520,12 @@ install_binary() {
         install -m 644 "${TMP_DIR}/xray/geoip.dat" "${ASSET_DIR}/geoip.dat"
         install -m 644 "${TMP_DIR}/xray/geosite.dat" "${ASSET_DIR}/geosite.dat"
     fi
-    printf '正在下载地理数据...\n'
-    if download "${GEODATA_BASE}/geoip.dat" "${ASSET_DIR}/geoip.dat" \
-        && download "${GEODATA_BASE}/geosite.dat" "${ASSET_DIR}/geosite.dat"; then
-        chmod 644 "${ASSET_DIR}/geoip.dat" "${ASSET_DIR}/geosite.dat"
-    else
-        printf '地理数据下载失败，已保留安装包内置数据\n'
+    if id nobody >/dev/null 2>&1; then
+        chown "nobody:$(id -gn nobody)" "$ASSET_DIR" "${ASSET_DIR}/geoip.dat" "${ASSET_DIR}/geosite.dat" 2>/dev/null || true
     fi
     rm -rf "$TMP_DIR"
     TMP_DIR=
+    VER_CACHE=
     return 0
 }
 
@@ -430,11 +541,16 @@ install_service() {
     chown "${RUN_USER}:${RUN_GROUP}" "${LOG_DIR}/access.log" "${LOG_DIR}/error.log"
     chmod 600 "${LOG_DIR}/access.log" "${LOG_DIR}/error.log"
     install_logrotate
+    write_units
+}
+
+write_units() {
+    prepare_user || return 1
     if [ "$INIT" = systemd ]; then
         cat >/etc/systemd/system/xray.service <<EOF
 [Unit]
 Description=Xray Service
-Documentation=https://xtls.github.io
+Documentation=https://github.com/xtls
 After=network.target nss-lookup.target
 
 [Service]
@@ -443,23 +559,26 @@ CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 Environment=XRAY_LOCATION_ASSET=${ASSET_DIR}
+Environment=XRAY_JSON_STRICT=true
 ExecStart=${XRAY_BIN} run -config ${CONF_FILE}
 Restart=on-failure
 RestartPreventExitStatus=23
 LimitNPROC=10000
 LimitNOFILE=1000000
+RuntimeDirectory=xray
+RuntimeDirectoryMode=0755
 
 [Install]
 WantedBy=multi-user.target
 EOF
         chmod 644 /etc/systemd/system/xray.service
-        systemctl daemon-reload
+        svc reload
     else
         cat >/etc/init.d/xray <<EOF
 #!/sbin/openrc-run
 
-name="Xray"
-description="Xray-core"
+name="Xray Daemon"
+description="A unified platform for anti-censorship"
 supervisor=supervise-daemon
 respawn_delay=5
 respawn_max=2
@@ -467,40 +586,43 @@ respawn_period=600
 pidfile="/run/\${RC_SVCNAME}.pid"
 rc_ulimit="-n 1024000 -u 1024000"
 capabilities="^cap_net_bind_service,^cap_net_admin,^cap_net_raw"
-env="XRAY_LOCATION_ASSET=${ASSET_DIR}"
+extra_commands="checkconfig"
+env="XRAY_LOCATION_ASSET=${ASSET_DIR}/"
 command="${XRAY_BIN}"
 command_user="${RUN_USER}:${RUN_GROUP}"
 command_args="run -config ${CONF_FILE}"
+required_files="${CONF_FILE}"
 
 depend() {
     need net
     after firewall
 }
 
-start_pre() {
-    export XRAY_LOCATION_ASSET=${ASSET_DIR}
-    \$command run -test -config ${CONF_FILE} || return 1
+checkconfig() {
+    export \$env
+    \$command run -test -config ${CONF_FILE}
+    eend \$?
 }
 EOF
         chmod 755 /etc/init.d/xray
     fi
 }
 
+unit_ok() {
+    if [ "$INIT" = systemd ]; then
+        grep -q 'XRAY_JSON_STRICT=true' /etc/systemd/system/xray.service 2>/dev/null
+    else
+        [ -f /etc/init.d/xray ] && ! grep -q 'start_pre' /etc/init.d/xray
+    fi
+}
+
 install_logrotate() {
     if ! command -v logrotate >/dev/null 2>&1; then
         printf '正在安装日志轮转...\n'
-        if [ "$OS" = debian ]; then
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update -qq && apt-get install -y logrotate || {
-                printf '日志轮转安装失败，不影响内核运行\n'
-                return 0
-            }
-        else
-            apk add --no-cache logrotate || {
-                printf '日志轮转安装失败，不影响内核运行\n'
-                return 0
-            }
-        fi
+        pkg_install logrotate || {
+            printf '日志轮转安装失败，不影响内核运行\n'
+            return 0
+        }
     fi
     install -d -m 755 /etc/logrotate.d
     # Xray 不会重新打开日志，必须 copytruncate，否则轮转后仍写入旧文件。
@@ -525,41 +647,28 @@ EOF
 }
 
 svc_start() {
-    if [ "$INIT" = systemd ]; then
-        systemctl enable xray >/dev/null 2>&1 || true
-        systemctl restart xray
-    else
-        rc-update add xray default >/dev/null 2>&1 || true
-        rc-service xray restart
-    fi
+    svc enabled || svc enable || true
+    svc start
 }
 
-svc_stop() {
-    if [ "$INIT" = systemd ]; then
-        systemctl stop xray
-    else
-        rc-service xray stop
-    fi
+install_core() {
+    page_head "$1"
+    install_packages || {
+        notice "依赖安装失败"
+        return 1
+    }
+    paint
+    install_binary "$2" || return 1
+    install_service
 }
 
 action_install() {
-    if ! need_root; then
-        notice "请用 root 运行"
-        return
-    fi
     if [ -x "$XRAY_BIN" ]; then
         notice "内核已安装
 请使用 2  升级内核"
         return
     fi
-    page_head "安装内核"
-    install_packages || {
-        notice "依赖安装失败"
-        return
-    }
-    paint
-    install_binary 0 || return
-    install_service || return
+    install_core "安装内核" 0 || return
     if [ ! -f "$CONF_FILE" ]; then
         rebuild_config || {
             notice "写入空配置失败"
@@ -572,25 +681,15 @@ action_install() {
 }
 
 action_upgrade() {
-    if ! need_root; then
-        notice "请用 root 运行"
-        return
-    fi
     if ! need_kernel; then
         return
     fi
-    page_head "升级内核"
     was=0
     svc_active && was=1
-    install_packages || {
-        notice "依赖安装失败"
-        return
-    }
-    paint
-    install_binary 1 || return
-    install_service || return
+    install_core "升级内核" 1 || return
     if [ "$was" -eq 1 ]; then
-        if svc_start; then
+        svc enabled || svc enable || true
+        if svc restart; then
             notice "内核已升级并重新启动
 版本  $(version_word)"
         else
@@ -605,10 +704,6 @@ action_upgrade() {
 }
 
 action_start() {
-    if ! need_root; then
-        notice "请用 root 运行"
-        return
-    fi
     if ! need_kernel; then
         return
     fi
@@ -619,6 +714,7 @@ action_start() {
         notice "内核已在运行"
         return
     fi
+    unit_ok || write_units
     if svc_start; then
         notice "内核已启动"
     else
@@ -628,10 +724,6 @@ action_start() {
 }
 
 action_stop() {
-    if ! need_root; then
-        notice "请用 root 运行"
-        return
-    fi
     if ! need_kernel; then
         return
     fi
@@ -639,7 +731,7 @@ action_stop() {
         notice "内核未在运行"
         return
     fi
-    if svc_stop; then
+    if svc stop; then
         notice "内核已停止"
     else
         notice "停止失败"
@@ -647,10 +739,6 @@ action_stop() {
 }
 
 action_uninstall() {
-    if ! need_root; then
-        notice "请用 root 运行"
-        return
-    fi
     if [ ! -x "$XRAY_BIN" ] && [ ! -f /etc/systemd/system/xray.service ] && [ ! -f /etc/init.d/xray ]; then
         notice "内核未安装"
         return
@@ -664,13 +752,12 @@ action_uninstall() {
         2) purge=1 ;;
         *) return ;;
     esac
-    svc_active && svc_stop || true
+    svc_active && svc stop || true
+    svc disable || true
     if [ "$INIT" = systemd ]; then
-        systemctl disable xray >/dev/null 2>&1 || true
         rm -f /etc/systemd/system/xray.service
-        systemctl daemon-reload >/dev/null 2>&1 || true
+        svc reload >/dev/null 2>&1 || true
     else
-        rc-update del xray >/dev/null 2>&1 || true
         rm -f /etc/init.d/xray
     fi
     rm -f "$XRAY_BIN"
@@ -703,29 +790,15 @@ action_logs() {
     pause_back
 }
 
+FIELDS="IB_ID TAG PROTO LISTEN PORT SS_METHOD SS_PASSWORD SOCKS_USER SOCKS_PASS SOCKS_UDP TROJAN_PASSWORD VLESS_ID VLESS_FLOW HY_AUTH BRUTAL_UP BRUTAL_DOWN HY_MASQ SNI CERT KEY SELF_SIGNED ACME CERT_SHA"
+
 reset_ib() {
-    IB_ID=
-    TAG=
-    PROTO=
-    LISTEN=
-    PORT=
-    SS_METHOD=
-    SS_PASSWORD=
-    SOCKS_USER=
-    SOCKS_PASS=
+    for key in $FIELDS; do
+        eval "$key="
+    done
     SOCKS_UDP=1
-    TROJAN_PASSWORD=
-    VLESS_ID=
-    VLESS_FLOW=
-    HY_AUTH=
-    BRUTAL_UP=
-    BRUTAL_DOWN=
-    HY_MASQ=
-    SNI=
-    CERT=
-    KEY=
     SELF_SIGNED=0
-    CERT_SHA=
+    ACME=0
 }
 
 load_ib() {
@@ -740,43 +813,25 @@ qv() {
 
 save_ib() {
     file=$1
+    [ "$PROTO" = vless ] && VLESS_FLOW=xtls-rprx-vision
     install -d -m 755 "$PANEL_DIR"
+    old_umask=$(umask)
     umask 077
-    cat >"$file" <<EOF
-IB_ID='$(qv "$IB_ID")'
-TAG='$(qv "$TAG")'
-PROTO='$(qv "$PROTO")'
-LISTEN='$(qv "$LISTEN")'
-PORT='$(qv "$PORT")'
-SS_METHOD='$(qv "$SS_METHOD")'
-SS_PASSWORD='$(qv "$SS_PASSWORD")'
-SOCKS_USER='$(qv "$SOCKS_USER")'
-SOCKS_PASS='$(qv "$SOCKS_PASS")'
-SOCKS_UDP='$(qv "$SOCKS_UDP")'
-TROJAN_PASSWORD='$(qv "$TROJAN_PASSWORD")'
-VLESS_ID='$(qv "$VLESS_ID")'
-VLESS_FLOW='$(qv "$VLESS_FLOW")'
-HY_AUTH='$(qv "$HY_AUTH")'
-BRUTAL_UP='$(qv "$BRUTAL_UP")'
-BRUTAL_DOWN='$(qv "$BRUTAL_DOWN")'
-HY_MASQ='$(qv "$HY_MASQ")'
-SNI='$(qv "$SNI")'
-CERT='$(qv "$CERT")'
-KEY='$(qv "$KEY")'
-SELF_SIGNED='$(qv "$SELF_SIGNED")'
-CERT_SHA='$(qv "$CERT_SHA")'
-EOF
+    : >"$file"
+    for key in $FIELDS; do
+        eval "val=\${$key}"
+        printf "%s='%s'\n" "$key" "$(qv "$val")" >>"$file"
+    done
+    umask "$old_umask"
     chmod 600 "$file"
 }
 
-ib_get() {
-    file=$1
-    key=$2
+ib_rec() {
     (
         reset_ib
         # shellcheck disable=SC1090
-        . "$file"
-        eval "printf '%s' \"\${$key}\""
+        . "$1"
+        printf '%s|%s|%s|%s' "$IB_ID" "$PORT" "$PROTO" "${SOCKS_UDP:-1}"
     )
 }
 
@@ -796,29 +851,26 @@ proto_kind() {
     esac
 }
 
-kinds_overlap() {
-    case "$1:$2" in
-        tcp:udp | udp:tcp) return 1 ;;
-        *) return 0 ;;
-    esac
-}
-
 port_busy() {
     want=$1
     kind=$2
     skip=${3:-}
     for f in "$PANEL_DIR"/*.env; do
         [ -f "$f" ] || continue
-        id=$(ib_get "$f" IB_ID)
+        rec=$(ib_rec "$f")
+        id=${rec%%|*}
+        rest=${rec#*|}
+        p=${rest%%|*}
+        rest=${rest#*|}
+        other=${rest%%|*}
+        udp=${rest#*|}
         [ -n "$skip" ] && [ "$id" = "$skip" ] && continue
-        p=$(ib_get "$f" PORT)
         [ "$p" = "$want" ] || continue
-        other=$(ib_get "$f" PROTO)
-        udp=$(ib_get "$f" SOCKS_UDP)
         okind=$(proto_kind "$other" "$udp")
-        if kinds_overlap "$kind" "$okind"; then
-            return 0
-        fi
+        case "$kind:$okind" in
+            tcp:udp | udp:tcp) ;;
+            *) return 0 ;;
+        esac
     done
     return 1
 }
@@ -866,20 +918,12 @@ os_port_busy() {
     [ -n "$inodes" ] || return 1
     for ino in $inodes; do
         pid=
-        for piddir in /proc/[0-9]*; do
-            hit=
-            for fd in "$piddir"/fd/*; do
-                [ -L "$fd" ] || continue
-                target=$(readlink "$fd" 2>/dev/null) || continue
-                if [ "$target" = "socket:[$ino]" ]; then
-                    hit=1
-                    break
-                fi
-            done
-            if [ -n "$hit" ]; then
-                pid=${piddir#/proc/}
-                break
-            fi
+        for link in /proc/[0-9]*/fd/*; do
+            [ -L "$link" ] || continue
+            [ "$(readlink "$link" 2>/dev/null)" = "socket:[$ino]" ] || continue
+            pid=${link#/proc/}
+            pid=${pid%%/*}
+            break
         done
         [ -n "$pid" ] || return 0
         exe=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
@@ -910,7 +954,8 @@ next_id() {
     max=0
     for f in "$PANEL_DIR"/*.env; do
         [ -f "$f" ] || continue
-        id=$(ib_get "$f" IB_ID)
+        rec=$(ib_rec "$f")
+        id=${rec%%|*}
         is_number "$id" || continue
         [ "$id" -gt "$max" ] && max=$id
     done
@@ -935,9 +980,12 @@ list_inbounds() {
         [ -f "$f" ] || continue
         found=1
         i=$((i + 1))
-        proto=$(ib_get "$f" PROTO)
-        port=$(ib_get "$f" PORT)
-        printf '%-4s%-16s%s\n' "$i" "$(proto_label "$proto")" "$port"
+        rec=$(ib_rec "$f")
+        rest=${rec#*|}
+        port=${rest%%|*}
+        rest=${rest#*|}
+        proto=${rest%%|*}
+        printf '%s%s\n' "$(pad "$(printf '%-3s%s' "$i" "$(proto_label "$proto")")" 22)" "$port"
     done
     [ "$found" -eq 1 ]
 }
@@ -972,6 +1020,11 @@ pick_inbound() {
 
 tls_block() {
     alpn=$1
+    once=
+    # 自签证书不续期，只加载一次。ACME 和外部证书保持官方热重载。
+    if [ "$SELF_SIGNED" = 1 ]; then
+        once='"oneTimeLoading": true,'
+    fi
     cat <<EOF
     "security": "tls",
     "tlsSettings": {
@@ -979,7 +1032,7 @@ tls_block() {
       "alpn": ${alpn},
       "certificates": [
         {
-          "usage": "encipherment",
+          ${once}
           "certificateFile": "$(json_escape "$CERT")",
           "keyFile": "$(json_escape "$KEY")"
         }
@@ -988,25 +1041,37 @@ tls_block() {
 EOF
 }
 
-emit_inbound() {
-    case "$PROTO" in
-        shadowsocks)
-            cat <<EOF
+SNIFF='  "sniffing": {"enabled": true, "destOverride": ["http", "tls"]}'
+
+emit_open() {
+    cat <<EOF
 {
   "tag": "$(json_escape "$TAG")",
   "listen": "$(json_escape "$LISTEN")",
   "port": ${PORT},
-  "protocol": "shadowsocks",
+  "protocol": "$1",
+EOF
+}
+
+emit_tail() {
+    printf '%s\n}\n' "$SNIFF"
+}
+
+emit_inbound() {
+    mail="$(json_escape "$TAG")@xray.local"
+    case "$PROTO" in
+        shadowsocks)
+            emit_open shadowsocks
+            cat <<EOF
   "settings": {
     "network": "tcp,udp",
     "method": "$(json_escape "$SS_METHOD")",
     "password": "$(json_escape "$SS_PASSWORD")",
     "level": 0,
-    "email": "$(json_escape "$TAG")@xray.local"
+    "email": "${mail}"
   },
-  "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"]}
-}
 EOF
+            emit_tail
             ;;
         socks)
             udp_json=false
@@ -1018,12 +1083,8 @@ EOF
                     udp_ip=$SERVER_IP
                     ;;
             esac
+            emit_open socks
             cat <<EOF
-{
-  "tag": "$(json_escape "$TAG")",
-  "listen": "$(json_escape "$LISTEN")",
-  "port": ${PORT},
-  "protocol": "socks",
   "settings": {
     "auth": "password",
     "udp": ${udp_json},
@@ -1031,38 +1092,25 @@ EOF
     "userLevel": 0,
     "users": [{"user": "$(json_escape "$SOCKS_USER")", "pass": "$(json_escape "$SOCKS_PASS")"}]
   },
-  "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"]}
-}
 EOF
+            emit_tail
             ;;
         trojan)
+            emit_open trojan
             cat <<EOF
-{
-  "tag": "$(json_escape "$TAG")",
-  "listen": "$(json_escape "$LISTEN")",
-  "port": ${PORT},
-  "protocol": "trojan",
   "settings": {
-    "users": [{"password": "$(json_escape "$TROJAN_PASSWORD")", "email": "$(json_escape "$TAG")@xray.local", "level": 0}]
+    "users": [{"password": "$(json_escape "$TROJAN_PASSWORD")", "email": "${mail}", "level": 0}]
   },
   "streamSettings": {
     "method": "raw",
-    "network": "tcp",
 $(tls_block '["h2", "http/1.1"]')
   },
-  "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"]}
-}
 EOF
+            emit_tail
             ;;
         vless)
-            # TCP+TLS 下 VLESS 可用 xtls-rprx-vision，固定启用。
-            VLESS_FLOW=xtls-rprx-vision
+            emit_open vless
             cat <<EOF
-{
-  "tag": "$(json_escape "$TAG")",
-  "listen": "$(json_escape "$LISTEN")",
-  "port": ${PORT},
-  "protocol": "vless",
   "settings": {
     "decryption": "none",
     "flow": "xtls-rprx-vision",
@@ -1070,17 +1118,15 @@ EOF
       "id": "$(json_escape "$VLESS_ID")",
       "flow": "xtls-rprx-vision",
       "level": 0,
-      "email": "$(json_escape "$TAG")@xray.local"
+      "email": "${mail}"
     }]
   },
   "streamSettings": {
     "method": "raw",
-    "network": "tcp",
 $(tls_block '["http/1.1"]')
   },
-  "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"]}
-}
 EOF
+            emit_tail
             ;;
         hysteria)
             masq=
@@ -1093,28 +1139,21 @@ EOF
                 brutal=",
     \"finalmask\": {\"quicParams\": {\"congestion\": \"brutal\", \"brutalUp\": \"$(json_escape "$BRUTAL_UP")\", \"brutalDown\": \"$(json_escape "$BRUTAL_DOWN")\"}}"
             fi
+            emit_open hysteria
             cat <<EOF
-{
-  "tag": "$(json_escape "$TAG")",
-  "listen": "$(json_escape "$LISTEN")",
-  "port": ${PORT},
-  "protocol": "hysteria",
   "settings": {
     "version": 2,
-    "users": [{"auth": "$(json_escape "$HY_AUTH")", "level": 0, "email": "$(json_escape "$TAG")@xray.local"}]
+    "users": [{"auth": "$(json_escape "$HY_AUTH")", "level": 0, "email": "${mail}"}]
   },
   "streamSettings": {
     "method": "hysteria",
-    "network": "hysteria",
 $(tls_block '["h3"]'),
     "hysteriaSettings": {
-      "version": 2,
-      "auth": "$(json_escape "$HY_AUTH")"${masq}
+      "version": 2${masq}
     }${brutal}
   },
-  "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"]}
-}
 EOF
+            emit_tail
             ;;
     esac
 }
@@ -1191,7 +1230,7 @@ ${err}"
     fi
     rm -f "${CONF_DIR}/test.err"
     if svc_active; then
-        svc_start || {
+        svc restart || {
             notice "配置已写入，但重启失败"
             return 1
         }
@@ -1208,56 +1247,206 @@ needs_tls() {
 
 setup_tls() {
     page_head "证书"
-    printf '1  自动生成自签证书\n'
-    printf '2  使用已有证书\n'
+    printf '1  自签名\n'
+    printf '2  ACME\n'
+    printf '3  已有证书\n'
     read_choice "回车 自签"
     case "$CHOICE" in
+        '' | 1) issue_self_signed || return 1 ;;
+        2) issue_acme || return 1 ;;
+        3) use_existing_cert || return 1 ;;
+        *) return 1 ;;
+    esac
+    CERT_SHA=$(cert_fp "$CERT")
+    return 0
+}
+
+issue_self_signed() {
+    SELF_SIGNED=1
+    ACME=0
+    SNI=$(ask "域名" "xray.local")
+    [ -n "$SNI" ] || SNI=xray.local
+    install -d -m 755 "$CERT_DIR"
+    prefix="${CERT_DIR}/${TAG}"
+    # 默认只签 90 天，面板不续期，这里签 10 年。
+    if ! "$XRAY_BIN" tls cert --domain "$SNI" --name "$SNI" --expire 87600h --file "$prefix" >/dev/null 2>&1; then
+        notice "生成证书失败"
+        return 1
+    fi
+    CERT="${prefix}.crt"
+    KEY="${prefix}.key"
+    lock_cert
+}
+
+use_existing_cert() {
+    SELF_SIGNED=0
+    ACME=0
+    CERT=$(ask "证书路径" "")
+    KEY=$(ask "私钥路径" "")
+    if [ ! -r "$CERT" ] || [ ! -r "$KEY" ]; then
+        notice "证书或私钥不可读"
+        return 1
+    fi
+    SNI=$(ask "SNI / 域名" "")
+    if [ -z "$SNI" ]; then
+        SNI=$(openssl x509 -in "$CERT" -noout -subject -nameopt sep_multiline 2>/dev/null | awk -F= '/CN=/{gsub(/ /,"",$2); print $2; exit}')
+    fi
+    if [ -z "$SNI" ]; then
+        notice "需要填写域名"
+        return 1
+    fi
+}
+
+acme_bin() {
+    if [ -x "${HOME:-/root}/.acme.sh/acme.sh" ]; then
+        printf '%s' "${HOME:-/root}/.acme.sh/acme.sh"
+        return 0
+    fi
+    command -v acme.sh 2>/dev/null
+}
+
+ensure_acme() {
+    bin=$(acme_bin) && [ -n "$bin" ] && return 0
+    printf '正在安装 acme.sh...\n'
+    pkg_install socat curl || {
+        notice "安装 acme.sh 依赖失败"
+        return 1
+    }
+    paint
+    curl -fsSL https://get.acme.sh | sh || {
+        notice "acme.sh 安装失败"
+        return 1
+    }
+    bin=$(acme_bin) || {
+        notice "找不到 acme.sh"
+        return 1
+    }
+    "$bin" --upgrade --auto-upgrade >/dev/null 2>&1 || true
+    "$bin" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+}
+
+write_acme_reload() {
+    prepare_user || true
+    install -d -m 755 "$CONF_DIR"
+    cat >"${CONF_DIR}/acme-reload.sh" <<EOF
+#!/bin/sh
+chown "root:${RUN_GROUP:-nobody}" ${CERT_DIR}/*.key 2>/dev/null || true
+chmod 640 ${CERT_DIR}/*.key 2>/dev/null || true
+chmod 644 ${CERT_DIR}/*.crt 2>/dev/null || true
+if [ -d /run/systemd/system ]; then
+    systemctl try-restart xray
+else
+    rc-service xray try-restart 2>/dev/null || rc-service xray restart
+fi
+exit 0
+EOF
+    chmod 755 "${CONF_DIR}/acme-reload.sh"
+}
+
+issue_acme() {
+    SELF_SIGNED=0
+    ACME=1
+    page_head "ACME"
+    printf '使用 acme.sh 向 Let'\''s Encrypt 申请 ECC 证书\n\n'
+    SNI=$(ask "域名" "")
+    case "$SNI" in
+        '' | *[!A-Za-z0-9.-]* | .* | *. | *\**)
+            notice "需要真实域名，不支持通配符"
+            return 1
+            ;;
+        *.*) ;;
+        *)
+            notice "需要真实域名"
+            return 1
+            ;;
+    esac
+    printf '\n1  80 端口验证，会短暂停止内核\n'
+    printf '2  网站目录验证\n'
+    read_choice "回车 80 端口"
+    webroot=
+    case "$CHOICE" in
         '' | 1)
-            SELF_SIGNED=1
-            SNI=$(ask "域名" "xray.local")
-            [ -n "$SNI" ] || SNI=xray.local
-            install -d -m 755 "$CERT_DIR"
-            prefix="${CERT_DIR}/${TAG}"
-            # 默认只签 90 天，面板不续期，这里签 10 年。
-            if ! "$XRAY_BIN" tls cert --domain "$SNI" --name "$SNI" --expire 87600h --file "$prefix" >/dev/null 2>&1; then
-                notice "生成证书失败"
+            if os_port_busy 80 tcp; then
+                notice "80 端口被其他程序占用\n请改用网站目录验证"
                 return 1
             fi
-            CERT="${prefix}.crt"
-            KEY="${prefix}.key"
-            chmod 644 "$CERT"
-            chmod 640 "$KEY"
             ;;
         2)
-            SELF_SIGNED=0
-            CERT=$(ask "证书路径" "")
-            KEY=$(ask "私钥路径" "")
-            if [ ! -r "$CERT" ] || [ ! -r "$KEY" ]; then
-                notice "证书或私钥不可读"
-                return 1
-            fi
-            SNI=$(ask "SNI / 域名" "")
-            if [ -z "$SNI" ]; then
-                SNI=$(openssl x509 -in "$CERT" -noout -subject -nameopt sep_multiline 2>/dev/null | awk -F= '/CN=/{gsub(/ /,"",$2); print $2; exit}')
-            fi
-            if [ -z "$SNI" ]; then
-                notice "需要填写域名"
+            webroot=$(ask "网站目录" "")
+            if [ ! -d "$webroot" ]; then
+                notice "网站目录不存在"
                 return 1
             fi
             ;;
         *) return 1 ;;
     esac
-    CERT_SHA=$(openssl x509 -in "$CERT" -noout -fingerprint -sha256 | awk -F= '{print $2}' | tr -d ':' | tr 'A-F' 'a-f')
-    return 0
+    ensure_acme || return 1
+    bin=$(acme_bin)
+    held=0
+    if [ -z "$webroot" ] && svc_active; then
+        svc stop || true
+        held=1
+    fi
+    log=$(mktemp)
+    if [ -n "$webroot" ]; then
+        "$bin" --issue -d "$SNI" -w "$webroot" --keylength ec-256 --server letsencrypt >"$log" 2>&1
+    else
+        "$bin" --issue -d "$SNI" --standalone --httpport 80 --keylength ec-256 --server letsencrypt >"$log" 2>&1
+    fi
+    st=$?
+    if [ "$st" -ne 0 ] && [ "$st" -ne 2 ]; then
+        err=$(tail -n 8 "$log" 2>/dev/null || true)
+        rm -f "$log"
+        acme_resume
+        notice "证书申请失败\n${err}"
+        return 1
+    fi
+    rm -f "$log"
+    install -d -m 755 "$CERT_DIR"
+    CERT="${CERT_DIR}/${SNI}.crt"
+    KEY="${CERT_DIR}/${SNI}.key"
+    write_acme_reload
+    if ! "$bin" --install-cert -d "$SNI" --ecc \
+        --fullchain-file "$CERT" \
+        --key-file "$KEY" \
+        --reloadcmd "${CONF_DIR}/acme-reload.sh" >/dev/null 2>&1; then
+        acme_resume
+        notice "证书安装失败"
+        return 1
+    fi
+    lock_cert
+    acme_resume
+}
+
+lock_cert() {
+    chmod 644 "$CERT"
+    chmod 640 "$KEY"
+}
+
+acme_resume() {
+    [ "${held:-0}" -eq 1 ] || return 0
+    svc_start || true
+}
+
+cert_still_used() {
+    want=$1
+    for f in "$PANEL_DIR"/*.env; do
+        [ -f "$f" ] || continue
+        got=$(. "$f"; printf '%s' "$CERT")
+        [ "$got" = "$want" ] && return 0
+    done
+    return 1
+}
+
+cert_fp() {
+    openssl x509 -in "$1" -noout -fingerprint -sha256 | awk -F= '{print $2}' | tr -d ':' | tr 'A-F' 'a-f'
 }
 
 ss_key_bytes() {
     case "$1" in
         2022-blake3-aes-128-gcm) printf 16 ;;
         2022-blake3-aes-256-gcm | 2022-blake3-chacha20-poly1305) printf 32 ;;
-        aes-128-gcm | aes-256-gcm | chacha20-poly1305 | chacha20-ietf-poly1305 | xchacha20-poly1305 | xchacha20-ietf-poly1305)
-            printf 0
-            ;;
+        aes-128-gcm | aes-256-gcm | chacha20-poly1305 | xchacha20-poly1305) printf 0 ;;
         *) return 1 ;;
     esac
 }
@@ -1302,10 +1491,7 @@ fill_new_secrets() {
             SOCKS_PASS=$(rand_b64 12)
             ;;
         trojan) TROJAN_PASSWORD=$(rand_hex 16) ;;
-        vless)
-            VLESS_ID=$("$XRAY_BIN" uuid)
-            VLESS_FLOW=xtls-rprx-vision
-            ;;
+        vless) VLESS_ID=$("$XRAY_BIN" uuid) ;;
         hysteria) HY_AUTH=$(rand_hex 16) ;;
     esac
     return 0
@@ -1325,7 +1511,7 @@ cert_pin() {
         return 1
     fi
     if [ -z "$CERT_SHA" ] && [ -r "$CERT" ]; then
-        CERT_SHA=$(openssl x509 -in "$CERT" -noout -fingerprint -sha256 | awk -F= '{print $2}' | tr -d ':' | tr 'A-F' 'a-f')
+        CERT_SHA=$(cert_fp "$CERT")
     fi
     [ -n "$CERT_SHA" ] || return 1
     printf '%s' "$CERT_SHA" | tr 'a-f' 'A-F'
@@ -1334,40 +1520,40 @@ cert_pin() {
 print_share() {
     host=$(share_host)
     pin=$(cert_pin || true)
-    printf '协议    %s\n' "$(proto_label "$PROTO")"
-    printf '地址    %s\n' "$host"
-    printf '端口    %s\n' "$PORT"
+    kv 协议 "$(proto_label "$PROTO")"
+    kv 地址 "$host"
+    kv 端口 "$PORT"
     case "$PROTO" in
         shadowsocks)
-            printf '加密    %s\n' "$SS_METHOD"
-            printf '密码    %s\n' "$SS_PASSWORD"
+            kv 加密 "$SS_METHOD"
+            kv 密码 "$SS_PASSWORD"
             printf '\n%s\n' "ss://$(b64url "${SS_METHOD}:${SS_PASSWORD}")@${host}:${PORT}#ss"
             ;;
         socks)
-            printf '监听    %s\n' "$LISTEN"
-            printf '用户    %s\n' "$SOCKS_USER"
-            printf '密码    %s\n' "$SOCKS_PASS"
-            printf 'UDP     %s\n' "$SOCKS_UDP"
+            kv 监听 "$LISTEN"
+            kv 用户 "$SOCKS_USER"
+            kv 密码 "$SOCKS_PASS"
+            kv UDP "$SOCKS_UDP"
             printf '\nSocks 无传输加密，不要暴露到公网\n'
             ;;
         trojan)
-            printf '密码    %s\n' "$TROJAN_PASSWORD"
-            printf 'SNI     %s\n' "$SNI"
+            kv 密码 "$TROJAN_PASSWORD"
+            kv SNI "$SNI"
             extra=
             [ -n "$pin" ] && extra="&pcs=$(urlencode "$pin")"
             printf '\n%s\n' "trojan://$(urlencode "$TROJAN_PASSWORD")@${host}:${PORT}?security=tls&type=raw&sni=$(urlencode "$SNI")${extra}#trojan"
             ;;
         vless)
-            printf 'UUID    %s\n' "$VLESS_ID"
-            printf '流控    xtls-rprx-vision\n'
-            printf 'SNI     %s\n' "$SNI"
+            kv UUID "$VLESS_ID"
+            kv 流控 xtls-rprx-vision
+            kv SNI "$SNI"
             extra=
             [ -n "$pin" ] && extra="&pcs=$(urlencode "$pin")"
             printf '\n%s\n' "vless://${VLESS_ID}@${host}:${PORT}?encryption=none&security=tls&type=raw&flow=xtls-rprx-vision&alpn=http%2F1.1&sni=$(urlencode "$SNI")${extra}#vless"
             ;;
         hysteria)
-            printf '认证    %s\n' "$HY_AUTH"
-            printf 'SNI     %s\n' "$SNI"
+            kv 认证 "$HY_AUTH"
+            kv SNI "$SNI"
             if [ -n "$BRUTAL_UP" ] && [ -n "$BRUTAL_DOWN" ]; then
                 printf 'Brutal  上行 %s，下行 %s\n' "$BRUTAL_UP" "$BRUTAL_DOWN"
                 printf '客户端需自行填写对应速率\n'
@@ -1382,6 +1568,8 @@ print_share() {
     if [ -n "$pin" ]; then
         printf '\n自签证书，指纹已写入链接\n'
         printf '%s\n' "$pin"
+    elif [ "$ACME" = 1 ]; then
+        printf '\nACME 证书会自动续期\n'
     fi
 }
 
@@ -1394,6 +1582,51 @@ show_share_page() {
         printf '\n内核未启动，选择 3  启动内核后生效\n'
     fi
     pause_back
+}
+
+pick_socks_udp() {
+    page_head "$1"
+    printf '1  开启 UDP\n'
+    printf '2  仅 TCP\n'
+    read_choice "$2"
+    case "$CHOICE" in
+        1) SOCKS_UDP=1 ;;
+        2) SOCKS_UDP=0 ;;
+        '') [ "$3" = on ] && SOCKS_UDP=1 || return 1 ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+guard_socks_listen() {
+    is_loopback "$LISTEN" && return 0
+    page_head "$1"
+    printf 'Socks 没有传输加密，不适合公网\n\n'
+    printf '1  仍然使用 %s\n' "$LISTEN"
+    printf '2  %s\n' "$2"
+    read_choice "回车返回"
+    case "$CHOICE" in
+        1) return 0 ;;
+        2)
+            [ "$3" = cancel ] && return 1
+            LISTEN=127.0.0.1
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+read_brutal() {
+    BRUTAL_UP=$(ask "$1" "$2")
+    if [ -z "$BRUTAL_UP" ]; then
+        BRUTAL_DOWN=
+        return 0
+    fi
+    BRUTAL_DOWN=$(ask "Brutal 下行，如 100 mbps" "$3")
+    if [ -z "$BRUTAL_DOWN" ]; then
+        notice "需要同时填写下行速率"
+        return 1
+    fi
 }
 
 collect_common() {
@@ -1413,30 +1646,13 @@ collect_common() {
     ensure_port_free "$PORT" "$kind" "${IB_ID:-}" || return 1
     if [ "$PROTO" = socks ]; then
         LISTEN=$(ask "监听地址" "127.0.0.1")
-        if ! is_loopback "$LISTEN"; then
-            page_head "添加入站"
-            printf 'Socks 没有传输加密，不适合公网\n\n'
-            printf '1  仍然使用 %s\n' "$LISTEN"
-            printf '2  改为 127.0.0.1\n'
-            read_choice "回车返回"
-            case "$CHOICE" in
-                1) ;;
-                2) LISTEN=127.0.0.1 ;;
-                *) return 1 ;;
-            esac
-        fi
+        guard_socks_listen "添加入站" "改为 127.0.0.1" keep || return 1
     else
         LISTEN=$(ask "监听地址" "0.0.0.0")
     fi
-    [ -n "$LISTEN" ] || LISTEN=0.0.0.0
-    return 0
 }
 
 action_add() {
-    if ! need_root; then
-        notice "请用 root 运行"
-        return
-    fi
     if ! need_kernel; then
         return
     fi
@@ -1462,30 +1678,10 @@ action_add() {
         shadowsocks)
             pick_ss_method || return
             ;;
-        socks)
-            page_head "Socks"
-            printf '1  开启 UDP\n'
-            printf '2  仅 TCP\n'
-            read_choice "回车 开启"
-            case "$CHOICE" in
-                '' | 1) SOCKS_UDP=1 ;;
-                2) SOCKS_UDP=0 ;;
-                *) return ;;
-            esac
-            ;;
-        vless)
-            VLESS_FLOW=xtls-rprx-vision
-            ;;
+        socks) pick_socks_udp "Socks" "回车 开启" on || return ;;
         hysteria)
             page_head "Hysteria"
-            BRUTAL_UP=$(ask "Brutal 上行，如 100 mbps，回车跳过" "")
-            if [ -n "$BRUTAL_UP" ]; then
-                BRUTAL_DOWN=$(ask "Brutal 下行" "")
-                if [ -z "$BRUTAL_DOWN" ]; then
-                    notice "需要同时填写下行速率"
-                    return
-                fi
-            fi
+            read_brutal "Brutal 上行，如 100 mbps，回车跳过" "" "" || return
             HY_MASQ=$(ask "伪装页文字，回车跳过" "")
             ;;
     esac
@@ -1513,10 +1709,6 @@ action_add() {
 }
 
 action_modify() {
-    if ! need_root; then
-        notice "请用 root 运行"
-        return
-    fi
     if ! need_kernel; then
         return
     fi
@@ -1551,18 +1743,9 @@ action_modify() {
             PORT=$newport
             ;;
         2)
+            LISTEN=$(ask "监听地址" "$LISTEN")
             if [ "$PROTO" = socks ]; then
-                LISTEN=$(ask "监听地址" "$LISTEN")
-                if ! is_loopback "$LISTEN"; then
-                    page_head "修改入站"
-                    printf 'Socks 没有传输加密\n\n'
-                    printf '1  仍然使用 %s\n' "$LISTEN"
-                    printf '2  取消\n'
-                    read_choice "回车返回"
-                    [ "$CHOICE" = 1 ] || return
-                fi
-            else
-                LISTEN=$(ask "监听地址" "$LISTEN")
+                guard_socks_listen "修改入站" "取消" cancel || return
             fi
             ;;
         3)
@@ -1588,10 +1771,7 @@ action_modify() {
                             TROJAN_PASSWORD=$(ask "密码" "")
                             [ -n "$TROJAN_PASSWORD" ] || return
                             ;;
-                        vless)
-                            VLESS_ID=$(ask "UUID" "$VLESS_ID")
-                            VLESS_FLOW=xtls-rprx-vision
-                            ;;
+                        vless) VLESS_ID=$(ask "UUID" "$VLESS_ID") ;;
                         hysteria)
                             HY_AUTH=$(ask "认证" "")
                             [ -n "$HY_AUTH" ] || return
@@ -1610,18 +1790,10 @@ action_modify() {
             ;;
         5)
             if [ "$PROTO" = socks ]; then
-                page_head "Socks UDP"
-                printf '1  开启 UDP\n'
-                printf '2  仅 TCP\n'
-                read_choice "回车返回"
-                case "$CHOICE" in
-                    1) newudp=1 ;;
-                    2) newudp=0 ;;
-                    *) return ;;
-                esac
-                kind=$(proto_kind socks "$newudp")
-                ensure_port_free "$PORT" "$kind" "$IB_ID" || return
-                SOCKS_UDP=$newudp
+                old=$SOCKS_UDP
+                pick_socks_udp "Socks UDP" "回车返回" || return
+                kind=$(proto_kind socks "$SOCKS_UDP")
+                ensure_port_free "$PORT" "$kind" "$IB_ID" || { SOCKS_UDP=$old; return; }
             elif [ "$PROTO" = hysteria ]; then
                 page_head "Brutal"
                 printf '当前  上行 %s  下行 %s\n\n' "${BRUTAL_UP:-未设置}" "${BRUTAL_DOWN:-未设置}"
@@ -1629,14 +1801,7 @@ action_modify() {
                 printf '2  关闭\n'
                 read_choice "回车返回"
                 case "$CHOICE" in
-                    1)
-                        BRUTAL_UP=$(ask "上行，如 100 mbps" "$BRUTAL_UP")
-                        BRUTAL_DOWN=$(ask "下行，如 100 mbps" "$BRUTAL_DOWN")
-                        if [ -z "$BRUTAL_UP" ] || [ -z "$BRUTAL_DOWN" ]; then
-                            notice "需要同时填写上行和下行"
-                            return
-                        fi
-                        ;;
+                    1) read_brutal "上行，如 100 mbps" "$BRUTAL_UP" "$BRUTAL_DOWN" || return ;;
                     2)
                         BRUTAL_UP=
                         BRUTAL_DOWN=
@@ -1669,9 +1834,6 @@ action_modify() {
             ;;
         *) return ;;
     esac
-    if [ "$PROTO" = vless ]; then
-        VLESS_FLOW=xtls-rprx-vision
-    fi
     cp "$file" "${file}.bak"
     save_ib "$file"
     if ! apply_config; then
@@ -1690,10 +1852,6 @@ action_share() {
 }
 
 action_delete() {
-    if ! need_root; then
-        notice "请用 root 运行"
-        return
-    fi
     pick_inbound "删除入站" || return
     file=$PICK
     load_ib "$file"
@@ -1703,8 +1861,8 @@ action_delete() {
     read_choice "回车返回"
     [ "$CHOICE" = 1 ] || return
     rm -f "$file"
-    if [ "$SELF_SIGNED" = 1 ]; then
-        rm -f "$CERT" "$KEY"
+    if [ "$SELF_SIGNED" = 1 ] || [ "$ACME" = 1 ]; then
+        cert_still_used "$CERT" || rm -f "$CERT" "$KEY"
     fi
     if ! apply_config; then
         notice "入站文件已删除，但配置刷新失败"
@@ -1725,7 +1883,7 @@ main() {
         printf '%s' "$RST"
         exit 1
     fi
-    if ! need_root; then
+    if [ "$(id -u)" -ne 0 ]; then
         notice "请用 root 运行"
         printf '%s' "$RST"
         exit 1
@@ -1747,7 +1905,7 @@ main() {
             *) notice "无效选项" ;;
         esac
     done
-    printf '%s\033[H\033[2J' "$RST"
+    printf '%s%s\033[H\033[2J' "$OSC_RESET" "$RST"
 }
 
 main
