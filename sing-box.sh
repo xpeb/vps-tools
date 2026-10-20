@@ -1299,7 +1299,7 @@ ui_pick_inbound() {
   store_validate "$INB_DIR" || return 1
   store_list entries || { ui_warn '还没有入站'; return 2; }
   for index in "${!entries[@]}"; do
-    display=$(jq -r '.name|gsub("[\\u0000-\\u001f\\u007f]";" ")' "${entries[$index]}") || return 1
+    display=$(jq -r '.name|gsub("[\u0000-\u001f\u007f]";" ")' "${entries[$index]}") || return 1
     printf '  %d  %s\n' "$((index+1))" "$display"
   done
   printf '\n'; ui_select choice "${#entries[@]}" || return 2
@@ -1326,9 +1326,8 @@ app_add() {
       proto_tls "${protocols[$index]}" && label+='（TLS）'
       printf '  %d  %s\n' "$((index+1))" "$label"
     done
-    printf '  %d  返回\n\n' "$(( ${#protocols[@]} + 1 ))"
-    ui_select choice "$(( ${#protocols[@]} + 1 ))" || return 2
-    [ "$choice" -le "${#protocols[@]}" ] || return 0
+    printf '\n'
+    ui_select choice "${#protocols[@]}" || return 2
     app_add_one "${protocols[$((choice-1))]}"
     ui_settle
   done
