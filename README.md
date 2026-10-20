@@ -22,7 +22,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xpeb/vps-tools/main/sing-box
 
 自签名 TLS 的 SNI 默认使用 `www.gnu.org`，可在向导中替换；该域名当前解析直达 Free Software Foundation 的服务器，未发现 CDN 接入迹象。生成的仍为自签名证书。域名证书需填写自己控制且解析到 VPS 的域名。Hysteria2/TUIC 的公网连通性还需要 VPS 与客户端之间的路径允许双向 UDP。
 
-下载与候选内核暂存在 `/var/tmp`，结束后自动清理，避免小容量 `/run` tmpfs 导致安装失败；进程锁仍放在 `/run`。
+下载与候选内核暂存在 `/var/tmp`，结束后自动清理，避免小容量 `/run` tmpfs 导致安装失败；进程锁仍放在 `/run`。内核版本信息缓存在私有锁目录中，二进制变化后自动失效，减少重复启动面板时的内核加载；卸载时清除缓存。
 
 可设置 `GH_PROXY` 作为 GitHub 下载地址的前缀；官方 SHA-256 摘要始终从 `api.github.com` 获取。无法获取官方摘要时，可通过 `SINGBOX_SHA256` 指定下载压缩包的 64 位十六进制摘要。
 

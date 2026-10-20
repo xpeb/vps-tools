@@ -656,8 +656,24 @@ EOF
 release_installed() { [ -x "$BIN" ]; }
 release_need_core() { release_installed || { ui_warn '请先安装内核'; return 1; }; }
 release_core_version() {
-  if [ -z "$CORE_VER" ]; then CORE_VER=$("$BIN" version 2>/dev/null | awk 'NR==1{print $3}'); fi
-  [ -n "$CORE_VER" ] || return 1
+  if [ -z "$CORE_VER" ]; then
+    local _cache=$RUN_ROOT/sb-sing-box/core-version _signature _saved_signature _saved_version _tmp
+    _signature=$(stat -Lc '%d:%i:%s:%y:%z' "$BIN" 2>/dev/null) || return 1
+    # 锁目录由 root 私有；跨进程复用版本，二进制替换或修改后自动失效。
+    if [ -f "$_cache" ] && [ ! -L "$_cache" ] && {
+      IFS= read -r _saved_signature && IFS= read -r _saved_version
+    } <"$_cache" && [ "$_saved_signature" = "$_signature" ] && valid_version "$_saved_version"; then
+      CORE_VER=$_saved_version
+    else
+      CORE_VER=$("$BIN" version 2>/dev/null | awk 'NR==1{print $3}')
+      valid_version "$CORE_VER" || { CORE_VER=''; return 1; }
+      # 缓存写入失败不影响面板；运行期间发生外部替换时不保存旧版本。
+      if [ "$_signature" = "$(stat -Lc '%d:%i:%s:%y:%z' "$BIN" 2>/dev/null)" ] \
+        && _tmp=$(mktemp "${_cache}.XXXXXX" 2>/dev/null); then
+        if ! printf '%s\n%s\n' "$_signature" "$CORE_VER" >"$_tmp" || ! mv -f -- "$_tmp" "$_cache"; then rm -f -- "$_tmp"; fi
+      fi
+    fi
+  fi
   printf -v "$1" '%s' "$CORE_VER"
 }
 release_fetch() {
@@ -1263,7 +1279,7 @@ app_uninstall() {
   [ "$UI_EOF" = 0 ] || return 2
   service_do stop && service_wait stopped || { service_failure; return 1; }
   if service_do enabled; then service_do disable || { ui_err '停用自启失败，已停止卸载'; return 1; }; fi
-  rm -f "$UNIT" "$BIN" || { ui_err '服务已停止，但文件删除失败'; return 1; }
+  rm -f "$UNIT" "$BIN" "$RUN_ROOT/sb-sing-box/core-version" || { ui_err '服务已停止，但文件删除失败'; return 1; }
   CORE_VER=''
   service_do reload || { ui_err '文件已删除，但服务管理器重载失败'; return 1; }
   if [ "$purge" = 1 ]; then
@@ -1491,21 +1507,24 @@ ui_share() {
 }
 ui_home() {
   local state version body
+  local -a entries=()
+  store_list entries || true
   if release_installed; then
     release_core_version version || version=未知
     version=v$version
     if service_do active && service_process_alive; then state="${G}● 运行中${N}"; else state="${R}○ 已停止${N}"; fi
   else version=未安装; state="${D}○ 未安装${N}"; fi
   body=$'\n'"  ${B}sing-box${N} 管理面板"$'\n'"$RULE"$'\n'
-  body+="  $state    $version    入站 $(store_count "$INB_DIR")"$'\n'"$RULE"$'\n'
+  body+="  $state    $version    入站 ${#entries[@]}"$'\n'"$RULE"$'\n'
   if [ -n "$NOTICE" ]; then body+="$NOTICE$RULE"$'\n'; NOTICE=''; fi
   body+=$'\n  1   安装内核      6   查看日志\n  2   升级内核      7   添加入站\n  3   启动内核      8   修改入站\n  4   停止内核      9   分享入站\n  5   卸载内核      10  删除入站\n\n'
   printf '%s%s' "$CLS" "$body"
 }
 main() {
   if ((BASH_VERSINFO[0]<4 || (BASH_VERSINFO[0]==4 && BASH_VERSINFO[1]<3))); then printf '需要 Bash >= 4.3\n' >&2; return 1; fi
-  [ "$(id -u)" = 0 ] || { printf '请使用 root 运行\n' >&2; return 1; }
+  [ "$EUID" = 0 ] || { printf '请使用 root 运行\n' >&2; return 1; }
   runtime_paths ''
+  ui_info '正在加载 sing-box 管理面板…'
   umask 077
   export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
   platform_detect || return 1
