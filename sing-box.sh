@@ -19,7 +19,7 @@ runtime_paths() {
   CORE_VER='' REL_VER='' REL_JSON='' SERVER_IP4='' SERVER_IP6=''
   NOTICE='' HOLD=0 UI_EOF=0
   G=$'\033[32m' R=$'\033[31m' Y=$'\033[33m' D=$'\033[2m' B=$'\033[1m' N=$'\033[0m'
-  CLS=$'\033[H\033[2J' RULE="  ${D}──────────────────────────────────${N}"
+  CLS=$'\033[H\033[2J' RULE="  ${D}──────────────────────────────${N}"
 }
 
 ui_ok()   { local msg="  ${G}✓${N} $*"; printf '%s\n' "$msg"; NOTICE+="$msg"$'\n'; }
