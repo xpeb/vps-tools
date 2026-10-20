@@ -137,15 +137,12 @@ platform_remove_user() {
 }
 platform_dirs() {
   mkdir -p "$INB_DIR" "$CERT_DIR" "$ACME_DIR" "$STATE_DIR" "$TXN_ROOT" || return 1
-  chown root:root "$BASE" "$INB_DIR" "$CERT_DIR" "$TXN_ROOT" || return 1
-  chmod 700 "$TXN_ROOT" || return 1
-  chgrp "$SVC_USER" "$BASE" "$INB_DIR" "$CERT_DIR" || return 1
-  chmod 750 "$BASE" "$INB_DIR" "$CERT_DIR" || return 1
-  chown "$SVC_USER:$SVC_USER" "$STATE_DIR" "$ACME_DIR" || return 1
-  chmod 750 "$STATE_DIR" && chmod 700 "$ACME_DIR" || return 1
+  chown root:root "$TXN_ROOT" && chmod 700 "$TXN_ROOT" || return 1
+  chown root:"$SVC_USER" "$BASE" "$INB_DIR" "$CERT_DIR" && chmod 750 "$BASE" "$INB_DIR" "$CERT_DIR" || return 1
+  chown "$SVC_USER:$SVC_USER" "$STATE_DIR" && chmod 750 "$STATE_DIR" || return 1
   # 兼容旧安装中的 ACME 存储；不遍历配置、证书或事务目录。
-  find "$ACME_DIR" -type d -exec chown "$SVC_USER:$SVC_USER" {} + -exec chmod 700 {} + || return 1
-  find "$ACME_DIR" -type f -exec chown "$SVC_USER:$SVC_USER" {} + -exec chmod 600 {} + || return 1
+  find "$ACME_DIR/." -type d -exec chown "$SVC_USER:$SVC_USER" {} + -exec chmod 700 {} + || return 1
+  find "$ACME_DIR/." -type f -exec chown "$SVC_USER:$SVC_USER" {} + -exec chmod 600 {} + || return 1
   if [ "$INIT" = openrc ]; then
     mkdir -p "$(dirname "$LOG")" && touch "$LOG" && chown "$SVC_USER:$SVC_USER" "$LOG" && chmod 600 "$LOG" || return 1
   fi
@@ -295,7 +292,6 @@ proto_name() {
   esac
 }
 proto_tls() { case $1 in vless|hysteria2|anytls|tuic) return 0;; *) return 1;; esac; }
-proto_alpn() { case $1 in vless) printf '["http/1.1"]';; hysteria2|tuic) printf '["h3"]';; *) printf '[]';; esac; }
 proto_fields() {
   local -n _field_keys=$2 _field_labels=$3
   _field_keys=(port); _field_labels=(端口)
@@ -324,7 +320,6 @@ proto_random() {
   done
   printf '%s' "${value:0:length}"
 }
-proto_uuid() { local uuid; IFS= read -r uuid </proc/sys/kernel/random/uuid && printf '%s' "$uuid"; }
 proto_ss_keylen() {
   case $1 in 2022-blake3-aes-128-gcm) printf 16;; 2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) printf 32;; *) printf 0;; esac
 }
@@ -345,13 +340,10 @@ proto_build() {
   local proto=$1 tag=$2 port=$3 tls_json=${4:-\{\}} method=${5:-aes-128-gcm} version=${6:-6} obfs_mode=${7:-none} secret='' id='' user=''
   case $proto in
     socks) user=$(proto_random 8) || return 1;;
-    vless|tuic) id=$(proto_uuid) || return 1;;
+    vless|tuic) IFS= read -r id </proc/sys/kernel/random/uuid || return 1;;
   esac
-  case $proto in
-    vless) ;;
-    shadowsocks) secret=$(proto_ss_password "$method") || return 1;;
-    *) secret=$(proto_random 24) || return 1;;
-  esac
+  if [ "$proto" = shadowsocks ]; then secret=$(proto_ss_password "$method") || return 1
+  elif [ "$proto" != vless ]; then secret=$(proto_random 24) || return 1; fi
   SB_SECRET=$secret SB_USER=$user SB_UUID=$id jq -n \
     --arg p "$proto" --arg t "$tag" --argjson port "$port" --arg listen "$(net_listen)" --arg m "$method" --argjson tls "$tls_json" --argjson sv "$version" --arg so "$obfs_mode" '
     {type:$p,tag:$t,listen:$listen,listen_port:$port}
@@ -409,13 +401,13 @@ valid_ip() {
   done
 }
 net_public() {
-  valid_ip "$2" || return 1
   local value second first
   if [ "$1" = 6 ]; then
+    [[ $2 == *:* ]] || return 1
     value=$(net_norm_ip "$2") || return 1
     case $value in 2001:0db8:*|2001:0002:*) return 1;; 2*|3*) return 0;; *) return 1;; esac
   fi
-  [[ $2 != *:* ]] || return 1
+  [[ $2 != *:* ]] && valid_ip "$2" || return 1
   case $2 in
     0.*|10.*|127.*|169.254.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|192.168.*|192.0.0.*|192.0.2.*|198.51.100.*|203.0.113.*) return 1;;
   esac
@@ -1025,8 +1017,9 @@ tls_generate() {
 tls_build() {
   local tag=$1 proto=$2 mode=$3 domain=$4 directory=$5
   if [ "$mode" != acme ]; then tls_generate "$directory" "$tag" "$domain" || return 1; fi
-  jq -nc --arg d "$domain" --arg m "$mode" --arg c "$CERT_DIR/$tag" --argjson a "$(proto_alpn "$proto")" '
-    {enabled:true,server_name:$d} + (if ($a|length)>0 then {alpn:$a} else {} end)
+  jq -nc --arg d "$domain" --arg m "$mode" --arg c "$CERT_DIR/$tag" --arg p "$proto" '
+    {enabled:true,server_name:$d}
+    + (if $p=="vless" then {alpn:["http/1.1"]} elif $p=="hysteria2" or $p=="tuic" then {alpn:["h3"]} else {} end)
     + (if $m=="acme" then {certificate_provider:("acme-"+($d|gsub("[:/]";"-")))}
        else {certificate_path:($c+".crt"),key_path:($c+".key")} end)'
 }
@@ -1058,20 +1051,18 @@ ui_ss_method() {
 }
 ui_snell_options() {
   local _snell_choice _version=${3:-6} _obfs=${4:-none} _version_default _obfs_default
-  local _selected_version _selected_obfs=none
   printf '  1  Snell v5\n  2  Snell v6\n\n'
   [ "$_version" = 5 ] && _version_default=1 || _version_default=2
   ui_select _snell_choice 2 "使用 Snell v$_version" "$_version_default" || return 2
-  [ "$_snell_choice" = 1 ] && _selected_version=5 || _selected_version=6
-  if [ "$_selected_version" = 5 ]; then
+  [ "$_snell_choice" = 1 ] && _version=5 || _version=6
+  if [ "$_version" = 5 ]; then
     printf '  1  不启用 HTTP 混淆\n  2  HTTP 混淆\n\n'
     [ "$_obfs" = http ] && _obfs_default=2 || _obfs_default=1
-    if ui_select _snell_choice 2 '使用当前混淆设置' "$_obfs_default"; then
-      [ "$_snell_choice" != 2 ] || _selected_obfs=http
-    else return 2; fi
-  fi
-  printf -v "$1" '%s' "$_selected_version"
-  printf -v "$2" '%s' "$_selected_obfs"
+    ui_select _snell_choice 2 '使用当前混淆设置' "$_obfs_default" || return 2
+    [ "$_snell_choice" = 2 ] && _obfs=http || _obfs=none
+  else _obfs=none; fi
+  printf -v "$1" '%s' "$_version"
+  printf -v "$2" '%s' "$_obfs"
 }
 ui_positive() {
   local _positive
@@ -1355,14 +1346,14 @@ app_add_one() {
   ui_ok '入站已添加'; ui_share "$INB_DIR/$tag.json"
 }
 app_modify_one() {
-  local file=$1 proto key choice index status staged old_mode old_domain new_mode new_domain
+  local file=$1 key choice index status staged old_domain=''
   local -a keys=() labels=()
   app_prepare || return 1
-  proto=$(jq -r .proto "$file"); proto_fields "$proto" keys labels
+  proto_fields "$(jq -r .proto "$file")" keys labels
   for index in "${!keys[@]}"; do printf '  %d  %s\n' "$((index+1))" "${labels[$index]}"; done
   printf '\n'; ui_select choice "${#keys[@]}" || return 2
   key=${keys[$((choice-1))]}
-  old_mode=$(jq -r .cert "$file"); old_domain=$(jq -r '.domain//""' "$file")
+  if [ "$key" = tls ] || [ "$key" = sni ]; then old_domain=$(jq -r 'select(.cert=="acme")|.domain' "$file"); fi
   txn_begin modify || return 1
   staged=$TXN_DIR/inbounds/${file##*/}
   proto_edit "$staged" "$key" "$TXN_DIR/certs"; status=$?
@@ -1371,9 +1362,8 @@ app_modify_one() {
     if ! txn_stage "$file" "$staged" || ! txn_publish none; then txn_rollback; return 1; fi
     ui_ok '修改完成'; return 0
   fi
-  new_mode=$(jq -r .cert "$staged"); new_domain=$(jq -r '.domain//""' "$staged")
   app_finish apply || return 1
-  if [ "$old_mode" = acme ] && { [ "$new_mode" != acme ] || [ "$old_domain" != "$new_domain" ]; }; then tls_forget "$old_domain" || true; fi
+  if [ -n "$old_domain" ]; then tls_forget "$old_domain" || true; fi
   ui_ok '修改完成'; ui_share "$file"
 }
 app_delete_one() {
@@ -1408,8 +1398,7 @@ proto_share() {
     (.proto) as $proto
     | (.name|component) as $name
     | (.inbound.listen_port|tostring) as $port
-    | (.domain//"") as $domain
-    | ($domain|component) as $sni
+    | (.domain//""|component) as $sni
     | (if ($host|contains(":")) then "["+$host+"]" else $host end) as $address
     | if $proto=="socks" then
         "socks5://"+(.inbound.users[0].username|component)+":"+(.inbound.users[0].password|component)+"@"+$address+":"+$port+"#"+$name
@@ -1450,7 +1439,7 @@ proto_share() {
   printf '%s\n' "$output"
 }
 ui_share() {
-  local file=$1 proto name port mode domain host label output duplicate
+  local file=$1 proto name port mode domain host label output duplicate version
   local -a hosts=()
   proto=$(jq -r .proto "$file"); name=$(jq -r .name "$file"); port=$(jq -r .inbound.listen_port "$file")
   mode=$(jq -r .cert "$file"); domain=$(jq -r '.domain//""' "$file")
@@ -1534,7 +1523,6 @@ main() {
     HOLD=0
     ui_home
     ui_select choice 10 退出 || break
-    NOTICE=''
     case $choice in
       1) app_install;; 2) app_upgrade;; 3) app_start;; 4) app_stop;; 5) app_uninstall;;
       6) app_logs;; 7) app_add;; 8) app_with_inbound 修改入站 app_modify_one;;
