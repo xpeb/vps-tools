@@ -20,6 +20,10 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xpeb/vps-tools/main/sing-box
 
 菜单和七种协议保持原有用法；Snell 支持 v5（可选 HTTP 混淆）和 v6。入站变更成功后自动启动或重启；删除最后一个入站时停止；仅改备注不会重启。升级保持原来的运行状态。安装仅启用开机自启，添加入站后启动。
 
+自签名 TLS 的 SNI 默认使用 `www.gnu.org`，可在向导中替换；该域名当前解析直达 Free Software Foundation 的服务器，未发现 CDN 接入迹象。生成的仍为自签名证书。域名证书需填写自己控制且解析到 VPS 的域名。Hysteria2/TUIC 的公网连通性还需要 VPS 与客户端之间的路径允许双向 UDP。
+
+下载与候选内核暂存在 `/var/tmp`，结束后自动清理，避免小容量 `/run` tmpfs 导致安装失败；进程锁仍放在 `/run`。
+
 可设置 `GH_PROXY` 作为 GitHub 下载地址的前缀；官方 SHA-256 摘要始终从 `api.github.com` 获取。无法获取官方摘要时，可通过 `SINGBOX_SHA256` 指定下载压缩包的 64 位十六进制摘要。
 
 配置仍位于 `/etc/sing-box`，现有 `inbounds/*.json` 无需迁移。每次变更先暂存、校验并备份，服务验证成功后才提交。失败或可捕获的中断会恢复原文件和原服务状态；强制结束后，下次运行会检测并恢复遗留事务。服务状态检查只确认进程持续运行，不代表外部网络和 ACME 签发一定成功。

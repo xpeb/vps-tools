@@ -720,11 +720,11 @@ release_download() {
   if ! tar -tzf "$work/core.tgz" >"$work/members"; then rm -rf "$work"; return 1; fi
   while IFS= read -r member; do
     case $member in /*|..|../*|*/../*|*/..) ui_err '压缩包路径不合法'; rm -rf "$work"; return 1;; esac
+    case $member in sing-box|*/sing-box) binaries+=("$member");; esac
   done <"$work/members"
-  if ! tar -xzf "$work/core.tgz" -C "$work"; then rm -rf "$work"; return 1; fi
-  mapfile -t binaries < <(find "$work" -type f -name sing-box)
-  if [ "${#binaries[@]}" != 1 ] || ! cp "${binaries[0]}" "$output" || ! chmod 700 "$output"; then
-    ui_err '压缩包内核缺失或写入失败'; rm -rf "$work"; return 1
+  # 只将内核写入候选路径，避免完整解压后再复制一份大文件。
+  if [ "${#binaries[@]}" != 1 ] || ! tar -xOzf "$work/core.tgz" "${binaries[0]}" >"$output" || ! chmod 700 "$output"; then
+    ui_err '压缩包内核缺失或写入失败'; rm -rf "$work"; rm -f "$output"; return 1
   fi
   actual=$("$output" version 2>/dev/null | awk 'NR==1{print $3}')
   rm -rf "$work"
@@ -996,7 +996,7 @@ ui_tls() {
     done
   else
     while true; do
-      ui_ask _tls_domain SNI '' || return 2
+      ui_ask _tls_domain SNI www.gnu.org || return 2
       _tls_domain=$(net_bare_ip "$_tls_domain")
       { valid_domain "$_tls_domain" || valid_ip "$_tls_domain"; } && break
       ui_soft 'SNI 须为域名或 IP'
@@ -1527,7 +1527,8 @@ main() {
   trap 'exit 130' INT
   trap 'exit 143' TERM
   platform_deps || return 1
-  RUNTIME_DIR=$(mktemp -d "$RUN_ROOT/sb-panel.XXXXXX") || return 1
+  # /run 通常是小容量 tmpfs；下载与候选内核使用磁盘临时目录。
+  RUNTIME_DIR=$(mktemp -d /var/tmp/sb-panel.XXXXXX) || return 1
   txn_recover || { RUNTIME_BLOCKED=1; ui_warn "遗留事务未恢复，修改功能已停用；备份：$TXN_DIR"; }
   local choice
   while [ "$UI_EOF" = 0 ]; do
