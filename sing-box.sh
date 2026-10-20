@@ -1,571 +1,638 @@
 #!/usr/bin/env bash
-# sing-box 管理面板（Debian / Ubuntu / Alpine）。需要 >= 1.14.0。用法: bash sing-box.sh
-# Alpine 先 apk add bash。下载可设 GH_PROXY；校验只走 api.github.com，或设 SINGBOX_SHA256
+# sing-box 管理面板：Debian / Ubuntu / Alpine，内核 >= 1.14.0。
+# bash sing-box.sh；Alpine 先 apk add bash。支持 GH_PROXY / SINGBOX_SHA256。
+# source 只定义函数；所有环境初始化和系统操作从 main 开始。
 
-shopt -s nullglob
+# jq 过滤器使用字面量 $变量；&&/|| 链统一表示前置步骤失败即退出。
+# shellcheck disable=SC2016,SC2015
 
-BASE=/etc/sing-box
-INB_DIR=$BASE/inbounds
-CERT_DIR=$BASE/certs
-ACME_DIR=$BASE/acme
-CONF=$BASE/config.json
-BIN=/usr/local/bin/sing-box
-SVC=sing-box
-SVC_USER=sing-box
-UNIT=/etc/systemd/system/sing-box.service
-LOG=/var/log/sing-box.log
-MIN_VER=1.14.0
-GH_PROXY="${GH_PROXY:-}"
-
-G=$'\033[32m'; R=$'\033[31m'; Y=$'\033[33m'; D=$'\033[2m'; B=$'\033[1m'; N=$'\033[0m'
-
-# NOTICE 留到下一屏；HOLD=1 时先按回车再离开结果页
-NOTICE=""; HOLD=0
-
-ok()   { local m="  ${G}✓${N} $*"; echo "$m"; NOTICE+="$m"$'\n'; }
-warn() { local m="  ${Y}!${N} $*"; echo "$m"; NOTICE+="$m"$'\n'; }
-tip()  { local m="  ${D}$*${N}";   echo "$m"; NOTICE+="$m"$'\n'; }
-err()  { echo "  ${R}✗${N} $*"; HOLD=1; }
-soft() { echo "  ${R}✗${N} $*"; }
-info() { echo "  ${D}$*${N}"; }
-line() { echo "$RULE"; }
-kv()   { echo "  ${D}$1${N}  $2"; }
-# clear 会查 terminfo，SSH 上常多一次往返；整页一次写出
-CLS=$'\033[H\033[2J'
-RULE="  ${D}──────────────────────────────────${N}"
-MENU=$'  1   安装内核      6   查看日志
-  2   升级内核      7   添加入站
-  3   启动内核      8   修改入站
-  4   停止内核      9   分享入站
-  5   卸载内核      10  删除入站
-'
-paint() { printf '%s%s' "$CLS" "$1"; }
-page() {
-  local b=$'\n'"  ${B}sing-box${N} ${D}›${N} ${B}$1${N}"$'\n'"$RULE"$'\n\n'
-  if [ -n "$NOTICE" ]; then b+="$NOTICE$RULE"$'\n\n'; NOTICE=""; fi
-  paint "$b"
+# 1. 运行时、平台和终端。业务返回值：0 成功，1 失败，2 取消/无变化。
+runtime_paths() {
+  local prefix=${1:-}
+  BASE=$prefix/etc/sing-box
+  INB_DIR=$BASE/inbounds CERT_DIR=$BASE/certs ACME_DIR=$BASE/acme
+  CONF=$BASE/config.json TXN_ROOT=$BASE/.transactions
+  BIN=$prefix/usr/local/bin/sing-box UNIT=$prefix/etc/systemd/system/sing-box.service
+  STATE_DIR=$prefix/var/lib/sing-box LOG=$prefix/var/log/sing-box.log RUN_ROOT=$prefix/run
+  SVC=sing-box SVC_USER=sing-box MIN_VER=1.14.0
+  OS='' INIT=systemd RUNTIME_DIR='' TXN_DIR='' LOCK_FD='' RUNTIME_BLOCKED=0
+  CORE_VER='' REL_VER='' REL_JSON='' SERVER_IP4='' SERVER_IP6=''
+  NOTICE='' HOLD=0 UI_EOF=0
+  G=$'\033[32m' R=$'\033[31m' Y=$'\033[33m' D=$'\033[2m' B=$'\033[1m' N=$'\033[0m'
+  CLS=$'\033[H\033[2J' RULE="  ${D}──────────────────────────────────${N}"
 }
 
-[ "$(id -u)" -eq 0 ] || { echo "请使用 root 运行"; exit 1; }
-umask 077
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+ui_ok()   { local msg="  ${G}✓${N} $*"; printf '%s\n' "$msg"; NOTICE+="$msg"$'\n'; }
+ui_warn() { local msg="  ${Y}!${N} $*"; printf '%s\n' "$msg" >&2; NOTICE+="$msg"$'\n'; }
+ui_tip()  { local msg="  ${D}$*${N}"; printf '%s\n' "$msg"; NOTICE+="$msg"$'\n'; }
+ui_err()  { printf '  %s✗%s %s\n' "$R" "$N" "$*" >&2; HOLD=1; }
+ui_soft() { printf '  %s✗%s %s\n' "$R" "$N" "$*" >&2; }
+ui_info() { printf '  %s%s%s\n' "$D" "$*" "$N" >&2; }
+ui_line() { printf '%s\n' "$RULE"; }
+ui_kv()   { printf '  %s%s%s  %s\n' "$D" "$1" "$N" "$2"; }
+ui_page() {
+  local body=$'\n'"  ${B}sing-box${N} ${D}›${N} ${B}$1${N}"$'\n'"$RULE"$'\n\n'
+  if [ -n "$NOTICE" ]; then body+="$NOTICE$RULE"$'\n\n'; NOTICE=''; fi
+  printf '%s%s' "$CLS" "$body"
+}
 
-detect_system() {
+ui_read() {
+  local _read_value
+  if ! IFS= read -r -p "$2" _read_value; then UI_EOF=1; return 2; fi
+  printf -v "$1" '%s' "$_read_value"
+}
+ui_ask() {
+  local _ask_value
+  ui_read _ask_value "  $2${3:+ [$3]}: " || return 2
+  printf -v "$1" '%s' "${_ask_value:-$3}"
+}
+ui_confirm() {
+  local answer default=${2:-n} hint='y/N'
+  [ "$default" = y ] && hint='Y/n'
+  ui_read answer "  $1 [$hint]: " || return 2
+  [[ ${answer:-$default} =~ ^[Yy]$ ]] || return 2
+}
+ui_select() {
+  local _choice _default=${4:-} _hint=${3:-返回}
+  while true; do
+    ui_read _choice "  请选择 [回车$_hint]: " || return 2
+    if [ -z "$_choice" ]; then
+      [ -n "$_default" ] || return 2
+      printf -v "$1" '%s' "$_default"; return 0
+    fi
+    if [[ $_choice =~ ^[1-9][0-9]{0,4}$ ]] && [ "$_choice" -le "$2" ]; then
+      printf -v "$1" '%s' "$_choice"; return 0
+    fi
+  done
+}
+ui_settle() {
+  local answer
+  if [ "$HOLD" = 1 ] && [ "$UI_EOF" = 0 ]; then
+    printf '\n'
+    while ui_read answer '  请选择 [回车返回]: '; do [ -z "$answer" ] && break; done
+    HOLD=0 NOTICE=''
+  fi
+}
+
+platform_detect() {
   if [ -f /etc/alpine-release ]; then
-    OS=alpine; INIT=openrc; UNIT=/etc/init.d/$SVC
-    [ -e /run/openrc/softlevel ] || [ -e /var/run/openrc/softlevel ] \
-      || { echo "OpenRC 未运行"; exit 1; }
-    command -v rc-service >/dev/null 2>&1 || { echo "需要 OpenRC（apk add openrc）"; exit 1; }
-  elif [ -f /etc/debian_version ] || command -v apt-get >/dev/null 2>&1; then
-    OS=debian; INIT=systemd
-    command -v systemctl >/dev/null 2>&1 || { echo "需要 systemd"; exit 1; }
-  else
-    echo "仅支持 Debian / Ubuntu / Alpine Linux"; exit 1
-  fi
+    OS=alpine INIT=openrc UNIT=/etc/init.d/$SVC
+    { [ -e /run/openrc/softlevel ] || [ -e /var/run/openrc/softlevel ]; } || {
+      ui_err 'OpenRC 未运行'; return 1;
+    }
+    command -v rc-service >/dev/null 2>&1 || { ui_err '需要 OpenRC（apk add openrc）'; return 1; }
+  elif [ -f /etc/debian_version ]; then
+    OS=debian INIT=systemd
+    [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1 || {
+      ui_err '需要正在运行的 systemd'; return 1;
+    }
+  else ui_err '仅支持 Debian / Ubuntu / Alpine Linux'; return 1; fi
 }
-detect_system
-
-# svc active|start|stop|restart|enable|disable|logs N|-f
-SVC_ST=""
-svc() {
-  case $1 in
-    active)
-      if [ "$INIT" = systemd ]; then systemctl is-active --quiet "$SVC"
-      else rc-service "$SVC" status >/dev/null 2>&1; fi;;
-    start|stop)
-      SVC_ST=""
-      if [ "$INIT" = systemd ]; then systemctl "$1" "$SVC"
-      else rc-service "$SVC" "$1" >/dev/null 2>&1; fi;;
-    restart)
-      SVC_ST=""
-      if [ "$INIT" = systemd ]; then systemctl restart "$SVC"
-      elif svc active; then rc-service "$SVC" restart >/dev/null 2>&1
-      else rc-service "$SVC" start >/dev/null 2>&1; fi;;
-    enable)
-      if [ "$INIT" = systemd ]; then systemctl enable "$SVC" >/dev/null 2>&1
-      else rc-update add "$SVC" default >/dev/null 2>&1 || warn "开机自启失败：rc-update add $SVC default"; fi;;
-    disable)
-      if [ "$INIT" = systemd ]; then systemctl disable "$SVC" >/dev/null 2>&1
-      else rc-update del "$SVC" default >/dev/null 2>&1; fi;;
-    logs)
-      if [ "$INIT" = systemd ]; then
-        if [ "$2" = -f ]; then journalctl -u "$SVC" -f -o cat
-        else journalctl -u "$SVC" -n "$2" --no-pager -o cat; fi
-      else
-        touch "$LOG" 2>/dev/null
-        if [ "$2" = -f ]; then tail -n 20 -f "$LOG"; else tail -n "$2" "$LOG"; fi
-      fi;;
-  esac
-}
-
-svc_user() {
-  local u
-  if [ -f "$UNIT" ]; then
-    if [ "$INIT" = systemd ]; then u=$(sed -n 's/^User=//p' "$UNIT" | head -n1)
-    else u=$(sed -n 's/^[[:space:]]*command_user="\{0,1\}\([^":[:space:]]*\).*/\1/p' "$UNIT" | head -n1); fi
-  fi
-  printf '%s' "${u:-root}"
-}
-
-ensure_dirs() { mkdir -p "$INB_DIR" "$CERT_DIR" "$ACME_DIR" /var/lib/sing-box; }
-
-# 配置归 root，服务组只读；只有 ACME 目录给服务写
-secure_tree() {
-  local u f
-  [ -d "$BASE" ] || return 0
-  ensure_dirs
-  chown -R root:root "$BASE" 2>/dev/null || true
-  find "$BASE" -type d -exec chmod 700 {} + 2>/dev/null || true
-  find "$BASE" -type f -exec chmod 600 {} + 2>/dev/null || true
-  u=$(svc_user)
-  if [ "$u" != root ] && id "$u" >/dev/null 2>&1; then
-    chgrp "$u" "$BASE" "$INB_DIR" "$CERT_DIR" 2>/dev/null || true
-    chmod 750 "$BASE" "$INB_DIR" "$CERT_DIR" 2>/dev/null || true
-    find "$INB_DIR" "$CERT_DIR" -type f -exec chgrp "$u" {} + -exec chmod 640 {} + 2>/dev/null || true
-    for f in "$CONF" "$CONF.new"; do
-      [ -f "$f" ] || continue
-      chgrp "$u" "$f" 2>/dev/null || true
-      chmod 640 "$f" 2>/dev/null || true
-    done
-    chown -R "$u:$u" "$ACME_DIR" 2>/dev/null || true
-    chmod 700 "$ACME_DIR" 2>/dev/null || true
-    if [ -d "$BASE/.bak" ]; then chown -R root:root "$BASE/.bak"; chmod -R go-rwx "$BASE/.bak"; fi
-    if [ -d "$BASE/.certbak" ]; then chown -R root:root "$BASE/.certbak"; chmod -R go-rwx "$BASE/.certbak"; fi
-  fi
-}
-
-ask() { local _ans; read -rp "  $2${3:+ [$3]}: " _ans; printf -v "$1" '%s' "${_ans:-$3}"; }
-
-confirm() {
-  local _a _d=${2:-n} _h="y/N"; [ "$_d" = y ] && _h="Y/n"
-  read -rp "  $1 [$_h]: " _a; _a=${_a:-$_d}; [[ $_a =~ ^[Yy] ]]
-}
-
-sel() { # 回车返回 1
-  local _c _l=${3:-返回}
-  while true; do
-    read -rp "  请选择 [回车$_l]: " _c
-    case $_c in
-      "") return 1;;
-      *[!0-9]*) ;;
-      *)   if [ "$_c" -ge 1 ] && [ "$_c" -le "$2" ]; then printf -v "$1" '%s' "$_c"; return 0; fi;;
-    esac
-  done
-}
-
-rand_str() { head -c 512 /dev/urandom | tr -dc 'A-Za-z0-9' | head -c "$1"; }
-rand_hex() { head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
-gen_uuid() { cat /proc/sys/kernel/random/uuid; }
-urlenc()   { SB_SECRET=$1 jq -rn 'env.SB_SECRET|@uri'; }
-b64url()   { printf %s "$1" | base64 | tr -d '\n' | tr '+/' '-_' | tr -d '='; }
-bare_ip() { local ip=$1; ip=${ip#[}; ip=${ip%"]"}; printf '%s' "${ip%%%*}"; }
-host_fmt() { [[ $1 == *:* ]] && echo "[$1]" || echo "$1"; }
-
-jq_edit()  { local f=$1; shift; jq "$@" "$f" > "$f.tmp" && mv -f "$f.tmp" "$f"; }
-listen_host() {
-  local f=/proc/sys/net/ipv6/conf/all/disable_ipv6
-  if [ -r "$f" ] && [ "$(cat "$f" 2>/dev/null)" = 0 ]; then printf '%s' '::'
-  else printf '%s' '0.0.0.0'; fi
-}
-
-installed() { [ -x "$BIN" ]; }
-need_core() { installed || { warn "请先安装内核"; return 1; }; }
-CORE_VER=""
-core_ver() {
-  [ -n "$CORE_VER" ] || CORE_VER=$("$BIN" version 2>/dev/null | awk 'NR==1{print $3}')
-  printf '%s' "$CORE_VER"
-}
-list_inb() {
-  local -n _inb=$1
-  _inb=("$INB_DIR"/*.json)
-  [ ${#_inb[@]} -gt 0 ]
-}
-has_inb() { local -a _a; list_inb _a; }
-inb_count() { local -a a; list_inb a; echo "${#a[@]}"; }
-is_acme() { [ "$1" = acme ]; }
-ver_ge() { # a >= b；同一版本号的预发布比正式版更旧
-  local a=${1%%-*} b=${2%%-*} ap=0 bp=0
-  [[ $1 == *-* ]] && ap=1
-  [[ $2 == *-* ]] && bp=1
-  if [ "$a" = "$b" ]; then [ "$ap" -le "$bp" ]; return; fi
-  [ "$(printf '%s\n%s\n' "$a" "$b" | sort -V | head -n1)" = "$b" ]
-}
-
-pname() {
-  case $1 in
-    socks) echo "SOCKS5";; shadowsocks) echo "Shadowsocks";; vless) echo "VLESS";;
-    hysteria2) echo "Hysteria2";; anytls) echo "AnyTLS";; tuic) echo "TUIC";; snell) echo "Snell v6";;
-  esac
-}
-tls_proto() { case $1 in vless|hysteria2|anytls|tuic) return 0;; *) return 1;; esac; }
-
-SERVER_IP="" SERVER_IP4="" SERVER_IP6=""
-
-norm_ip() {
-  local ip=$1 left right g s="" i
-  local -a lg=() rg=() out=()
-  ip=$(bare_ip "$1")
-  [[ $ip == *:* ]] || { printf '%s' "$ip"; return 0; }
-  ip=$(printf '%s' "$ip" | tr 'A-F' 'a-f')
-  if [[ $ip == *::* ]]; then
-    left=${ip%%::*}; right=${ip#*::}
-    [ -n "$left" ] && IFS=: read -ra lg <<< "$left"
-    [ -n "$right" ] && IFS=: read -ra rg <<< "$right"
-    out=("${lg[@]}")
-    for ((i=${#lg[@]}+${#rg[@]}; i<8; i++)); do out+=(0); done
-    out+=("${rg[@]}")
-  else
-    IFS=: read -ra out <<< "$ip"
-  fi
-  [ ${#out[@]} -eq 8 ] || { printf '%s' "$1"; return 1; }
-  for g in "${out[@]}"; do
-    [[ ${g:-0} =~ ^[0-9a-f]{1,4}$ ]] || { printf '%s' "$1"; return 1; }
-    printf -v g '%04x' "$((16#${g:-0}))"
-    s+="${s:+:}$g"
-  done
-  printf '%s' "$s"
-}
-
-is_public_v4() {
-  local ip=$1 o
-  valid_ip "$ip" || return 1
-  [[ $ip == *:* ]] && return 1
-  case $ip in
-    10.*|127.*|192.168.*|169.254.*|0.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*|255.*|192.0.2.*|198.51.100.*|203.0.113.*) return 1;;
-  esac
-  # CGNAT 100.64/10、基准测试 198.18/15 不当公网地址
-  if [[ $ip =~ ^100\.([0-9]+)\. ]]; then
-    o=$((10#${BASH_REMATCH[1]}))
-    [ "$o" -ge 64 ] && [ "$o" -le 127 ] && return 1
-  fi
-  if [[ $ip =~ ^198\.([0-9]+)\. ]]; then
-    o=$((10#${BASH_REMATCH[1]}))
-    [ "$o" -ge 18 ] && [ "$o" -le 19 ] && return 1
-  fi
-  if [[ $ip =~ ^([0-9]+)\. ]]; then
-    o=$((10#${BASH_REMATCH[1]}))
-    [ "$o" -ge 224 ] && return 1
-  fi
-  return 0
-}
-
-is_public_v6() {
-  local n
-  valid_ip "$1" || return 1
-  [[ $1 == *:* ]] || return 1
-  n=$(norm_ip "$1") || return 1
-  case $n in
-    0000:0000:0000:0000:0000:0000:0000:0001|fe80:*|fc*|fd*|ff*) return 1;;
-    2*|3*) return 0;;
-  esac
-  return 1
-}
-
-local_addrs() {
-  command -v ip >/dev/null 2>&1 || return 0
-  ip -"$1" -o addr show scope global 2>/dev/null | awk '
-    /temporary|deprecated|dadfailed|tentative/ { next }
-    {
-      for (i = 1; i <= NF; i++)
-        if ($i == "inet" || $i == "inet6") { split($(i + 1), a, "/"); print a[1]; break }
-    }'
-}
-
-is_public() {
-  if [ "$1" = 4 ]; then is_public_v4 "$2"; else is_public_v6 "$2"; fi
-}
-local_public() {
-  local a
-  while read -r a; do
-    is_public "$1" "$a" || continue
-    printf '%s' "$a"; return 0
-  done < <(local_addrs "$1")
-  return 1
-}
-
-curl_ip() {
-  local fam=$1 u r
-  shift
-  command -v curl >/dev/null 2>&1 || return 1
-  for u in "$@"; do
-    r=$(curl -"$fam" -fsS --connect-timeout 2 -m 3 "$u" 2>/dev/null | tr -d '[:space:]')
-    is_public "$fam" "$r" && { printf '%s' "$r"; return 0; }
-  done
-  return 1
-}
-
-ip_is_ours() {
-  local n want
-  n=$(norm_ip "$1") || return 1
-  for want in $SERVER_IP4 $SERVER_IP6 $SERVER_IP; do
-    [ -n "$want" ] && [ "$(norm_ip "$want")" = "$n" ] && return 0
-  done
-  return 1
-}
-
-local_ips() {
-  local s=""
-  [ -n "$SERVER_IP4" ] && s+="$SERVER_IP4 "
-  [ -n "$SERVER_IP6" ] && s+="$SERVER_IP6 "
-  [ -z "$s" ] && s="$SERVER_IP "
-  printf '%s' "${s% }"
-}
-
-get_ip() {
-  [ -n "$SERVER_IP" ] && return 0
-  local v4e="" v6e="" v4f v6f p4 p6
-  v4f=$(mktemp); v6f=$(mktemp)
-  curl_ip 4 https://api.ipify.org https://ipv4.icanhazip.com >"$v4f" & p4=$!
-  curl_ip 6 https://api6.ipify.org https://ipv6.icanhazip.com >"$v6f" & p6=$!
-  wait "$p4" || true
-  wait "$p6" || true
-  v4e=$(cat "$v4f"); v6e=$(cat "$v6f")
-  rm -f "$v4f" "$v6f"
-  # 公网 IPv4 多半在 NAT 后，探不到再看网卡，最后才用 IPv6
-  if [ -n "$v4e" ]; then SERVER_IP4=$v4e; else SERVER_IP4=$(local_public 4 || true); fi
-  if [ -n "$v6e" ]; then SERVER_IP6=$v6e; else SERVER_IP6=$(local_public 6 || true); fi
-  if [ -n "$SERVER_IP4" ]; then SERVER_IP=$SERVER_IP4
-  elif [ -n "$SERVER_IP6" ]; then SERVER_IP=$SERVER_IP6
-  else
-    ask SERVER_IP "无法获取公网 IP，请手动输入" ""
-    SERVER_IP=$(bare_ip "$SERVER_IP")
-    if [[ $SERVER_IP == *:* ]]; then SERVER_IP6=$SERVER_IP; else SERVER_IP4=$SERVER_IP; fi
-  fi
-}
-
-acme_left() {
-  local -a a
-  list_inb a || return 1
-  jq -se 'any(.[]; .cert=="acme")' "${a[@]}" >/dev/null
-}
-# HTTP-01 占 80；TLS-ALPN 占 443，本入站自己听 443 时可共用
-acme_listen_conflict() {
-  local mine=$1 f p
-  local -a a
-  [ "$mine" = 80 ] && return 0
-  list_inb a || return 1
-  for f in "${a[@]}"; do
-    p=$(jq -r '.inbound.listen_port // empty' "$f" 2>/dev/null) || continue
-    [ "$p" = 80 ] && return 0
-    [ "$p" = 443 ] && [ "$mine" != 443 ] && return 0
-  done
-  return 1
-}
-require_acme_ports() {
-  acme_listen_conflict "${TLS_PORT:-}" || return 0
-  err "ACME 需要空闲的 80；443 只能由本入站占用"
-  return 1
-}
-
-sys_port_used() { ss -H -ltun "sport = :$1" 2>/dev/null | grep -q .; }
-inb_port_used() {
-  local -a a
-  list_inb a || return 1
-  jq -se --argjson p "$1" 'any(.[]; .inbound.listen_port==$p)' "${a[@]}" >/dev/null 2>&1
-}
-port_ok() { [[ $1 =~ ^[1-9][0-9]*$ ]] && [ "$1" -le 65535 ]; }
-read_port() {
-  local _got
-  ask _got "$2" "$3"
-  port_ok "$_got" || { soft "端口须为 1-65535"; return 1; }
-  printf -v "$1" '%s' "$_got"
-}
-
-rand_port() {
-  local p
-  while true; do
-    p=$(shuf -i 10000-60000 -n 1)
-    sys_port_used "$p" || inb_port_used "$p" || { echo "$p"; return; }
-  done
-}
-
-ask_mbps() {
-  local _v
-  while true; do
-    ask _v "$2" "$3"
-    [[ $_v =~ ^[1-9][0-9]*$ ]] && { printf -v "$1" '%s' "$_v"; return; }
-    soft "须为正整数"
-  done
-}
-
-ask_port() {
-  local _p _d; _d=$(rand_port)
-  while true; do
-    read_port _p "监听端口" "${2:-$_d}" || continue
-    if [ "$_p" != "$2" ]; then
-      inb_port_used "$_p" && { soft "端口已被其他入站使用"; continue; }
-      sys_port_used "$_p" && { soft "端口已被系统占用"; continue; }
-      if acme_left && { [ "$_p" = 80 ] || [ "$_p" = 443 ]; }; then
-        soft "80/443 已留给 ACME，请换端口"
-        continue
+platform_packages() {
+  [ "$#" -gt 0 ] || return 0
+  local log_file
+  log_file=$(mktemp) || return 1
+  if [ "$OS" = alpine ]; then
+    if ! apk add --no-cache "$@" >"$log_file" 2>&1; then
+      if ! apk update >>"$log_file" 2>&1 || ! apk add --no-cache "$@" >>"$log_file" 2>&1; then
+        tail -n 12 "$log_file" >&2; rm -f "$log_file"; return 1
       fi
     fi
-    printf -v "$1" '%s' "$_p"; return
+  elif ! apt-get install -y -qq "$@" >"$log_file" 2>&1; then
+    if ! apt-get update -qq >>"$log_file" 2>&1 || ! apt-get install -y -qq "$@" >>"$log_file" 2>&1; then
+      tail -n 12 "$log_file" >&2; rm -f "$log_file"; return 1
+    fi
+  fi
+  rm -f "$log_file"
+}
+platform_deps() {
+  local cmd
+  local -a packages=()
+  for cmd in curl jq openssl tar; do command -v "$cmd" >/dev/null 2>&1 || packages+=("$cmd"); done
+  if ! command -v ip >/dev/null 2>&1 || ! command -v ss >/dev/null 2>&1; then packages+=(iproute2); fi
+  command -v shuf >/dev/null 2>&1 || packages+=(coreutils)
+  command -v flock >/dev/null 2>&1 || packages+=(util-linux)
+  [ -f /etc/ssl/certs/ca-certificates.crt ] || packages+=(ca-certificates)
+  if [ "$INIT" = openrc ] && ! command -v setcap >/dev/null 2>&1; then packages+=(libcap); fi
+  [ "${#packages[@]}" -eq 0 ] || ui_info '正在安装依赖…'
+  platform_packages "${packages[@]}" || { ui_err '依赖安装失败，请检查软件源与网络'; return 1; }
+  for cmd in curl jq openssl tar ip ss shuf flock sha256sum; do
+    command -v "$cmd" >/dev/null 2>&1 || { ui_err "缺少必要工具：$cmd"; return 1; }
   done
 }
-
-detect_arch() {
-  case $(uname -m) in
-    x86_64|amd64) echo amd64;; aarch64|arm64) echo arm64;;
-    armv7l|armv7) echo armv7;; i386|i686) echo 386;; s390x) echo s390x;;
-    *) return 1;;
-  esac
-}
-
-REL_JSON=""
-REL_VER=""
-latest_version() {
-  local j s
-  j=$(curl -fsSL -m 15 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null) || return 1
-  s=$(jq -r '.tag_name // empty' <<<"$j" | sed 's/^v//')
-  [ -n "$s" ] && ver_ge "$s" "$MIN_VER" || return 1
-  REL_JSON=$j; REL_VER=$s
-  printf '%s' "$s"
-}
-
-VER=""
-accept_version() {
-  if [ -z "$VER" ]; then
-    warn "无法获取最新版本信息"
-    ask VER "请手动输入版本号，如 1.14.0" ""
-  fi
-  ver_ge "$VER" "$MIN_VER" || { err "版本需不低于 $MIN_VER"; return 1; }
-}
-pick_version() {
-  VER=$(latest_version)
-  accept_version
-}
-
-ensure_user() {
+platform_user() {
   id "$SVC_USER" >/dev/null 2>&1 && return 0
   if [ "$OS" = alpine ]; then
     addgroup -S "$SVC_USER" 2>/dev/null || true
-    adduser -S -D -H -h /var/lib/sing-box -G "$SVC_USER" -s /sbin/nologin "$SVC_USER"
+    adduser -S -D -H -h "$STATE_DIR" -G "$SVC_USER" -s /sbin/nologin "$SVC_USER" || return 1
   else
-    useradd --system --user-group --home-dir /var/lib/sing-box --shell /usr/sbin/nologin "$SVC_USER" \
-      || useradd --system --user-group --home-dir /var/lib/sing-box --shell /bin/false "$SVC_USER"
+    useradd --system --user-group --home-dir "$STATE_DIR" --shell /usr/sbin/nologin "$SVC_USER" || return 1
   fi
   id "$SVC_USER" >/dev/null 2>&1
 }
-
-remove_user() {
+platform_remove_user() {
   id "$SVC_USER" >/dev/null 2>&1 || return 0
-  if [ "$OS" = alpine ]; then
-    deluser "$SVC_USER" >/dev/null 2>&1 || warn "未能删除用户 $SVC_USER"
-  else
-    userdel "$SVC_USER" >/dev/null 2>&1 || warn "未能删除用户 $SVC_USER"
-    groupdel "$SVC_USER" >/dev/null 2>&1 || true
+  if [ "$OS" = alpine ]; then deluser "$SVC_USER"
+  else userdel "$SVC_USER" && { groupdel "$SVC_USER" 2>/dev/null || true; }; fi
+}
+platform_dirs() {
+  mkdir -p "$INB_DIR" "$CERT_DIR" "$ACME_DIR" "$STATE_DIR" "$TXN_ROOT" || return 1
+  chown root:root "$BASE" "$INB_DIR" "$CERT_DIR" "$TXN_ROOT" || return 1
+  chmod 700 "$TXN_ROOT" || return 1
+  chgrp "$SVC_USER" "$BASE" "$INB_DIR" "$CERT_DIR" || return 1
+  chmod 750 "$BASE" "$INB_DIR" "$CERT_DIR" || return 1
+  chown "$SVC_USER:$SVC_USER" "$STATE_DIR" "$ACME_DIR" || return 1
+  chmod 750 "$STATE_DIR" && chmod 700 "$ACME_DIR" || return 1
+  # 兼容旧安装中的 ACME 存储；不遍历配置、证书或事务目录。
+  find "$ACME_DIR" -type d -exec chown "$SVC_USER:$SVC_USER" {} + -exec chmod 700 {} + || return 1
+  find "$ACME_DIR" -type f -exec chown "$SVC_USER:$SVC_USER" {} + -exec chmod 600 {} + || return 1
+  if [ "$INIT" = openrc ]; then
+    mkdir -p "$(dirname "$LOG")" && touch "$LOG" && chown "$SVC_USER:$SVC_USER" "$LOG" && chmod 600 "$LOG" || return 1
   fi
 }
-
-# systemd 用 ambient 能力并去掉文件能力。OpenRC 只能给文件加能力，模式 750
-grant_bind() {
-  [ -e "$BIN" ] || return 0
-  if id "$SVC_USER" >/dev/null 2>&1; then
-    chown root:"$SVC_USER" "$BIN" 2>/dev/null || true
-    chmod 750 "$BIN" 2>/dev/null || true
-  fi
+platform_file_mode() {
+  case ${2:-$1} in
+    "$BIN") chown root:"$SVC_USER" "$1" && chmod 750 "$1";;
+    "$UNIT") chown root:root "$1" && { if [ "$INIT" = openrc ]; then chmod 755 "$1"; else chmod 644 "$1"; fi; };;
+    *) chown root:"$SVC_USER" "$1" && chmod 640 "$1";;
+  esac
+}
+platform_bind() {
+  [ -x "$BIN" ] || return 0
   if [ "$INIT" = systemd ]; then
-    command -v setcap >/dev/null 2>&1 && setcap -r "$BIN" 2>/dev/null || true
-    return 0
+    if command -v getcap >/dev/null 2>&1 && [ -n "$(getcap "$BIN")" ]; then setcap -r "$BIN" || return 1; fi
+  else
+    setcap cap_net_bind_service=+ep "$BIN" || return 1
   fi
-  command -v setcap >/dev/null 2>&1 || { warn "没有 setcap，低端口将无法监听"; return 0; }
-  setcap cap_net_bind_service=+ep "$BIN" || warn "设置低端口能力失败"
+}
+platform_arch() {
+  case $1 in
+    x86_64|amd64) printf amd64;; aarch64|arm64) printf arm64;; armv7l|armv7) printf armv7;;
+    i386|i686) printf 386;; s390x) printf s390x;; *) return 1;;
+  esac
+}
+runtime_lock() {
+  local lock_dir=$RUN_ROOT/sb-sing-box
+  # /run/lock 在部分系统可由普通用户写入；锁放进 /run 下的私有目录。
+  [ ! -L "$lock_dir" ] && mkdir -p "$lock_dir" && chmod 700 "$lock_dir" || return 1
+  [ ! -L "$lock_dir/panel.lock" ] || return 1
+  # 锁文件永不 unlink；由内核在描述符关闭时释放锁。
+  exec {LOCK_FD}>>"$lock_dir/panel.lock" || return 1
+  flock -n "$LOCK_FD" || { ui_err '另一个 sing-box.sh 正在运行'; exec {LOCK_FD}>&-; LOCK_FD=''; return 1; }
+}
+runtime_cleanup() {
+  local status=${1:-$?}
+  trap - EXIT INT TERM
+  if [ -n "$TXN_DIR" ]; then txn_rollback || status=1; fi
+  [ -z "$RUNTIME_DIR" ] || rm -rf -- "$RUNTIME_DIR"
+  if [ -n "$LOCK_FD" ]; then exec {LOCK_FD}>&-; fi
+  return "$status"
 }
 
-verify_download() { # 摘要只向 api.github.com 索取
-  local file=$1 asset=$2 ver=$3 dig expect got pin
-  got=$(sha256sum "$file" | awk 'NR==1{print $1}')
-  if [ -n "${SINGBOX_SHA256:-}" ]; then
-    pin=$(printf '%s' "$SINGBOX_SHA256" | tr 'A-F' 'a-f')
-    [[ $pin =~ ^[0-9a-f]{64}$ ]] || { err "SINGBOX_SHA256 须为 64 位十六进制"; return 1; }
-    [ "$got" = "$pin" ] || { err "下载文件与 SINGBOX_SHA256 不一致"; return 1; }
-    return 0
-  fi
-  if [ "$REL_VER" != "$ver" ] || [ -z "$REL_JSON" ]; then
-    REL_JSON=$(curl -fsSL -m 20 "https://api.github.com/repos/SagerNet/sing-box/releases/tags/v${ver}") || REL_JSON=""
-    REL_VER=$ver
-  fi
-  dig=$(jq -r --arg n "$asset" '.assets[] | select(.name==$n) | .digest' <<<"$REL_JSON" | head -n1)
-  expect=${dig#sha256:}
-  [[ $expect =~ ^[0-9a-f]{64}$ ]] || { err "拿不到官方 sha256，可设置 SINGBOX_SHA256 后重试"; return 1; }
-  [ "$got" = "$expect" ] || { err "与 GitHub 官方 sha256 不一致"; return 1; }
+# 2. 数据、校验和协议元数据。路径必须显式传入，读取不修改原文件。
+store_list() {
+  local -n _store_files=$1
+  local entry
+  _store_files=()
+  for entry in "${2:-$INB_DIR}"/*.json; do
+    if [ -e "$entry" ] || [ -L "$entry" ]; then _store_files+=("$entry"); fi
+  done
+  [ "${#_store_files[@]}" -gt 0 ]
 }
-
-download_core() {
-  local ver=$1 arch tmp bin asset url
-  arch=$(detect_arch) || { err "不支持的 CPU 架构：$(uname -m)"; return 1; }
-  tmp=$(mktemp -d)
-  asset="sing-box-${ver}-linux-${arch}.tar.gz"
-  [ "$OS" = alpine ] && asset="sing-box-${ver}-linux-${arch}-musl.tar.gz"
-  url="${GH_PROXY}https://github.com/SagerNet/sing-box/releases/download/v${ver}/$asset"
-  if ! curl -fL --progress-bar -o "$tmp/sb.tgz" "$url"; then
-    err "下载失败，可设置 GH_PROXY 后重试"; rm -rf "$tmp"; return 1
-  fi
-  if ! verify_download "$tmp/sb.tgz" "$asset" "$ver"; then
-    rm -rf "$tmp"; return 1
-  fi
-  tar -xzf "$tmp/sb.tgz" -C "$tmp" || { err "解压失败"; rm -rf "$tmp"; return 1; }
-  bin=$(find "$tmp" -type f -name sing-box | head -n1)
-  [ -n "$bin" ] || { err "压缩包内未找到 sing-box"; rm -rf "$tmp"; return 1; }
-  install -m 755 "$bin" "$BIN" || { rm -rf "$tmp"; return 1; }
-  CORE_VER=""
-  grant_bind
-  rm -rf "$tmp"
+store_count() { local -a entries; store_list entries "$1" || true; printf '%s' "${#entries[@]}"; }
+store_edit() {
+  local path=$1 tmp_file; shift
+  tmp_file=$(mktemp "${path}.XXXXXX") || return 1
+  if jq "$@" "$path" >"$tmp_file" && chmod 600 "$tmp_file" && mv -f -- "$tmp_file" "$path"; then return 0; fi
+  rm -f -- "$tmp_file"; return 1
 }
-
-put_file() { # 内容相同则不写；0 已更新，1 未变
-  local path=$1 body cur
-  body=$(cat)
-  if [ -f "$path" ]; then
-    cur=$(cat "$path")
-    [ "$cur" = "$body" ] && return 1
-  fi
-  printf '%s\n' "$body" > "$path" || return 2
+store_save() {
+  local out=$1 proto=$2 name=$3 cert=$4 domain=$5 email=$6 inbound=$7
+  SB_NAME=$name SB_INB=$inbound jq -n --arg p "$proto" --arg c "$cert" --arg d "$domain" --arg e "$email" \
+    '{proto:$p,name:env.SB_NAME,cert:$c,domain:$d,email:$e,inbound:(env.SB_INB|fromjson)}' >"$out"
+}
+store_validate() {
+  local file
+  local -a entries=()
+  store_list entries "$1" || return 0
+  for file in "${entries[@]}"; do
+    if [ ! -f "$file" ] || [ -L "$file" ] || ! jq -e '
+      type=="object" and (.proto|IN("socks","shadowsocks","vless","hysteria2","anytls","tuic","snell"))
+      and (.name|type=="string") and (.cert|IN("none","self","acme"))
+      and (.inbound|type=="object") and (.proto==.inbound.type)
+      and (.inbound.tag|type=="string" and test("^[A-Za-z0-9][A-Za-z0-9_-]*$"))
+      and (.inbound.listen_port|type=="number" and floor==. and .>=1 and .<=65535)
+      and (if .cert=="none" then true else (.domain|type=="string" and length>0) and (.inbound.tls.enabled==true) end)
+      and (if .cert=="acme" then (.inbound.tls.certificate_provider|type=="string" and length>0) else true end)
+      and (if .proto=="snell" then
+        (.inbound.version|IN(5,6))
+        and (if .inbound.version==5 then ((.inbound.obfs_mode//"none")|IN("none","http")) else ((.inbound|has("obfs_mode"))|not) end)
+        else true end)
+    ' "$file" >/dev/null 2>&1; then ui_err "入站文件损坏或不受支持：$file"; return 1; fi
+    if [ "$(jq -r .inbound.tag "$file")" != "$(basename "$file" .json)" ]; then
+      ui_err "入站 tag 与文件名不一致：$file"; return 1
+    fi
+  done
+  jq -se '([.[].inbound.listen_port]|length== (unique|length)) and
+    ([.[].inbound.tag]|length==(unique|length))' "${entries[@]}" >/dev/null || {
+    ui_err '入站 tag 或端口重复'; return 1;
+  }
+}
+valid_port() { [[ $1 =~ ^[1-9][0-9]{0,4}$ ]] && [ "$1" -le 65535 ]; }
+valid_positive() { [[ $1 =~ ^[1-9][0-9]{0,8}$ ]]; }
+valid_nonempty() { [ -n "$1" ]; }
+valid_uuid() { [[ $1 =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; }
+valid_psk() { [ "${#1}" -ge 12 ] && [ "${#1}" -le 255 ]; }
+valid_domain() {
+  local label
+  local -a labels
+  [ "${#1}" -le 253 ] && [[ $1 == *.* && $1 != *. && $1 != .* && $1 != *..* ]] || return 1
+  IFS=. read -ra labels <<<"$1"
+  for label in "${labels[@]}"; do
+    [[ $label =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] || return 1
+  done
+  [[ ${labels[${#labels[@]}-1]} =~ ^[A-Za-z][A-Za-z0-9-]*$ ]]
+}
+valid_version() {
+  local numeric item
+  local -a parts
+  [[ $1 =~ ^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]] || return 1
+  [[ $1 == *-* ]] || return 0
+  numeric=${1#*-}; IFS=. read -ra parts <<<"$numeric"
+  for item in "${parts[@]}"; do [[ $item =~ ^0[0-9]+$ ]] && return 1; done
   return 0
 }
-write_unit() {
-  ensure_user || { err "无法创建系统用户 $SVC_USER"; return 1; }
-  ensure_dirs
-  touch "$LOG"
-  chown "$SVC_USER:$SVC_USER" /var/lib/sing-box "$LOG" 2>/dev/null || true
-  chmod 750 /var/lib/sing-box 2>/dev/null || true
-  local st=0
-  if [ "$INIT" = openrc ]; then
-    put_file "$UNIT" <<EOF
-#!/sbin/openrc-run
+version_ge() {
+  valid_version "$1" && valid_version "$2" || return 1
+  local i x y ap='' bp=''
+  local -a a b
+  IFS=. read -ra a <<<"${1%%-*}"; IFS=. read -ra b <<<"${2%%-*}"
+  for i in 0 1 2; do
+    [ "${a[$i]}" -gt "${b[$i]}" ] && return 0
+    [ "${a[$i]}" -lt "${b[$i]}" ] && return 1
+  done
+  [[ $1 == *-* ]] && ap=${1#*-}; [[ $2 == *-* ]] && bp=${2#*-}
+  [ -n "$ap" ] || return 0
+  [ -n "$bp" ] || return 1
+  IFS=. read -ra a <<<"$ap"; IFS=. read -ra b <<<"$bp"
+  for ((i=0; i<${#a[@]} || i<${#b[@]}; i++)); do
+    [ "$i" -lt "${#a[@]}" ] || return 1
+    [ "$i" -lt "${#b[@]}" ] || return 0
+    x=${a[$i]} y=${b[$i]}; [ "$x" != "$y" ] || continue
+    if [[ $x =~ ^[0-9]+$ && $y =~ ^[0-9]+$ ]]; then
+      [ "${#x}" -eq "${#y}" ] || { [ "${#x}" -gt "${#y}" ]; return; }
+      [[ $x > $y ]]; return
+    elif [[ $x =~ ^[0-9]+$ ]]; then return 1
+    elif [[ $y =~ ^[0-9]+$ ]]; then return 0
+    else LC_ALL=C test "$x" \> "$y"; return; fi
+  done
+  return 0
+}
+proto_name() {
+  case $1 in
+    socks) printf SOCKS5;; shadowsocks) printf Shadowsocks;; vless) printf VLESS;; hysteria2) printf Hysteria2;;
+    anytls) printf AnyTLS;; tuic) printf TUIC;; snell) printf Snell;; *) return 1;;
+  esac
+}
+proto_tls() { case $1 in vless|hysteria2|anytls|tuic) return 0;; *) return 1;; esac; }
+proto_alpn() { case $1 in vless) printf '["http/1.1"]';; hysteria2|tuic) printf '["h3"]';; *) printf '[]';; esac; }
+proto_fields() {
+  local -n _field_keys=$2 _field_labels=$3
+  _field_keys=(port); _field_labels=(端口)
+  case $1 in
+    socks) _field_keys+=(user pass); _field_labels+=(用户名 密码);;
+    shadowsocks) _field_keys+=(method pass); _field_labels+=(加密 密码);;
+    vless) _field_keys+=(uuid); _field_labels+=(UUID);;
+    hysteria2|anytls) _field_keys+=(pass); _field_labels+=(密码);;
+    tuic) _field_keys+=(uuid pass); _field_labels+=(UUID 密码);;
+    snell) _field_keys+=(version psk); _field_labels+=(版本 PSK);;
+  esac
+  if proto_tls "$1"; then _field_keys+=(sni); _field_labels+=(SNI); fi
+  case $1 in
+    vless) _field_keys+=(flow); _field_labels+=(流控);;
+    tuic) _field_keys+=(cc); _field_labels+=(拥塞);;
+    hysteria2) _field_keys+=(hcc); _field_labels+=(拥塞);;
+  esac
+  if proto_tls "$1"; then _field_keys+=(tls); _field_labels+=(证书); fi
+  _field_keys+=(name); _field_labels+=(备注)
+}
+proto_random() {
+  local length=$1 value='' chunk
+  while [ "${#value}" -lt "$length" ]; do
+    chunk=$(openssl rand -base64 "$length") || return 1
+    value+=${chunk//[^A-Za-z0-9]/}
+  done
+  printf '%s' "${value:0:length}"
+}
+proto_uuid() { local uuid; IFS= read -r uuid </proc/sys/kernel/random/uuid && printf '%s' "$uuid"; }
+proto_ss_keylen() {
+  case $1 in 2022-blake3-aes-128-gcm) printf 16;; 2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) printf 32;; *) printf 0;; esac
+}
+proto_ss_password() {
+  local size; size=$(proto_ss_keylen "$1")
+  if [ "$size" -gt 0 ]; then openssl rand -base64 "$size" | tr -d '\n'; else proto_random 20; fi
+}
+proto_ss_valid() {
+  local size decoded
+  size=$(proto_ss_keylen "$1")
+  [ "$size" -gt 0 ] || { valid_nonempty "$2"; return; }
+  # 先检查编码形态，再检查解码长度；不把 base64 的失败藏在管道中。
+  [[ $2 =~ ^[A-Za-z0-9+/]+={0,2}$ ]] && [ "$((${#2}%4))" -eq 0 ] || return 1
+  decoded=$(printf %s "$2" | openssl base64 -d -A | od -An -v -tx1 | tr -d ' \n') || return 1
+  [ "${#decoded}" -eq "$((size*2))" ]
+}
+proto_build() {
+  local proto=$1 tag=$2 port=$3 tls_json=${4:-\{\}} method=${5:-aes-128-gcm} version=${6:-6} obfs_mode=${7:-none} secret='' id='' user=''
+  case $proto in
+    socks) user=$(proto_random 8) || return 1;;
+    vless|tuic) id=$(proto_uuid) || return 1;;
+  esac
+  case $proto in
+    vless) ;;
+    shadowsocks) secret=$(proto_ss_password "$method") || return 1;;
+    *) secret=$(proto_random 24) || return 1;;
+  esac
+  SB_SECRET=$secret SB_USER=$user SB_UUID=$id jq -n \
+    --arg p "$proto" --arg t "$tag" --argjson port "$port" --arg listen "$(net_listen)" --arg m "$method" --argjson tls "$tls_json" --argjson sv "$version" --arg so "$obfs_mode" '
+    {type:$p,tag:$t,listen:$listen,listen_port:$port}
+    + (if $p=="socks" then {users:[{username:env.SB_USER,password:env.SB_SECRET}]}
+       elif $p=="shadowsocks" then {method:$m,password:env.SB_SECRET}
+       elif $p=="snell" then {version:$sv,psk:env.SB_SECRET} + (if $sv==5 then {obfs_mode:$so} else {} end)
+       elif $p=="vless" then {tls:$tls,users:[{name:"user",uuid:env.SB_UUID,flow:"xtls-rprx-vision"}]}
+       elif $p=="tuic" then {tls:$tls,users:[{name:"user",uuid:env.SB_UUID,password:env.SB_SECRET}],congestion_control:"cubic"}
+       else {tls:$tls,users:[{name:"user",password:env.SB_SECRET}]} end)'
+}
 
+# 3. 网络。探测失败与“未占用”分开返回；端口检测：0 占用，1 空闲，2 失败。
+net_bare_ip() { local value=$1; value=${value#[}; value=${value%]}; printf '%s' "${value%%%*}"; }
+net_norm_ip() {
+  local value left right group result='' i v4 h1 h2
+  local -a lhs=() rhs=() groups=() octets
+  value=$(net_bare_ip "$1"); value=${value,,}
+  if [[ $value != *:* ]]; then valid_ip "$value" || return 1; printf '%s' "$value"; return 0; fi
+  if [[ $value == *.* ]]; then
+    v4=${value##*:}; valid_ip "$v4" || return 1
+    IFS=. read -ra octets <<<"$v4"
+    printf -v h1 '%x' "$((10#${octets[0]}*256+10#${octets[1]}))"
+    printf -v h2 '%x' "$((10#${octets[2]}*256+10#${octets[3]}))"
+    value=${value%:*}:$h1:$h2
+  fi
+  [[ $value != *[^0-9a-f:]* && $value != *:::* ]] || return 1
+  if [[ $value == *::* ]]; then
+    left=${value%%::*}; right=${value#*::}; [[ $right != *::* ]] || return 1
+    [[ $left != :* && $left != *: && $right != :* && $right != *: ]] || return 1
+    [ -z "$left" ] || IFS=: read -ra lhs <<<"$left"
+    [ -z "$right" ] || IFS=: read -ra rhs <<<"$right"
+    [ "$((${#lhs[@]}+${#rhs[@]}))" -lt 8 ] || return 1
+    groups=("${lhs[@]}")
+    for ((i=${#lhs[@]}+${#rhs[@]}; i<8; i++)); do groups+=(0); done
+    groups+=("${rhs[@]}")
+  else
+    [[ $value != :* && $value != *: ]] || return 1
+    IFS=: read -ra groups <<<"$value"
+  fi
+  [ "${#groups[@]}" -eq 8 ] || return 1
+  for group in "${groups[@]}"; do
+    [[ $group =~ ^[0-9a-f]{1,4}$ ]] || return 1
+    printf -v group '%04x' "$((16#$group))"; result+=${result:+:}$group
+  done
+  printf '%s' "$result"
+}
+valid_ip() {
+  local octet
+  local -a octets
+  if [[ $1 == *:* ]]; then net_norm_ip "$1" >/dev/null; return; fi
+  [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  IFS=. read -ra octets <<<"$1"
+  for octet in "${octets[@]}"; do
+    [ "$((10#$octet))" -le 255 ] && [ "$octet" = "$((10#$octet))" ] || return 1
+  done
+}
+net_public() {
+  valid_ip "$2" || return 1
+  local value second first
+  if [ "$1" = 6 ]; then
+    value=$(net_norm_ip "$2") || return 1
+    case $value in 2001:0db8:*|2001:0002:*) return 1;; 2*|3*) return 0;; *) return 1;; esac
+  fi
+  [[ $2 != *:* ]] || return 1
+  case $2 in
+    0.*|10.*|127.*|169.254.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|192.168.*|192.0.0.*|192.0.2.*|198.51.100.*|203.0.113.*) return 1;;
+  esac
+  IFS=. read -r first second _ <<<"$2"
+  [ "$first" -lt 224 ] || return 1
+  if [ "$first" = 100 ] && [ "$second" -ge 64 ] && [ "$second" -le 127 ]; then return 1; fi
+  if [ "$first" = 198 ] && { [ "$second" = 18 ] || [ "$second" = 19 ]; }; then return 1; fi
+  return 0
+}
+net_local_public() {
+  local value
+  while IFS= read -r value; do
+    net_public "$1" "$value" && { printf '%s' "$value"; return 0; }
+  done < <(ip -"$1" -o addr show scope global 2>/dev/null | awk '
+    /temporary|deprecated|dadfailed|tentative/ {next}
+    {for(i=1;i<=NF;i++) if($i=="inet"||$i=="inet6"){split($(i+1),a,"/");print a[1];break}}')
+  return 1
+}
+net_curl_ip() {
+  local family=$1 url result; shift
+  for url in "$@"; do
+    result=$(curl -"$family" -fsS --connect-timeout 2 -m 3 "$url" 2>/dev/null) || continue
+    result=${result//[$' \t\r\n']/}
+    net_public "$family" "$result" && { printf '%s' "$result"; return 0; }
+  done
+  return 1
+}
+net_get_ip() {
+  [ -z "$SERVER_IP4$SERVER_IP6" ] || return 0
+  local p4 p6 v4 v6 address
+  v4=$(mktemp "$RUNTIME_DIR/ip4.XXXXXX") && v6=$(mktemp "$RUNTIME_DIR/ip6.XXXXXX") || return 1
+  net_curl_ip 4 https://api.ipify.org https://ipv4.icanhazip.com >"$v4" & p4=$!
+  net_curl_ip 6 https://api6.ipify.org https://ipv6.icanhazip.com >"$v6" & p6=$!
+  wait "$p4" || true; wait "$p6" || true
+  SERVER_IP4=$(<"$v4"); SERVER_IP6=$(<"$v6"); rm -f "$v4" "$v6"
+  [ -n "$SERVER_IP4" ] || SERVER_IP4=$(net_local_public 4) || true
+  [ -n "$SERVER_IP6" ] || SERVER_IP6=$(net_local_public 6) || true
+  while [ -z "$SERVER_IP4$SERVER_IP6" ]; do
+    ui_ask address '无法获取公网 IP，请手动输入' '' || return 2
+    address=$(net_bare_ip "$address")
+    valid_ip "$address" || { ui_soft 'IP 格式不正确'; continue; }
+    if [[ $address == *:* ]]; then SERVER_IP6=$address; else SERVER_IP4=$address; fi
+  done
+}
+net_ours() {
+  local normalized candidate
+  normalized=$(net_norm_ip "$1") || return 1
+  for candidate in "$SERVER_IP4" "$SERVER_IP6"; do
+    [ -n "$candidate" ] && [ "$(net_norm_ip "$candidate")" = "$normalized" ] && return 0
+  done
+  return 1
+}
+net_resolve() {
+  local result=''
+  if command -v getent >/dev/null 2>&1; then
+    result=$(getent ahosts "$1" 2>/dev/null | awk '{print $1}' | sort -u)
+  fi
+  if [ -z "$result" ] && command -v nslookup >/dev/null 2>&1; then
+    result=$(nslookup "$1" 2>/dev/null | awk '
+      /^Name:/ {found=1; next}
+      found && /^Address[0-9]*:/ {print $2}
+      found && /^Address [0-9]+:/ {print $3}' | sort -u)
+  fi
+  local value
+  while IFS= read -r value; do valid_ip "$value" && printf '%s\n' "$value"; done <<<"$result"
+  return 0
+}
+net_listen() {
+  local value
+  if [ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ]; then
+    IFS= read -r value </proc/sys/net/ipv6/conf/all/disable_ipv6
+    if [ "$value" = 0 ]; then printf '::'; return 0; fi
+  fi
+  printf '0.0.0.0'
+}
+net_port_used() {
+  local result
+  command -v ss >/dev/null 2>&1 || { ui_err '缺少 ss，无法检查端口'; return 2; }
+  result=$(ss -H -ltun "sport = :$1" 2>/dev/null) || { ui_err '端口检测失败'; return 2; }
+  [ -n "$result" ]
+}
+net_inbound_port() {
+  local -a entries
+  store_list entries "${2:-$INB_DIR}" || return 1
+  jq -se --argjson p "$1" 'any(.[];.inbound.listen_port==$p)' "${entries[@]}" >/dev/null
+}
+net_random_port() {
+  local attempt port status
+  for ((attempt=0; attempt<128; attempt++)); do
+    port=$(shuf -i 10000-60000 -n 1) || return 1
+    net_port_used "$port"; status=$?
+    [ "$status" != 2 ] || return 1
+    if [ "$status" = 1 ] && ! net_inbound_port "$port"; then printf '%s' "$port"; return 0; fi
+  done
+  ui_err '未找到空闲端口'; return 1
+}
+ui_port() {
+  local _port _default=${2:-} status
+  [ -n "$_default" ] || _default=$(net_random_port) || return 1
+  while true; do
+    ui_ask _port 监听端口 "$_default" || return 2
+    valid_port "$_port" || { ui_soft '端口须为 1-65535'; continue; }
+    if [ "$_port" != "${2:-}" ]; then
+      net_inbound_port "$_port" && { ui_soft '端口已被其他入站使用'; continue; }
+      net_port_used "$_port"; status=$?
+      [ "$status" != 2 ] || return 1
+      [ "$status" != 0 ] || { ui_soft '端口已被系统占用'; continue; }
+      if tls_has_acme "$INB_DIR" && { [ "$_port" = 80 ] || [ "$_port" = 443 ]; }; then ui_soft '80/443 已留给 ACME'; continue; fi
+    fi
+    printf -v "$1" '%s' "$_port"; return 0
+  done
+}
+
+# 4. 配置、服务与 release 适配器。
+config_build() {
+  local source_dir=$1 certificate_dir=$2 output=$3
+  local -a entries=()
+  store_validate "$source_dir" || return 1
+  store_list entries "$source_dir" || entries=(/dev/null)
+  # -n + inputs 同时覆盖空目录和多文件；空目录显式读 /dev/null，避免读取终端。
+  jq -n --arg ad "$ACME_DIR" --arg cd "$certificate_dir" --arg listen "$(net_listen)" '
+    [inputs] as $items |
+    {log:{level:"info"},
+     dns:{servers:[{type:"tls",tag:"google",server:"8.8.8.8"}]},
+     certificate_providers:([$items[]|select(.cert=="acme")|
+       {type:"acme",tag:.inbound.tls.certificate_provider,domain:[.domain],data_directory:$ad,provider:"letsencrypt"}
+       + (if (.email//"")!="" then {email:.email} else {} end)]|unique_by(.tag)),
+     inbounds:[$items[] | . as $record | .inbound | .listen=$listen |
+       if $record.cert=="self" then
+         .tls.certificate_path=($cd+"/"+.tag+".crt") | .tls.key_path=($cd+"/"+.tag+".key") else . end |
+       if .type=="vless" and (.users[0].flow//"")=="xtls-rprx-vision" then .tls.alpn=["http/1.1"] else . end],
+     outbounds:[{type:"direct"}],route:{rules:[{port:53,action:"hijack-dns"}]}}
+    | if (.certificate_providers|length)==0 then del(.certificate_providers) else . end
+  ' "${entries[@]}" >"$output"
+}
+service_do() (
+  local action=$1; shift
+  # OpenRC 的 supervisor 不得继承面板锁，否则退出面板后仍会持锁。
+  if [ -n "$LOCK_FD" ]; then exec {LOCK_FD}>&-; fi
+  if [ "$INIT" = systemd ]; then
+    case $action in
+      active) systemctl is-active --quiet "$SVC" >/dev/null 2>&1;;
+      enabled) systemctl is-enabled --quiet "$SVC" >/dev/null 2>&1;;
+      reload) systemctl daemon-reload;;
+      logs) if [ "$1" = -f ]; then journalctl -u "$SVC" -f -o cat; else journalctl -u "$SVC" -n "$1" --no-pager -o cat; fi;;
+      *) systemctl "$action" "$SVC";;
+    esac
+  else
+    case $action in
+      active) rc-service "$SVC" status >/dev/null 2>&1;;
+      enabled) [ -L "/etc/runlevels/default/$SVC" ];;
+      reload) return 0;;
+      enable) rc-update add "$SVC" default;;
+      disable) rc-update del "$SVC" default;;
+      logs) if [ "$1" = -f ]; then tail -n 20 -f "$LOG"; else tail -n "$1" "$LOG"; fi;;
+      *) rc-service "$SVC" "$action";;
+    esac
+  fi
+)
+service_process_alive() {
+  [ "$INIT" = openrc ] || return 0
+  # OpenRC 的 status 可能只确认 supervisor；另查它记录的实际子进程。
+  local pid_file=$RUN_ROOT/openrc/options/$SVC/child_pid child executable
+  [ -f "$pid_file" ] || return 1
+  child=$(<"$pid_file")
+  [[ $child =~ ^[1-9][0-9]*$ ]] && kill -0 "$child" 2>/dev/null || return 1
+  executable=$(readlink -f "/proc/$child/exe" 2>/dev/null) || return 1
+  [ "$executable" = "$BIN" ]
+}
+service_wait() {
+  local desired=${1:-active} count stable=0
+  for ((count=0; count<16; count++)); do
+    if service_do active; then
+      if [ "$desired" != stopped ] && service_process_alive; then stable=$((stable+1)); else stable=0; fi
+    else
+      [ "$desired" != stopped ] || return 0
+      stable=0
+    fi
+    [ "$stable" -lt 5 ] || return 0
+    sleep 0.5
+  done
+  return 1
+}
+service_failure() {
+  ui_err '服务操作失败，最近日志：'
+  service_do logs 15 | sed 's/^/    /' >&2
+  return 1
+}
+service_check() { "$1" check -c "$2"; }
+service_render() {
+  if [ "$INIT" = openrc ]; then
+    cat <<EOF
+#!/sbin/openrc-run
 name=\$RC_SVCNAME
 description="sing-box service"
 supervisor=supervise-daemon
 command="$BIN"
 command_user="$SVC_USER:$SVC_USER"
-command_args="-D /var/lib/sing-box run --disable-color -c $CONF"
-directory="/var/lib/sing-box"
+command_args="-D $STATE_DIR run --disable-color -c $CONF"
+directory="$STATE_DIR"
 pidfile="/run/\${RC_SVCNAME}.pid"
 output_log="$LOG"
 error_log="$LOG"
 respawn_delay=5
 respawn_max=0
 rc_ulimit="-n 1048576"
-
-depend() {
-    after net dns
-}
-
+depend() { after net dns; }
 start_pre() {
-    checkpath --directory --owner $SVC_USER:$SVC_USER --mode 0750 /var/lib/sing-box
-    if ! "\$command" check -c $CONF >>$LOG 2>&1; then
+    checkpath --directory --owner $SVC_USER:$SVC_USER --mode 0750 $STATE_DIR
+    if ! su -s /bin/sh $SVC_USER -c '"$BIN" check -c "$CONF"' >>"$LOG" 2>&1; then
         eerror "配置校验失败，详见 $LOG"
         return 1
     fi
 }
 EOF
-    st=$?
-    [ "$st" -eq 2 ] && { err "服务单元写入失败"; return 1; }
-    chmod 755 "$UNIT" || { err "服务单元权限设置失败"; return 1; }
   else
-    put_file "$UNIT" <<EOF
+    cat <<EOF
 [Unit]
 Description=sing-box service
 After=network-online.target nss-lookup.target
@@ -575,9 +642,9 @@ Wants=network-online.target
 Type=simple
 User=$SVC_USER
 Group=$SVC_USER
-WorkingDirectory=/var/lib/sing-box
+WorkingDirectory=$STATE_DIR
 ExecStartPre=$BIN check -c $CONF
-ExecStart=$BIN -D /var/lib/sing-box run -c $CONF
+ExecStart=$BIN -D $STATE_DIR run -c $CONF
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=1048576
@@ -586,1045 +653,896 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadOnlyPaths=/etc/sing-box
-ReadWritePaths=/etc/sing-box/acme /var/lib/sing-box
+ReadOnlyPaths=$BASE
+ReadWritePaths=$ACME_DIR $STATE_DIR
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    st=$?
-    [ "$st" -eq 2 ] && { err "服务单元写入失败"; return 1; }
-    if [ "$st" -eq 0 ]; then
-      systemctl daemon-reload || { err "systemd 重载失败"; return 1; }
-    fi
   fi
-  grant_bind
 }
-
-alpine_enable_community() {
-  local f=/etc/apk/repositories
-  [ -f "$f" ] || return 0
-  grep -Eq '^[^#].*/community([[:space:]]|$)' "$f" && return 0
-  warn "未改 apk 源。安装失败时请启用 community"
+release_installed() { [ -x "$BIN" ]; }
+release_need_core() { release_installed || { ui_warn '请先安装内核'; return 1; }; }
+release_core_version() {
+  if [ -z "$CORE_VER" ]; then CORE_VER=$("$BIN" version 2>/dev/null | awk 'NR==1{print $3}'); fi
+  [ -n "$CORE_VER" ] || return 1
+  printf -v "$1" '%s' "$CORE_VER"
 }
-
-install_deps() {
-  local -a pkgs=()
-  local log
-  command -v curl >/dev/null 2>&1 || pkgs+=(curl)
-  command -v jq >/dev/null 2>&1 || pkgs+=(jq)
-  command -v openssl >/dev/null 2>&1 || pkgs+=(openssl)
-  command -v tar >/dev/null 2>&1 || pkgs+=(tar)
-  command -v ip >/dev/null 2>&1 || pkgs+=(iproute2)
-  [ -f /etc/ssl/certs/ca-certificates.crt ] || pkgs+=(ca-certificates)
-  if [ "$INIT" != systemd ] && ! command -v setcap >/dev/null 2>&1; then
-    if [ "$OS" = alpine ]; then pkgs+=(libcap); else pkgs+=(libcap2-bin); fi
-  fi
-  command -v shuf >/dev/null 2>&1 || pkgs+=(coreutils)
-  [ ${#pkgs[@]} -eq 0 ] && return 0
-  info "正在安装依赖…"
-  if [ "$OS" = alpine ]; then
-    log=$(mktemp)
-    alpine_enable_community
-    if ! apk add --no-cache "${pkgs[@]}" >"$log" 2>&1 \
-      && { ! apk update >"$log" 2>&1 || ! apk add --no-cache "${pkgs[@]}" >"$log" 2>&1; }; then
-      err "依赖安装失败，请检查 apk 源与网络"
-      tail -n 12 "$log" | sed 's/^/    /'
-      rm -f "$log"; return 1
-    fi
-    rm -f "$log"
+release_fetch() {
+  local requested=${1:-latest} url document fetched
+  if [ "$requested" != latest ] && [ "$REL_VER" = "$requested" ] && [ -n "$REL_JSON" ]; then return 0; fi
+  url=https://api.github.com/repos/SagerNet/sing-box/releases
+  if [ "$requested" = latest ]; then url+=/latest; else valid_version "$requested" || return 1; url+=/tags/v$requested; fi
+  document=$(curl -fsSL --connect-timeout 5 -m 20 "$url") || return 1
+  fetched=$(jq -er '.tag_name|strings|ltrimstr("v")' <<<"$document") || return 1
+  version_ge "$fetched" "$MIN_VER" || return 1
+  [ "$requested" = latest ] || [ "$requested" = "$fetched" ] || return 1
+  jq -e '.assets|type=="array"' <<<"$document" >/dev/null || return 1
+  REL_JSON=$document REL_VER=$fetched
+}
+release_pick() {
+  local _picked=''
+  if release_fetch latest; then _picked=$REL_VER
   else
-    apt-get install -y -qq "${pkgs[@]}" >/dev/null 2>&1 \
-      || { apt-get update -qq >/dev/null 2>&1 \
-           && apt-get install -y -qq "${pkgs[@]}" >/dev/null 2>&1; } \
-      || { err "依赖安装失败，请检查 apt 源与网络"; return 1; }
+    ui_warn '无法获取符合要求的最新版本信息'
+    ui_ask _picked '请手动输入版本号，如 1.14.0' '' || return 2
+    _picked=${_picked#v}
   fi
+  version_ge "$_picked" "$MIN_VER" || { ui_err "版本需不低于 $MIN_VER"; return 1; }
+  printf -v "$1" '%s' "$_picked"
 }
-
-install_core() {
-  local vf jf dp vp
-  page "安装内核"
-  if installed; then
-    warn "已安装 v$(core_ver)，更新请用「升级内核」"
-    write_unit || return
-    secure_tree
-    return
-  fi
-  vf=$(mktemp); jf=$(mktemp)
-  install_deps & dp=$!
-  (
-    s=$(latest_version) || exit 1
-    printf '%s' "$s" >"$vf"
-    printf '%s' "$REL_JSON" >"$jf"
-  ) & vp=$!
-  if ! wait "$dp"; then
-    kill "$vp" 2>/dev/null || true
-    wait "$vp" 2>/dev/null || true
-    rm -f "$vf" "$jf"
-    return
-  fi
-  wait "$vp" || true
-  VER=$(cat "$vf" 2>/dev/null || true)
-  REL_JSON=$(cat "$jf" 2>/dev/null || true)
-  REL_VER=$VER
-  rm -f "$vf" "$jf"
-  # 依赖刚装上时，并行的版本检查可能因为还没有 curl/jq 失败
-  if [ -z "$VER" ]; then
-    VER=$(latest_version) || true
-  fi
-  accept_version || return
-  info "正在下载 sing-box v$VER …"
-  download_core "$VER" || return
-  write_unit || return
-  build_config || { err "生成配置失败"; return; }
-  mv -f "$CONF.new" "$CONF"
-  secure_tree
-  svc enable
-  ok "安装完成（v$(core_ver)）"
-}
-
-upgrade_core() {
-  page "升级内核"
-  need_core || return
-  local cur was=0; cur=$(core_ver)
-  info "正在检查最新版本…"
-  pick_version || return
-  if [ "$cur" = "$VER" ]; then
-    if write_unit; then
-      secure_tree
-      ok "已是最新版本 v$cur"
-    fi
-    return
-  fi
-  info "v$cur → v$VER"
-  svc active && was=1
-  cp -f "$BIN" "$BIN.old" || { err "无法备份旧内核，已取消"; return; }
-  [ $was -eq 1 ] && svc stop
-  if download_core "$VER" && { [ ! -f "$CONF" ] || "$BIN" check -c "$CONF" >/dev/null 2>&1; }; then
-    rm -f "$BIN.old"
-    if write_unit; then
-      secure_tree
-      if [ $was -eq 1 ]; then
-        svc start
-        svc_report || return
-      fi
-      ok "升级完成（v$(core_ver)）"
-      return
-    fi
-    err "二进制已升级，但服务单元没有更新"
+release_verify() {
+  local archive=$1 asset=$2 version=$3 actual expected
+  actual=$(sha256sum "$archive") || return 1; actual=${actual%% *}
+  if [ -n "${SINGBOX_SHA256:-}" ]; then expected=${SINGBOX_SHA256,,}
   else
-    if [ -f "$BIN.old" ] && mv -f "$BIN.old" "$BIN"; then
-      grant_bind
-      err "升级失败，已恢复旧版本"
-    else
-      err "升级失败，且旧内核恢复失败"
-    fi
+    release_fetch "$version" || { ui_err '无法获取官方摘要，可设置 SINGBOX_SHA256'; return 1; }
+    expected=$(jq -er --arg n "$asset" '[.assets[]|select(.name==$n)|.digest]|select(length==1)|.[0]|strings' <<<"$REL_JSON") || return 1
+    expected=${expected#sha256:}; expected=${expected,,}
   fi
-  if [ $was -eq 1 ]; then
-    svc start
-    svc_report || true
+  [[ $expected =~ ^[0-9a-f]{64}$ ]] && [ "$actual" = "$expected" ] || {
+    ui_err '下载摘要校验失败'; return 1;
+  }
+}
+release_download() {
+  local version=$1 output=$2 arch work asset member actual
+  local -a binaries=()
+  arch=$(platform_arch "$(uname -m)") || { ui_err "不支持的 CPU 架构：$(uname -m)"; return 1; }
+  asset=sing-box-$version-linux-$arch
+  [ "$OS" != alpine ] || asset+=-musl
+  asset+=.tar.gz
+  work=$(mktemp -d "$RUNTIME_DIR/download.XXXXXX") || return 1
+  if ! curl -fL --connect-timeout 10 --max-time 300 --progress-bar -o "$work/core.tgz" \
+    "${GH_PROXY:-}https://github.com/SagerNet/sing-box/releases/download/v$version/$asset"; then
+    ui_err '下载失败，可设置 GH_PROXY'; rm -rf "$work"; return 1
   fi
+  if ! release_verify "$work/core.tgz" "$asset" "$version"; then rm -rf "$work"; return 1; fi
+  if ! tar -tzf "$work/core.tgz" >"$work/members"; then rm -rf "$work"; return 1; fi
+  while IFS= read -r member; do
+    case $member in /*|..|../*|*/../*|*/..) ui_err '压缩包路径不合法'; rm -rf "$work"; return 1;; esac
+  done <"$work/members"
+  if ! tar -xzf "$work/core.tgz" -C "$work"; then rm -rf "$work"; return 1; fi
+  mapfile -t binaries < <(find "$work" -type f -name sing-box)
+  if [ "${#binaries[@]}" != 1 ] || ! cp "${binaries[0]}" "$output" || ! chmod 700 "$output"; then
+    ui_err '压缩包内核缺失或写入失败'; rm -rf "$work"; return 1
+  fi
+  actual=$("$output" version 2>/dev/null | awk 'NR==1{print $3}')
+  rm -rf "$work"
+  [ "$actual" = "$version" ] || { ui_err '下载内核的版本与请求不一致'; rm -f "$output"; return 1; }
 }
 
-svc_wait() {
-  local i
-  svc active && return 0
-  for i in 1 2 3 4 5 6 7 8; do
-    sleep 0.5
-    svc active && return 0
+# 5. 文件事务。JSON 记录只存目标与原状态；备份/暂存路径由序号推导。
+# preparing 阶段不修改正式文件；publishing/rolling_back 可以幂等恢复。
+txn_record() { store_edit "$TXN_DIR/manifest.json" "$@"; }
+txn_phase() { txn_record --arg phase "$1" '.phase=$phase'; }
+txn_allowed() {
+  local target=$1 leaf
+  case $target in
+    "$CONF"|"$BIN"|"$UNIT") ;;
+    "$INB_DIR/"*.json) leaf=${target#"$INB_DIR/"}; [[ $leaf =~ ^[A-Za-z0-9][A-Za-z0-9_-]*\.json$ ]] || return 1;;
+    "$CERT_DIR/"*.crt|"$CERT_DIR/"*.key) leaf=${target#"$CERT_DIR/"}; [[ $leaf =~ ^[A-Za-z0-9][A-Za-z0-9_-]*\.(crt|key)$ ]] || return 1;;
+    *) return 1;;
+  esac
+  [ ! -L "$target" ] && [ ! -L "${target%/*}" ] && [ ! -L "$BASE" ]
+}
+txn_begin() {
+  [ "$RUNTIME_BLOCKED" = 0 ] && [ -z "$TXN_DIR" ] || { ui_err '存在未恢复事务，不能修改'; return 1; }
+  store_validate "$INB_DIR" || return 1
+  mkdir -p "$TXN_ROOT" || return 1
+  chmod 700 "$TXN_ROOT" || return 1
+  TXN_DIR=$(mktemp -d "$TXN_ROOT/txn.XXXXXXXX") || return 1
+  local active=false enabled=false
+  service_do active && active=true
+  service_do enabled && enabled=true
+  if ! mkdir "$TXN_DIR/backups" "$TXN_DIR/stage" "$TXN_DIR/inbounds" "$TXN_DIR/certs" \
+    || ! jq -n --arg op "$1" --argjson active "$active" --argjson enabled "$enabled" \
+       '{version:1,operation:$op,phase:"preparing",active:$active,enabled:$enabled,service_touched:false,paths:[]}' >"$TXN_DIR/manifest.json"; then
+    rm -rf "$TXN_DIR"; TXN_DIR=''; return 1
+  fi
+  local file
+  for file in "$INB_DIR"/*.json; do
+    [ -f "$file" ] || continue
+    cp -p "$file" "$TXN_DIR/inbounds/" || { txn_rollback; return 1; }
   done
-  return 1
-}
-show_fail_logs() { svc logs 15 | sed 's/^/    /'; }
-halt_if_empty() {
-  [ "$(inb_count)" -eq 0 ] || return 1
-  svc stop >/dev/null 2>&1 || true
-}
-svc_report() {
-  if svc_wait; then ok "内核运行中"; return 0; fi
-  err "内核启动失败，最近日志："
-  show_fail_logs
-  return 1
-}
-
-start_core() {
-  page "启动内核"
-  need_core || return
-  [ "$(inb_count)" -eq 0 ] && { warn "还没有入站"; return; }
-  write_unit || warn "服务单元未更新"
-  secure_tree
-  svc start
-  svc_report
-}
-
-stop_core() {
-  page "停止内核"
-  need_core || return
-  svc stop && ok "内核已停止"
-}
-
-uninstall_core() {
-  page "卸载内核"
-  need_core || return
-  confirm "确认卸载 sing-box？" n || return
-  svc stop >/dev/null 2>&1; svc disable
-  rm -f "$UNIT" "$BIN" "$BIN.old"
-  [ "$INIT" = systemd ] && systemctl daemon-reload
-  if confirm "同时删除所有入站与配置？" n; then
-    rm -rf "$BASE" /var/lib/sing-box
-    [ "$INIT" = openrc ] && rm -f "$LOG"
-    remove_user
-    ok "已卸载，配置已清除"
-  else
-    ok "已卸载，配置保留在 $BASE"
-  fi
-}
-
-view_logs() {
-  page "查看日志"
-  need_core || return
-  echo "  1  最近 100 行"
-  echo "  2  实时日志"
-  echo
-  local n; sel n 2 || return
-  echo
-  if [ "$n" = 2 ]; then
-    trap ':' INT; svc logs -f; trap - INT
-  else
-    svc logs 100; HOLD=1
-  fi
-}
-
-# 键顺序：log、dns、证书、inbounds、outbounds、route
-config_order='{log,dns}
-  + (if ((.certificate_providers//[])|length)>0 then {certificate_providers} else {} end)
-  + {inbounds,outbounds,route}'
-build_config() {
-  local -a files=()
-  local listen
-  listen=$(listen_host)
-  if list_inb files; then
-    jq -s --arg ad "$ACME_DIR" --arg listen "$listen" "
-    {
-      log:{level:\"info\"},
-      dns:{servers:[{type:\"tls\",tag:\"google\",server:\"8.8.8.8\"}]},
-      certificate_providers: ([ .[] | select(.cert==\"acme\") |
-        ({type:\"acme\",
-          tag:(\"acme-\"+(.domain|gsub(\"[:/]\";\"-\"))),
-          domain:[.domain],
-          data_directory:\$ad,
-          provider:\"letsencrypt\"}
-         + (if (.email//\"\")!=\"\" then {email:.email} else {} end)
-        ) ] | unique_by(.tag)),
-      inbounds: [ .[].inbound | .listen = \$listen
-        | if .type == \"vless\" and ((.users[0].flow // \"\") == \"xtls-rprx-vision\")
-          then .tls.alpn = [\"http/1.1\"] else . end ],
-      outbounds:[{type:\"direct\"}],
-      route:{rules:[{port:53,action:\"hijack-dns\"}]}
-    } | $config_order
-    " "${files[@]}" > "$CONF.new" || { rm -f "$CONF.new"; return 1; }
-  else
-    jq -n "
-    {log:{level:\"info\"},
-     dns:{servers:[{type:\"tls\",tag:\"google\",server:\"8.8.8.8\"}]},
-     inbounds:[],
-     outbounds:[{type:\"direct\"}],
-     route:{rules:[{port:53,action:\"hijack-dns\"}]}} | $config_order
-    " > "$CONF.new" || { rm -f "$CONF.new"; return 1; }
-  fi
-  chmod 600 "$CONF.new" 2>/dev/null || true
-}
-
-apply() { # 0 成功；1 未替换；2 已替换但未跑起来
-  build_config || { err "生成配置失败"; return 1; }
-  if ! "$BIN" check -c "$CONF.new" 2> "$BASE/.check.err"; then
-    err "配置校验未通过："; sed 's/^/    /' "$BASE/.check.err"; rm -f "$CONF.new"; return 1
-  fi
-  mv -f "$CONF.new" "$CONF"
-  write_unit || warn "服务单元未更新"
-  secure_tree
-  if halt_if_empty; then
-    tip "已无入站，内核已停止"
-    return 0
-  fi
-  info "正在应用配置…"
-  svc restart
-  svc_report && return 0
-  return 2
-}
-
-restore_running() {
-  build_config || { err "回滚后生成配置失败"; return; }
-  mv -f "$CONF.new" "$CONF" || { err "回滚后写回配置失败"; return; }
-  secure_tree
-  halt_if_empty && return
-  svc restart >/dev/null 2>&1 || true
-  if ! svc_wait; then
-    err "已恢复旧配置，但内核未能启动"
-    show_fail_logs
-  fi
-}
-
-commit() {
-  echo
-  local st
-  apply
-  st=$?
-  if [ "$st" -eq 0 ]; then drop_snap; return 0; fi
-  rollback
-  [ "$st" -eq 2 ] && restore_running
-  return 1
-}
-
-snapshot() {
-  mkdir -p "$INB_DIR" "$CERT_DIR"
-  rm -rf "$BASE/.bak" "$BASE/.certbak"
-  cp -a "$INB_DIR" "$BASE/.bak"
-  cp -a "$CERT_DIR" "$BASE/.certbak"
-}
-rollback() {
-  rm -rf "$INB_DIR"; mv "$BASE/.bak" "$INB_DIR"
-  if [ -d "$BASE/.certbak" ]; then rm -rf "$CERT_DIR"; mv "$BASE/.certbak" "$CERT_DIR"; fi
-  warn "已恢复到修改前的配置"
-}
-drop_snap() { rm -rf "$BASE/.bak" "$BASE/.certbak"; }
-
-rm_cert() { rm -f "$CERT_DIR/$1.crt" "$CERT_DIR/$1.key"; }
-leaf_sha256() {
-  local hex
-  [ -f "$1" ] || return 1
-  hex=$(openssl x509 -in "$1" -outform DER 2>/dev/null | openssl dgst -sha256 2>/dev/null | awk '{print tolower($NF)}')
-  [[ $hex =~ ^[0-9a-f]{64}$ ]] || return 1
-  printf '%s' "$hex"
-}
-# 没有其他入站还在用这个域名时，删掉 certmagic 里对应的证书数据
-forget_acme() {
-  local domain=$1 f act
-  local -a a=()
-  [ -n "$domain" ] && [ -d "$ACME_DIR" ] || return 0
-  case $domain in *'*'*|*'?'*|*'['*) return 0;; esac
-  if list_inb a; then
-    act=$(jq -r --arg d "$domain" 'if any(.[]; .cert=="acme" and .domain==$d) then "keep"
-      elif any(.[]; .cert=="acme") then "drop" else "wipe" end' "${a[@]}") || return 0
-  else
-    act=wipe
-  fi
-  [ "$act" = keep ] && return 0
-  if [ "$act" = drop ]; then
-    while IFS= read -r -d '' f; do rm -rf "$f"; done \
-      < <(find "$ACME_DIR" -depth -name "$domain" -print0 2>/dev/null)
-  else
-    find "$ACME_DIR" -mindepth 1 -depth -exec rm -rf {} + 2>/dev/null || true
-  fi
-}
-
-save_inbound() {
-  ensure_dirs
-  SB_PROTO=$2 SB_NAME=$3 SB_CERT=$4 SB_DOMAIN=$5 SB_EMAIL=$6 SB_INB=$7 \
-    jq -n '{proto:env.SB_PROTO,name:env.SB_NAME,cert:env.SB_CERT,domain:env.SB_DOMAIN,email:env.SB_EMAIL,inbound:(env.SB_INB|fromjson)}' \
-    > "$INB_DIR/$1.json" || return 1
-  chmod 600 "$INB_DIR/$1.json" 2>/dev/null || true
-}
-
-TLS_MODE=""; TLS_DOMAIN=""; TLS_EMAIL=""
-
-resolve_ips() {
-  local h=$1 r=""
-  if command -v getent >/dev/null 2>&1; then
-    r=$(getent ahosts "$h" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ')
-  fi
-  if [ -z "$r" ] && command -v nslookup >/dev/null 2>&1; then
-    r=$(nslookup "$h" 2>/dev/null | awk '
-      /^Name:/ { inn=1; next }
-      inn && /^Address[0-9]*:/ {
-        ip=$2
-        if (ip ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) print ip
-        else if (ip ~ /:/ && ip !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$/) print ip
-      }
-      inn && /^Address [0-9]+:/ {
-        ip=$3; sub(/%.*/,"",ip)
-        if (ip ~ /^[0-9.]+$/ || ip ~ /:/) print ip
-      }
-    ' | sort -u | tr '\n' ' ')
-  fi
-  printf '%s' "$r"
-}
-
-check_domain() {
-  get_ip
-  local r hit=0 ip bad=0 foreign=""
-  r=$(resolve_ips "$1")
-  for ip in $r; do
-    if ip_is_ours "$ip"; then hit=1; else foreign+="${foreign:+ }$ip"; fi
+  for file in "$CERT_DIR"/*.crt "$CERT_DIR"/*.key; do
+    [ -f "$file" ] || continue
+    if [ -L "$file" ] || ! cp -p "$file" "$TXN_DIR/certs/"; then txn_rollback; return 1; fi
   done
-  if [ -z "$r" ]; then warn "域名尚无解析，无法签发"; bad=1
-  elif [ "$hit" -eq 0 ]; then warn "解析（${r% }）与本机（$(local_ips)）不一致"; bad=1
-  elif [ -n "$foreign" ]; then warn "仍有解析未指向本机（$foreign）"; bad=1; fi
-  warn_acme_ports || bad=1
-  confirm_go "$bad"
 }
-
-warn_listen_port() {
-  local line pid exe any=0 ours=0 port=$1
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    any=1
-    pid=$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' <<<"$line")
-    exe=""
-    [ -n "$pid" ] && exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
-    if [ "$exe" = "$BIN" ] || [ "$(basename "${exe:-}")" = sing-box ]; then ours=1; fi
-  done < <(ss -H -ltnp "sport = :$port" 2>/dev/null || true)
-  if [ "$any" = 1 ] && [ "$ours" = 0 ]; then
-    warn "端口 ${port} 被占用，验证可能失败"
-    return 1
+txn_stage() {
+  local target=$1 source=${2:-} index exists=false action=write
+  [ "$(jq -r .phase "$TXN_DIR/manifest.json")" = preparing ] && txn_allowed "$target" || return 1
+  jq -e --arg target "$target" 'any(.paths[];.target==$target)' "$TXN_DIR/manifest.json" >/dev/null && return 1
+  index=$(jq '.paths|length' "$TXN_DIR/manifest.json") || return 1
+  if [ -e "$target" ]; then
+    [ -f "$target" ] && cp -p "$target" "$TXN_DIR/backups/$index" || return 1
+    exists=true
   fi
+  if [ -n "$source" ]; then
+    cp "$source" "$TXN_DIR/stage/$index" && chmod 600 "$TXN_DIR/stage/$index" || return 1
+  else action=delete; fi
+  txn_record --arg target "$target" --arg action "$action" --argjson exists "$exists" \
+    '.paths += [{target:$target,existed:$exists,action:$action}]'
+}
+txn_stage_tree() {
+  local live=$1 staged=$2 file leaf
+  for file in "$staged"/*; do
+    [ -f "$file" ] || continue
+    leaf=${file##*/}; txn_stage "$live/$leaf" "$file" || return 1
+  done
+  for file in "$live"/*; do
+    [ -f "$file" ] || continue
+    leaf=${file##*/}
+    case $leaf in *.json|*.crt|*.key) [ -f "$staged/$leaf" ] || txn_stage "$file" || return 1;; esac
+  done
+}
+txn_manifest_valid() {
+  local target index count phase
+  jq -e '
+    .version==1 and (.phase|IN("preparing","publishing","rolling_back","committed"))
+    and (.active|type=="boolean") and (.enabled|type=="boolean") and (.service_touched|type=="boolean")
+    and (.paths|type=="array") and all(.paths[];
+      (.target|type=="string") and (.existed|type=="boolean") and (.action|IN("write","delete")))
+    and ([.paths[].target]|length==(unique|length))
+  ' "$TXN_DIR/manifest.json" >/dev/null || return 1
+  count=$(jq '.paths|length' "$TXN_DIR/manifest.json") || return 1
+  phase=$(jq -r .phase "$TXN_DIR/manifest.json") || return 1
+  for ((index=0; index<count; index++)); do
+    target=$(jq -r ".paths[$index].target" "$TXN_DIR/manifest.json") || return 1
+    txn_allowed "$target" || return 1
+    if { [ "$phase" = publishing ] || [ "$phase" = rolling_back ]; } && jq -e ".paths[$index].existed" "$TXN_DIR/manifest.json" >/dev/null; then
+      [ -f "$TXN_DIR/backups/$index" ] && [ ! -L "$TXN_DIR/backups/$index" ] || return 1
+    fi
+  done
+}
+txn_copy() {
+  local source=$1 target=$2 index=$3 restore=${4:-false} adjacent
+  adjacent=$target.sb-${TXN_DIR##*/}-$index
+  [ ! -L "$adjacent" ] || return 1
+  mkdir -p "${target%/*}" || return 1
+  rm -f -- "$adjacent" || return 1
+  cp -p "$source" "$adjacent" || return 1
+  if [ "$restore" != true ]; then platform_file_mode "$adjacent" "$target" || return 1; fi
+  mv -f -- "$adjacent" "$target"
+}
+txn_publish() {
+  local goal=$1 count index target action reload=0 binary=0
+  txn_manifest_valid && txn_phase publishing || return 1
+  if [ "$goal" != none ]; then
+    txn_record '.service_touched=true' || return 1
+    # activating/auto-restart 也必须 stop，取消尚未触发的重启任务。
+    if [ -f "$UNIT" ] || service_do active; then service_do stop && service_wait stopped || return 1; fi
+  fi
+  count=$(jq '.paths|length' "$TXN_DIR/manifest.json") || return 1
+  for ((index=0; index<count; index++)); do
+    target=$(jq -r ".paths[$index].target" "$TXN_DIR/manifest.json") || return 1
+    action=$(jq -r ".paths[$index].action" "$TXN_DIR/manifest.json") || return 1
+    if [ "$action" = write ]; then txn_copy "$TXN_DIR/stage/$index" "$target" "$index" || return 1
+    else rm -f -- "$target" || return 1; fi
+    [ "$target" != "$UNIT" ] || reload=1
+    [ "$target" != "$BIN" ] || binary=1
+  done
+  [ "$binary" = 0 ] || { CORE_VER=''; platform_bind || return 1; }
+  [ "$reload" = 0 ] || service_do reload || return 1
+  if [ "$goal" != none ]; then
+    service_check "$BIN" "$CONF" || return 1
+    case $goal in
+      install) service_do enable || return 1;;
+      apply)
+        if [ "$(store_count "$INB_DIR")" -gt 0 ]; then service_do start && service_wait active || return 1
+        else service_wait stopped || return 1; fi;;
+      preserve)
+        if jq -e .active "$TXN_DIR/manifest.json" >/dev/null; then service_do start && service_wait active || return 1; fi;;
+      *) return 1;;
+    esac
+  fi
+  txn_commit
+}
+txn_commit() {
+  local completed=$TXN_DIR
+  txn_phase committed || return 1
+  TXN_DIR=''
+  rm -rf -- "$completed" || ui_warn "操作已提交，备份清理失败：$completed"
   return 0
 }
-warn_acme_ports() {
-  local bad=0
-  warn_listen_port 80 || bad=1
-  warn_listen_port 443 || bad=1
-  [ "$bad" -eq 0 ]
+txn_rollback() {
+  [ -n "$TXN_DIR" ] || return 0
+  local phase index count target touched reload=0 binary=0
+  if ! txn_manifest_valid; then
+    ui_err "事务记录或备份不完整，保留现场：$TXN_DIR"; RUNTIME_BLOCKED=1; return 1
+  fi
+  phase=$(jq -r .phase "$TXN_DIR/manifest.json") || return 1
+  if [ "$phase" = committed ] || [ "$phase" = preparing ]; then
+    rm -rf -- "$TXN_DIR" || { RUNTIME_BLOCKED=1; return 1; }
+    TXN_DIR=''; return 0
+  fi
+  txn_phase rolling_back || { RUNTIME_BLOCKED=1; return 1; }
+  touched=$(jq -r .service_touched "$TXN_DIR/manifest.json") || return 1
+  if [ "$touched" = true ]; then
+    if [ -f "$UNIT" ] || service_do active; then
+      if ! service_do stop || ! service_wait stopped; then
+        ui_err "回滚时无法停止服务，保留备份：$TXN_DIR"; RUNTIME_BLOCKED=1; return 1
+      fi
+    fi
+    if ! jq -e .enabled "$TXN_DIR/manifest.json" >/dev/null && service_do enabled; then
+      service_do disable || { RUNTIME_BLOCKED=1; return 1; }
+    fi
+  fi
+  count=$(jq '.paths|length' "$TXN_DIR/manifest.json") || return 1
+  for ((index=count-1; index>=0; index--)); do
+    target=$(jq -r ".paths[$index].target" "$TXN_DIR/manifest.json") || return 1
+    if jq -e ".paths[$index].existed" "$TXN_DIR/manifest.json" >/dev/null; then
+      if ! txn_copy "$TXN_DIR/backups/$index" "$target" "$index" true; then
+        ui_err "文件恢复失败：$target；备份：$TXN_DIR"; RUNTIME_BLOCKED=1; return 1
+      fi
+    elif ! rm -f -- "$target"; then RUNTIME_BLOCKED=1; return 1; fi
+    rm -f -- "$target.sb-${TXN_DIR##*/}-$index" || true
+    [ "$target" != "$UNIT" ] || reload=1
+    [ "$target" != "$BIN" ] || binary=1
+  done
+  [ "$binary" = 0 ] || { CORE_VER=''; platform_bind || { RUNTIME_BLOCKED=1; return 1; }; }
+  [ "$reload" = 0 ] || service_do reload || { RUNTIME_BLOCKED=1; return 1; }
+  if [ "$touched" = true ]; then
+    if jq -e .enabled "$TXN_DIR/manifest.json" >/dev/null; then service_do enable || { RUNTIME_BLOCKED=1; return 1; }; fi
+    if jq -e .active "$TXN_DIR/manifest.json" >/dev/null; then
+      service_do start && service_wait active || { service_failure; ui_err "旧文件已恢复，服务未恢复；备份：$TXN_DIR"; RUNTIME_BLOCKED=1; return 1; }
+    fi
+  fi
+  # 标记后再清理，清理中断不会在下一次运行重复服务恢复。
+  txn_commit || { RUNTIME_BLOCKED=1; return 1; }
+  ui_warn '已恢复原文件和操作前的服务状态'
 }
-
-valid_domain() { [[ $1 =~ ^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; }
-
-valid_ip() {
-  local ip=$1 o o1 o2 o3 o4
-  if [[ $ip == *:* ]]; then norm_ip "$ip" >/dev/null; return; fi
-  [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-  IFS=. read -r o1 o2 o3 o4 <<<"$ip"
-  for o in "$o1" "$o2" "$o3" "$o4"; do
-    [ "$((10#$o))" -le 255 ] 2>/dev/null || return 1
-    [ "$o" = "$((10#$o))" ] || return 1
+txn_recover() {
+  local directory
+  [ -d "$TXN_ROOT" ] || return 0
+  for directory in "$TXN_ROOT"/txn.*; do
+    [ -d "$directory" ] || continue
+    [ ! -L "$directory" ] || { ui_err "事务目录不能是符号链接：$directory"; RUNTIME_BLOCKED=1; return 1; }
+    TXN_DIR=$directory
+    # manifest 在任何发布前创建；没有它的目录只可能是未完成的准备。
+    if [ ! -e "$TXN_DIR/manifest.json" ]; then
+      rm -rf -- "$TXN_DIR" || return 1; TXN_DIR=''; continue
+    fi
+    ui_warn "检测到遗留事务：$TXN_DIR"
+    txn_rollback || return 1
   done
 }
 
-acme_tag() { printf 'acme-%s' "$(printf '%s' "$1" | tr ':/' '--')"; }
-
-confirm_go() { # 1=有风险，须原样再输入要签的名字
-  local typed
-  if [ "$1" != 1 ]; then confirm "继续申请？" y; return; fi
-  warn "继续申请可能失败"
-  ask typed "继续请原样输入 ${TLS_DOMAIN}" ""
-  [ "$typed" = "$TLS_DOMAIN" ] || { warn "输入不一致，已取消"; return 1; }
+# 6. 证书和交互式编辑。生成只作用于事务中的证书目录。
+tls_has_acme() {
+  local -a entries
+  store_list entries "${1:-$INB_DIR}" || return 1
+  jq -se 'any(.[];.cert=="acme")' "${entries[@]}" >/dev/null
 }
-
-ask_tls() {
-  echo "  1  自签名"
-  echo "  2  域名证书"
-  echo
-  local n; sel n 2 || return 1
-  echo
-  TLS_EMAIL=""
-  if [ "$n" = 2 ]; then
-    TLS_MODE=acme
-    require_acme_ports || return 1
+tls_require_ports() {
+  local port=$1 file other
+  local -a entries=()
+  [ "$port" != 80 ] || { ui_err 'ACME 需要空闲的 80 端口'; return 1; }
+  store_list entries || true
+  for file in "${entries[@]}"; do
+    other=$(jq -r .inbound.listen_port "$file") || return 1
+    if [ "$other" = 80 ] || { [ "$other" = 443 ] && [ "$port" != 443 ]; }; then
+      ui_err 'ACME 需要空闲的 80；443 只能由本入站占用'; return 1
+    fi
+  done
+}
+tls_warn_port() {
+  local port=$1 sockets socket pid executable foreign=0
+  sockets=$(ss -H -ltnp "sport = :$port" 2>/dev/null) || { ui_err '无法检测 ACME 端口'; return 1; }
+  while IFS= read -r socket; do
+    [ -n "$socket" ] || continue
+    executable=''
+    if [[ $socket =~ pid=([0-9]+) ]]; then
+      pid=${BASH_REMATCH[1]}; executable=$(readlink -f "/proc/$pid/exe" 2>/dev/null) || true
+    fi
+    [ "$executable" = "$BIN" ] || foreign=1
+  done <<<"$sockets"
+  [ "$foreign" = 0 ] || { ui_warn "端口 $port 被其他进程占用，验证可能失败"; return 1; }
+}
+ui_check_domain() {
+  local domain=$1 result ip hit=0 bad=0 foreign='' typed
+  net_get_ip || return $?
+  result=$(net_resolve "$domain") || return 1
+  while IFS= read -r ip; do
+    [ -n "$ip" ] || continue
+    if net_ours "$ip"; then hit=1; else foreign+="${foreign:+ }$ip"; fi
+  done <<<"$result"
+  if [ -z "$result" ]; then ui_warn '域名尚无解析，无法签发'; bad=1
+  elif [ "$hit" = 0 ]; then ui_warn "域名解析未指向本机（${SERVER_IP4:-} ${SERVER_IP6:-}）"; bad=1
+  elif [ -n "$foreign" ]; then ui_warn "仍有解析未指向本机：$foreign"; bad=1; fi
+  tls_warn_port 80 || bad=1; tls_warn_port 443 || bad=1
+  if [ "$bad" = 0 ]; then ui_confirm '继续申请？' y; return; fi
+  ui_warn '继续申请可能失败'
+  ui_ask typed "继续请原样输入 $domain" '' || return 2
+  [ "$typed" = "$domain" ] || { ui_warn '输入不一致，已取消'; return 2; }
+}
+ui_tls() {
+  local _tls_choice _tls_mode=self _tls_domain _tls_email=''
+  printf '  1  自签名\n  2  域名证书\n\n'
+  ui_select _tls_choice 2 || return 2
+  if [ "$_tls_choice" = 2 ]; then
+    _tls_mode=acme
+    tls_require_ports "$2" || return 1
     while true; do
-      ask TLS_DOMAIN "域名" ""
-      valid_domain "$TLS_DOMAIN" && break
-      soft "域名格式不正确"
+      ui_ask _tls_domain 域名 '' || return 2
+      valid_domain "$_tls_domain" && break
+      ui_soft '域名格式不正确'
     done
-    check_domain "$TLS_DOMAIN" || return 1
-  else
-    TLS_MODE=self
+    ui_check_domain "$_tls_domain" || return $?
     while true; do
-      ask TLS_DOMAIN "SNI" ""
-      TLS_DOMAIN=$(bare_ip "$TLS_DOMAIN")
-      { valid_domain "$TLS_DOMAIN" || valid_ip "$TLS_DOMAIN"; } && break
-      soft "SNI 须为域名或 IP"
+      ui_ask _tls_email '邮箱（可选，到期通知）' '' || return 2
+      [[ -z $_tls_email || $_tls_email =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] && break
+      ui_soft '邮箱格式不正确'
     done
-    return 0
+  else
+    while true; do
+      ui_ask _tls_domain SNI '' || return 2
+      _tls_domain=$(net_bare_ip "$_tls_domain")
+      { valid_domain "$_tls_domain" || valid_ip "$_tls_domain"; } && break
+      ui_soft 'SNI 须为域名或 IP'
+    done
   fi
+  local _tls_result
+  _tls_result=$(jq -nc --arg m "$_tls_mode" --arg d "$_tls_domain" --arg e "$_tls_email" '{mode:$m,domain:$d,email:$e}') || return 1
+  printf -v "$1" '%s' "$_tls_result"
+}
+tls_generate() {
+  local directory=$1 tag=$2 name=$3 work san
+  if valid_ip "$name"; then san=IP:$name
+  elif valid_domain "$name"; then san=DNS:$name
+  else return 1; fi
+  work=$(mktemp -d "$directory/.cert.XXXXXX") || return 1
+  if ! openssl req -new -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 \
+    -subj "/CN=$name" -addext "subjectAltName=$san" -addext 'basicConstraints=CA:FALSE' \
+    -keyout "$work/key" -out "$work/crt" 2>"$work/error"; then
+    ui_err '自签名证书生成失败'; rm -rf "$work"; return 1
+  fi
+  if ! chmod 600 "$work/key" "$work/crt" || ! mv -f "$work/key" "$directory/$tag.key" || ! mv -f "$work/crt" "$directory/$tag.crt"; then
+    rm -rf "$work"; return 1
+  fi
+  rm -rf "$work"
+}
+tls_build() {
+  local tag=$1 proto=$2 mode=$3 domain=$4 directory=$5
+  if [ "$mode" != acme ]; then tls_generate "$directory" "$tag" "$domain" || return 1; fi
+  jq -nc --arg d "$domain" --arg m "$mode" --arg c "$CERT_DIR/$tag" --argjson a "$(proto_alpn "$proto")" '
+    {enabled:true,server_name:$d} + (if ($a|length)>0 then {alpn:$a} else {} end)
+    + (if $m=="acme" then {certificate_provider:("acme-"+($d|gsub("[:/]";"-")))}
+       else {certificate_path:($c+".crt"),key_path:($c+".key")} end)'
+}
+tls_fingerprint() {
+  local hex
+  [ -f "$1" ] || return 1
+  hex=$(openssl x509 -in "$1" -outform DER 2>/dev/null | openssl dgst -sha256 2>/dev/null | awk '{print tolower($NF)}') || return 1
+  [[ $hex =~ ^[0-9a-f]{64}$ ]] && printf '%s' "$hex"
+}
+tls_forget() {
+  local domain=$1 file status=0
+  local -a entries=()
+  [ -n "$domain" ] && [ -d "$ACME_DIR/certificates" ] || return 0
+  store_validate "$INB_DIR" || return 1
+  store_list entries || true
+  if [ "${#entries[@]}" -gt 0 ] && jq -se --arg d "$domain" 'any(.[];.cert=="acme" and .domain==$d)' "${entries[@]}" >/dev/null; then return 0; fi
+  # certmagic 的 certificates 子树只含证书；保留 ACME 账户、锁及其他域名。
+  while IFS= read -r -d '' file; do rm -rf -- "$file" || status=1; done \
+    < <(find "$ACME_DIR/certificates" -type d -name "$domain" -prune -print0)
+  [ "$status" = 0 ] || ui_warn "证书缓存清理失败，数据已保留：$domain"
+  return "$status"
+}
+ui_ss_method() {
+  local _method_choice i
+  local -a methods=(2022-blake3-aes-128-gcm 2022-blake3-aes-256-gcm 2022-blake3-chacha20-poly1305 aes-128-gcm aes-256-gcm chacha20-ietf-poly1305)
+  for i in "${!methods[@]}"; do printf '  %d  %s\n' "$((i+1))" "${methods[$i]}"; done
+  printf '\n'; ui_select _method_choice "${#methods[@]}" '使用 2022-blake3-aes-128-gcm' 1 || return 2
+  printf -v "$1" '%s' "${methods[$((_method_choice-1))]}"
+}
+ui_snell_options() {
+  local _snell_choice _version=${3:-6} _obfs=${4:-none} _version_default _obfs_default
+  local _selected_version _selected_obfs=none
+  printf '  1  Snell v5\n  2  Snell v6\n\n'
+  [ "$_version" = 5 ] && _version_default=1 || _version_default=2
+  ui_select _snell_choice 2 "使用 Snell v$_version" "$_version_default" || return 2
+  [ "$_snell_choice" = 1 ] && _selected_version=5 || _selected_version=6
+  if [ "$_selected_version" = 5 ]; then
+    printf '  1  不启用 HTTP 混淆\n  2  HTTP 混淆\n\n'
+    [ "$_obfs" = http ] && _obfs_default=2 || _obfs_default=1
+    if ui_select _snell_choice 2 '使用当前混淆设置' "$_obfs_default"; then
+      [ "$_snell_choice" != 2 ] || _selected_obfs=http
+    else return 2; fi
+  fi
+  printf -v "$1" '%s' "$_selected_version"
+  printf -v "$2" '%s' "$_selected_obfs"
+}
+ui_positive() {
+  local _positive
   while true; do
-    ask TLS_EMAIL "邮箱（可选，到期通知）" ""
-    [ -z "$TLS_EMAIL" ] && break
-    [[ $TLS_EMAIL =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] && break
-    soft "邮箱格式不正确"
+    ui_ask _positive "$2" "$3" || return 2
+    if valid_positive "$_positive"; then printf -v "$1" '%s' "$_positive"; return 0; fi
+    ui_soft '须为正整数（最多 9 位）'
   done
 }
-
-gen_cert() { # 先写临时文件，成功才替换
-  local cn=$2 san cfg st key crt
-  valid_domain "$cn" || valid_ip "$cn" || return 1
-  ensure_dirs
-  if valid_ip "$cn"; then san="IP:$cn"; else san="DNS:$cn"; fi
-  cfg=$(mktemp); key=$(mktemp); crt=$(mktemp)
-  cat > "$cfg" <<EOF
-[req]
-distinguished_name=dn
-x509_extensions=v3
-prompt=no
-[dn]
-CN=$cn
-[v3]
-subjectAltName=$san
-basicConstraints=CA:FALSE
-EOF
-  openssl ecparam -genkey -name prime256v1 -out "$key" 2>/dev/null \
-  && openssl req -new -x509 -days 3650 -key "$key" -out "$crt" \
-       -config "$cfg" 2>/dev/null
-  st=$?
-  if [ "$st" -eq 0 ]; then
-    mv -f "$key" "$CERT_DIR/$1.key" && mv -f "$crt" "$CERT_DIR/$1.crt" \
-      && chmod 600 "$CERT_DIR/$1.key" "$CERT_DIR/$1.crt"
-    st=$?
-  fi
-  rm -f "$cfg" "$key" "$crt"
-  return $st
-}
-
-proto_alpn() {
-  # Vision 不能协商 h2
-  case $1 in vless) echo '["http/1.1"]';; hysteria2|tuic) echo '["h3"]';; *) echo '[]';; esac
-}
-
-make_tls() {
-  local extra
-  if is_acme "$TLS_MODE"; then
-    extra=$(jq -n --arg t "$(acme_tag "$TLS_DOMAIN")" '{certificate_provider:$t}')
-  else
-    gen_cert "$1" "$TLS_DOMAIN" || { rm_cert "$1"; err "自签名证书生成失败"; return 1; }
-    extra=$(jq -n --arg c "$CERT_DIR/$1.crt" --arg k "$CERT_DIR/$1.key" '{certificate_path:$c, key_path:$k}')
-  fi
-  jq -n --arg d "$TLS_DOMAIN" --argjson a "$2" --argjson e "$extra" \
-    '{enabled:true, server_name:$d} + (if ($a|length)>0 then {alpn:$a} else {} end) + $e'
-}
-
-SS_METHOD=""
-pick_ss_method() {
-  local m=(2022-blake3-aes-128-gcm 2022-blake3-aes-256-gcm 2022-blake3-chacha20-poly1305
-           aes-128-gcm aes-256-gcm chacha20-ietf-poly1305)
-  local n i
-  for i in "${!m[@]}"; do printf "  %d  %s\n" "$((i+1))" "${m[$i]}"; done
-  echo
-  sel n ${#m[@]} || return 1
-  echo
-  SS_METHOD=${m[$((n-1))]}
-}
-ss_keylen() {
-  case $1 in
-    2022-blake3-aes-128-gcm) echo 16;;
-    2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) echo 32;;
-    *) echo 0;;
-  esac
-}
-ss_password() {
-  local n; n=$(ss_keylen "$1")
-  if [ "$n" -gt 0 ]; then openssl rand -base64 "$n" | tr -d '\n'; else rand_str 20; fi
-}
-ss_key_ok() {
-  local need got
-  need=$(ss_keylen "$1")
-  if [ "$need" -eq 0 ]; then [ -n "$2" ]; return; fi
-  got=$(printf '%s' "$2" | base64 -d 2>/dev/null | wc -c) || return 1
-  [ "$got" -eq "$need" ]
-}
-
-SEL_FILE=""
-pick_inbound() {
-  local -a files names
-  local i n body="" raw
-  list_inb files || { warn "还没有入站"; return 1; }
-  raw=$(jq -r .name "${files[@]}") || { warn "无法读取入站"; return 1; }
-  mapfile -t names <<< "$raw"
-  for i in "${!files[@]}"; do body+="  $((i+1))  ${names[$i]}"$'\n'; done
-  printf '%s\n' "$body"
-  sel n ${#files[@]} || return 1
-  SEL_FILE=${files[$((n-1))]}
-}
-
-add_inbound() {
-  need_core || return
-  local protos=(socks shadowsocks vless hysteria2 anytls tuic snell) n i body=""
-  for i in "${!protos[@]}"; do body+="  $((i+1))  $(pname "${protos[$i]}")"$'\n'; done
+ui_edit_value() {
+  local file=$1 title=$2 path=$3 validator=$4 message=$5 current value blank=0; shift 5
+  current=$(jq -r "$path" "$file") || return 1
   while true; do
-    page "添加入站"
-    printf '%s\n' "$body"
-    sel n ${#protos[@]} || return
-    add_one "${protos[$((n-1))]}"
-    settle
-  done
-}
-
-add_one() {
-  local proto=$1
-  local port name tag cert=none domain="" email="" inb tls listen
-  echo
-  tag="$proto-$(rand_hex)"
-  ask_port port
-  ask name "备注名称" "$(pname $proto)-$port"
-  echo
-  listen=$(listen_host)
-
-  case $proto in
-    socks)
-      inb=$(SB_USER=$(rand_str 8) SB_PASS=$(rand_str 16) jq -n --arg t "$tag" --argjson port "$port" --arg listen "$listen" \
-        '{type:"socks",tag:$t,listen:$listen,listen_port:$port,users:[{username:env.SB_USER,password:env.SB_PASS}]}');;
-    shadowsocks)
-      pick_ss_method || return
-      inb=$(SB_PASS=$(ss_password "$SS_METHOD") jq -n --arg t "$tag" --argjson port "$port" --arg m "$SS_METHOD" --arg listen "$listen" \
-        '{type:"shadowsocks",tag:$t,listen:$listen,listen_port:$port,method:$m,password:env.SB_PASS}');;
-    snell)
-      inb=$(SB_PASS=$(rand_str 24) jq -n --arg t "$tag" --argjson port "$port" --arg listen "$listen" \
-        '{type:"snell",tag:$t,listen:$listen,listen_port:$port,version:6,psk:env.SB_PASS}');;
-    vless|hysteria2|anytls|tuic)
-      TLS_PORT=$port
-      ask_tls || return
-      tls=$(make_tls "$tag" "$(proto_alpn $proto)") || { rm_cert "$tag"; return; }
-      cert=$TLS_MODE; domain=$TLS_DOMAIN; email=$TLS_EMAIL
-      local id="" pw=""
-      case $proto in vless|tuic) id=$(gen_uuid);; esac
-      [ "$proto" != vless ] && pw=$(rand_str 20)
-      inb=$(SB_ID="$id" SB_PASS="$pw" jq -n --arg ty "$proto" --arg t "$tag" --argjson port "$port" --arg listen "$listen" --argjson tls "$tls" '
-        {type:$ty,tag:$t,listen:$listen,listen_port:$port,tls:$tls}
-        + (if $ty=="vless" then {users:[{name:"user",uuid:env.SB_ID,flow:"xtls-rprx-vision"}]}
-           elif $ty=="tuic" then {users:[{name:"user",uuid:env.SB_ID,password:env.SB_PASS}], congestion_control:"cubic"}
-           else {users:[{name:"user",password:env.SB_PASS}]} end)');;
-  esac
-
-  echo
-  snapshot
-  save_inbound "$tag" "$proto" "$name" "$cert" "$domain" "$email" "$inb" \
-    || { rollback; rm_cert "$tag"; err "保存入站失败"; return; }
-  if commit; then
-    ok "入站已添加"
-    show_share "$INB_DIR/$tag.json"
-  else
-    rm_cert "$tag"
-  fi
-}
-
-add_cred_fields() {
-  case $1 in
-    socks) keys+=(user pass); labels+=(用户名 密码);;
-    shadowsocks) keys+=(method pass); labels+=(加密 密码);;
-    vless) keys+=(uuid); labels+=(UUID);;
-    hysteria2|anytls) keys+=(pass); labels+=(密码);;
-    tuic) keys+=(uuid pass); labels+=(UUID 密码);;
-    snell) keys+=(psk); labels+=(PSK);;
-  esac
-}
-
-pick_key() {
-  local i n
-  [ ${#keys[@]} -gt 0 ] || return 1
-  if [ ${#keys[@]} -eq 1 ]; then key=${keys[0]}; return 0; fi
-  echo
-  for i in "${!keys[@]}"; do echo "  $((i+1))  ${labels[$i]}"; done
-  echo
-  sel n ${#keys[@]} || return 1
-  key=${keys[$((n-1))]}
-}
-
-nonempty() { [ -n "$1" ]; }
-uuid_ok() { [[ $1 =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; }
-psk_ok() { [ ${#1} -ge 12 ] && [ ${#1} -le 255 ]; }
-ss_pass_ok() { ss_key_ok "$method" "$1"; }
-
-edit_value() { # 未改动返回 2。空输入按校验失败处理，不把原值填回去
-  local cur v blank=0
-  cur=$(jq -r "$3" "$1")
-  while true; do
-    read -rp "  $2 [$cur]: " v || return 2
-    if [ -z "$v" ]; then
-      soft "$6"
-      [ "$blank" = 1 ] && return 2
-      blank=1
-      continue
+    ui_read value "  $title [$current]: " || return 2
+    if [ -z "$value" ]; then
+      ui_soft "$message"
+      [ "$blank" = 0 ] || return 2
+      blank=1; continue
     fi
     blank=0
-    "$5" "$v" && break
-    soft "$6"
+    "$validator" "$@" "$value" && break
+    ui_soft "$message"
   done
-  [ "$v" = "$cur" ] && return 2
-  SB_SECRET=$v jq_edit "$1" "$4" || return 1
+  [ "$value" != "$current" ] || return 2
+  SB_SECRET=$value store_edit "$file" "$path=env.SB_SECRET"
 }
-
-edit_pass() {
-  local method
-  if [ "$(jq -r .proto "$1")" = shadowsocks ]; then
-    method=$(jq -r .inbound.method "$1")
-    edit_value "$1" "密码" '.inbound.password' '.inbound.password=env.SB_SECRET' ss_pass_ok "密码格式不正确"
+proto_edit_tls() {
+  local file=$1 field=$2 directory=$3 tag proto mode domain email old_mode old_domain old_email chosen tls_json
+  tag=$(jq -r .inbound.tag "$file"); proto=$(jq -r .proto "$file")
+  old_mode=$(jq -r .cert "$file"); old_domain=$(jq -r .domain "$file"); old_email=$(jq -r '.email//""' "$file")
+  if [ "$field" = tls ]; then
+    ui_tls chosen "$(jq -r .inbound.listen_port "$file")" || return $?
+    mode=$(jq -r .mode <<<"$chosen"); domain=$(jq -r .domain <<<"$chosen"); email=$(jq -r .email <<<"$chosen")
   else
-    edit_value "$1" "密码" '.inbound.users[0].password' '.inbound.users[0].password=env.SB_SECRET' nonempty "密码不能为空"
+    mode=$old_mode email=$old_email
+    ui_ask domain SNI "$old_domain" || return 2
+    domain=$(net_bare_ip "$domain")
+    [ "$domain" != "$old_domain" ] || return 2
+    if [ "$mode" = acme ]; then
+      valid_domain "$domain" || { ui_err '域名格式不正确'; return 1; }
+      ui_check_domain "$domain" || return $?
+    else valid_domain "$domain" || valid_ip "$domain" || { ui_err 'SNI 须为域名或 IP'; return 1; }; fi
   fi
+  if [ "$mode" = "$old_mode" ] && [ "$domain" = "$old_domain" ] && { [ "$mode" = self ] || [ "$email" = "$old_email" ]; }; then return 2; fi
+  tls_json=$(tls_build "$tag" "$proto" "$mode" "$domain" "$directory") || return 1
+  store_edit "$file" --argjson tls "$tls_json" --arg m "$mode" --arg d "$domain" --arg e "$email" \
+    '.inbound.tls=$tls|.cert=$m|.domain=$d|.email=$e' || return 1
+  if [ "$mode" = acme ]; then rm -f "$directory/$tag.crt" "$directory/$tag.key" || return 1; fi
 }
-
-edit_method() {
-  local cur
-  cur=$(jq -r .inbound.method "$1")
-  pick_ss_method || return 2
-  [ "$SS_METHOD" = "$cur" ] && return 2
-  SB_METHOD=$SS_METHOD SB_SECRET=$(ss_password "$SS_METHOD") \
-    jq_edit "$1" '.inbound.method=env.SB_METHOD | .inbound.password=env.SB_SECRET' || return 1
-}
-
-edit_field() {
-  case $1 in
-    user) edit_value "$2" "用户名" '.inbound.users[0].username' '.inbound.users[0].username=env.SB_SECRET' nonempty "用户名不能为空";;
-    pass) edit_pass "$2";;
-    uuid) edit_value "$2" "UUID" '.inbound.users[0].uuid' '.inbound.users[0].uuid=env.SB_SECRET' uuid_ok "UUID 格式不正确";;
-    psk) edit_value "$2" "PSK（12-255 位）" '.inbound.psk' '.inbound.psk=env.SB_SECRET' psk_ok "PSK 长度须为 12-255";;
-    method) edit_method "$2";;
-    sni) edit_sni "$2";;
-    flow) edit_flow "$2";;
-    cc) edit_cc "$2";;
-    hcc) edit_hcc "$2";;
-    tls) edit_tls "$2";;
+proto_edit() {
+  local file=$1 field=$2 directory=$3 current value choice method port proto up down up0 down0 version obfs
+  case $field in
+    port)
+      current=$(jq -r .inbound.listen_port "$file"); ui_port port "$current" || return $?
+      [ "$port" != "$current" ] || return 2
+      store_edit "$file" --argjson p "$port" '.inbound.listen_port=$p';;
+    name)
+      current=$(jq -r .name "$file"); ui_ask value 新备注 "$current" || return 2
+      [ "$value" != "$current" ] || return 2
+      store_edit "$file" --arg name "$value" '.name=$name';;
+    user) ui_edit_value "$file" 用户名 '.inbound.users[0].username' valid_nonempty 用户名不能为空;;
+    uuid) ui_edit_value "$file" UUID '.inbound.users[0].uuid' valid_uuid 'UUID 格式不正确';;
+    version)
+      current=$(jq -r .inbound.version "$file"); up0=$(jq -r '.inbound.obfs_mode//"none"' "$file")
+      ui_snell_options version obfs "$current" "$up0" || return 2
+      [ "$version:$obfs" != "$current:$up0" ] || return 2
+      if [ "$version" = 5 ]; then
+        store_edit "$file" --argjson version "$version" --arg obfs "$obfs" '.inbound.version=$version|.inbound.obfs_mode=$obfs'
+      else store_edit "$file" --argjson version "$version" 'del(.inbound.obfs_mode)|.inbound.version=$version'; fi;;
+    psk) ui_edit_value "$file" 'PSK（12-255 位）' '.inbound.psk' valid_psk 'PSK 长度须为 12-255';;
+    pass)
+      proto=$(jq -r .proto "$file")
+      if [ "$proto" = shadowsocks ]; then
+        method=$(jq -r .inbound.method "$file")
+        ui_edit_value "$file" 密码 '.inbound.password' proto_ss_valid 密码格式不正确 "$method"
+      else ui_edit_value "$file" 密码 '.inbound.users[0].password' valid_nonempty 密码不能为空; fi;;
+    method)
+      current=$(jq -r .inbound.method "$file"); ui_ss_method method || return 2
+      [ "$method" != "$current" ] || return 2
+      value=$(proto_ss_password "$method") || return 1
+      SB_SECRET=$value store_edit "$file" --arg m "$method" '.inbound.method=$m|.inbound.password=env.SB_SECRET';;
+    tls|sni) proto_edit_tls "$file" "$field" "$directory";;
+    flow)
+      current=$(jq -r '.inbound.users[0].flow//""' "$file")
+      printf '  1  xtls-rprx-vision\n  2  无\n\n'; ui_select choice 2 || return 2
+      value=''; [ "$choice" != 1 ] || value=xtls-rprx-vision
+      [ "$value" != "$current" ] || return 2
+      store_edit "$file" --arg value "$value" 'if $value=="" then del(.inbound.users[0].flow) else .inbound.users[0].flow=$value end';;
+    cc)
+      current=$(jq -r '.inbound.congestion_control//"cubic"' "$file")
+      printf '  1  cubic\n  2  new_reno\n  3  bbr\n\n'; ui_select choice 3 || return 2
+      case $choice in 1) value=cubic;; 2) value=new_reno;; 3) value=bbr;; esac
+      [ "$value" != "$current" ] || return 2
+      store_edit "$file" --arg value "$value" '.inbound.congestion_control=$value';;
+    hcc)
+      current=$(jq -r 'if .inbound.ignore_client_bandwidth==true then "1" elif (.inbound.up_mbps and .inbound.down_mbps) then "2" else "3" end' "$file")
+      printf '  1  BBR\n  2  Brutal\n  3  不限制\n\n'; ui_select choice 3 || return 2
+      if [ "$choice" = 2 ]; then
+        up0=$(jq -r '.inbound.up_mbps//100' "$file"); down0=$(jq -r '.inbound.down_mbps//100' "$file")
+        printf '  服务器带宽：上行=客户端下载，下行=客户端上传\n'
+        ui_positive up '服务端上行 Mbps' "$up0" && ui_positive down '服务端下行 Mbps' "$down0" || return 2
+        [ "$current:$up0:$down0" != "2:$up:$down" ] || return 2
+        store_edit "$file" --argjson up "$up" --argjson down "$down" \
+          'del(.inbound.ignore_client_bandwidth)|.inbound.up_mbps=$up|.inbound.down_mbps=$down'
+      else
+        [ "$current" != "$choice" ] || return 2
+        store_edit "$file" --arg choice "$choice" 'del(.inbound.up_mbps,.inbound.down_mbps,.inbound.ignore_client_bandwidth)
+          | if $choice=="1" then .inbound.ignore_client_bandwidth=true else . end'
+      fi;;
     *) return 1;;
   esac
 }
 
-edit_tls() {
-  local f=$1 tag proto tls old_mode old_domain old_email
-  tag=$(jq -r .inbound.tag "$f"); proto=$(jq -r .proto "$f")
-  old_mode=$(jq -r .cert "$f"); old_domain=$(jq -r .domain "$f"); old_email=$(jq -r '.email // ""' "$f")
-  TLS_PORT=$(jq -r '.inbound.listen_port' "$f")
-  ask_tls || return 2
-  if [ "$TLS_MODE" = "$old_mode" ] && [ "$TLS_DOMAIN" = "$old_domain" ] \
-     && { [ "$TLS_MODE" = self ] || [ "$TLS_EMAIL" = "$old_email" ]; }; then
-    return 2
+# 7. 业务：只编辑事务副本，正式路径的写入由 txn_publish 负责。
+app_guard() {
+  if [ "$RUNTIME_BLOCKED" != 0 ] || [ -n "$TXN_DIR" ]; then
+    ui_err "恢复尚未完成，请处理保留的事务：$TXN_DIR"; return 1
   fi
-  tls=$(make_tls "$tag" "$(proto_alpn "$proto")") || return 1
-  jq_edit "$f" --argjson t "$tls" --arg c "$TLS_MODE" --arg d "$TLS_DOMAIN" --arg e "$TLS_EMAIL" \
-    '.inbound.tls=$t|.cert=$c|.domain=$d|.email=$e' || return 1
 }
-
-edit_sni() {
-  local f=$1 tag proto mode domain old tls
-  tag=$(jq -r .inbound.tag "$f"); proto=$(jq -r .proto "$f"); mode=$(jq -r .cert "$f")
-  old=$(jq -r '.inbound.tls.server_name // .domain' "$f")
-  ask domain "SNI" "$old"
-  domain=$(bare_ip "$domain")
-  [ -n "$domain" ] || { err "SNI 不能为空"; return 1; }
-  [ "$domain" = "$old" ] && return 2
-  if [ "$mode" = self ]; then
-    valid_domain "$domain" || valid_ip "$domain" || { err "SNI 须为域名或 IP"; return 1; }
-    gen_cert "$tag" "$domain" || { err "自签名证书生成失败"; return 1; }
-    jq_edit "$f" --arg d "$domain" '.domain=$d | .inbound.tls.server_name=$d' || return 1
-    return 0
+app_prepare() {
+  app_guard && platform_user && platform_dirs || { ui_err '无法准备服务用户、目录或权限'; return 1; }
+}
+app_stage_config() {
+  local candidate=$1
+  config_build "$TXN_DIR/inbounds" "$TXN_DIR/certs" "$TXN_DIR/check.json" || return 1
+  if ! service_check "$candidate" "$TXN_DIR/check.json" >"$TXN_DIR/check.log" 2>&1; then
+    ui_err '配置校验未通过：'; sed 's/^/    /' "$TXN_DIR/check.log" >&2; return 1
   fi
-  TLS_MODE=$mode; TLS_DOMAIN=$domain; TLS_EMAIL=$(jq -r '.email // ""' "$f")
-  if [ "$mode" != acme ]; then err "请改用域名证书或自签名"; return 1; fi
-  valid_domain "$domain" || { err "域名格式不正确"; return 1; }
-  check_domain "$domain" || return 1
-  tls=$(make_tls "$tag" "$(proto_alpn "$proto")") || return 1
-  jq_edit "$f" --argjson t "$tls" --arg d "$domain" '.inbound.tls=$t | .domain=$d' || return 1
+  config_build "$TXN_DIR/inbounds" "$CERT_DIR" "$TXN_DIR/config.json" || return 1
+  service_render >"$TXN_DIR/unit" || return 1
+  txn_stage_tree "$CERT_DIR" "$TXN_DIR/certs" && txn_stage_tree "$INB_DIR" "$TXN_DIR/inbounds" \
+    && txn_stage "$CONF" "$TXN_DIR/config.json" && txn_stage "$UNIT" "$TXN_DIR/unit" || return 1
+  if [ "$candidate" != "$BIN" ]; then txn_stage "$BIN" "$candidate" || return 1; fi
 }
-
-edit_flow() {
-  local f=$1 n cur new
-  cur=$(jq -r '.inbound.users[0].flow // ""' "$f")
-  echo "  1  xtls-rprx-vision"
-  echo "  2  无"
-  echo
-  sel n 2 || return 2
-  if [ "$n" = 1 ]; then new=xtls-rprx-vision; else new=""; fi
-  [ "$new" = "$cur" ] && return 2
-  if [ -n "$new" ]; then jq_edit "$f" --arg v "$new" '.inbound.users[0].flow=$v' || return 1
-  else jq_edit "$f" 'del(.inbound.users[0].flow)' || return 1; fi
+app_finish() {
+  local goal=$1 candidate=${2:-$BIN}
+  if app_stage_config "$candidate"; then
+    if txn_publish "$goal"; then return 0; fi
+    service_failure || true
+  fi
+  ui_err '操作未完成，正在恢复'
+  txn_rollback
+  return 1
 }
-
-edit_cc() {
-  local f=$1 m=(cubic new_reno bbr) n i cur
-  cur=$(jq -r '.inbound.congestion_control // "cubic"' "$f")
-  for i in "${!m[@]}"; do printf "  %d  %s\n" "$((i+1))" "${m[$i]}"; done
-  echo
-  sel n ${#m[@]} || return 2
-  [ "${m[$((n-1))]}" = "$cur" ] && return 2
-  jq_edit "$f" --arg c "${m[$((n-1))]}" '.inbound.congestion_control=$c' || return 1
+app_install() {
+  ui_page 安装内核
+  app_prepare || return 1
+  if release_installed; then
+    ui_warn '已安装内核；升级请使用「升级内核」'
+    txn_begin repair && app_finish preserve || return 1
+    ui_ok '服务配置已检查'; return 0
+  fi
+  local version candidate
+  release_pick version || return $?
+  candidate=$(mktemp "$RUNTIME_DIR/core.XXXXXX") || return 1
+  ui_info "正在下载 sing-box v$version …"
+  release_download "$version" "$candidate" || return 1
+  txn_begin install && app_finish install "$candidate" || return 1
+  rm -f "$candidate"
+  ui_ok "安装完成（v$version），添加入站后启动"
 }
-
-edit_hcc() {
-  local f=$1 n up down cur up0 down0
-  cur=$(jq -r 'if .inbound.ignore_client_bandwidth==true then "1"
-    elif (.inbound.up_mbps and .inbound.down_mbps) then "2" else "3" end' "$f")
-  echo "  1  BBR"
-  echo "  2  Brutal"
-  echo "  3  不限制"
-  echo
-  sel n 3 || return 2
-  case $n in
-    1) [ "$cur" = 1 ] && return 2
-       jq_edit "$f" 'del(.inbound.up_mbps,.inbound.down_mbps) | .inbound.ignore_client_bandwidth=true' || return 1;;
-    3) [ "$cur" = 3 ] && return 2
-       jq_edit "$f" 'del(.inbound.up_mbps,.inbound.down_mbps,.inbound.ignore_client_bandwidth)' || return 1;;
-    2)
-      up0=$(jq -r '.inbound.up_mbps // 100' "$f")
-      down0=$(jq -r '.inbound.down_mbps // 100' "$f")
-      echo "  服务器带宽：上行=客户端下载，下行=客户端上传"
-      ask_mbps up "服务端上行 Mbps" "$up0"
-      ask_mbps down "服务端下行 Mbps" "$down0"
-      [ "$cur" = 2 ] && [ "$up" = "$up0" ] && [ "$down" = "$down0" ] && return 2
-      jq_edit "$f" --argjson u "$up" --argjson d "$down" \
-        'del(.inbound.ignore_client_bandwidth) | .inbound.up_mbps=$u | .inbound.down_mbps=$d' || return 1;;
-  esac
+app_upgrade() {
+  ui_page 升级内核
+  release_need_core && app_prepare || return 1
+  local current version candidate
+  release_core_version current || return 1
+  release_pick version || return $?
+  if [ "$current" = "$version" ]; then
+    txn_begin repair && app_finish preserve || return 1
+    ui_ok "已是最新版本 v$current"; return 0
+  fi
+  ui_info "v$current → v$version"
+  candidate=$(mktemp "$RUNTIME_DIR/core.XXXXXX") || return 1
+  release_download "$version" "$candidate" || return 1
+  txn_begin upgrade && app_finish preserve "$candidate" || return 1
+  rm -f "$candidate"
+  ui_ok "升级完成（v$version）"
 }
-
-take_edit() {
-  local st
-  edit_field "$1" "$2"
-  st=$?
-  if [ "$st" -eq 2 ]; then drop_snap; return 2; fi
-  if [ "$st" -ne 0 ]; then rollback; return 1; fi
+app_start() {
+  ui_page 启动内核
+  release_need_core && app_prepare || return 1
+  [ "$(store_count "$INB_DIR")" -gt 0 ] || { ui_warn '还没有入站'; return 2; }
+  txn_begin start && app_finish apply || return 1
+  ui_ok '内核运行中'
 }
-
-with_inbound() {
-  local title=$1 action=$2
-  need_core || return
-  if ! has_inb; then warn "还没有入站"; return; fi
-  while has_inb; do
-    page "$title"
-    pick_inbound || return
-    "$action"
-    settle
+app_stop() {
+  ui_page 停止内核
+  app_guard && release_need_core || return 1
+  service_do stop && service_wait stopped || { service_failure; return 1; }
+  ui_ok '内核已停止'
+}
+app_uninstall() {
+  ui_page 卸载内核
+  app_guard && release_need_core || return 1
+  ui_confirm '确认卸载 sing-box？' n || return 2
+  local purge=0
+  ui_confirm '同时删除所有入站与配置？' n && purge=1
+  [ "$UI_EOF" = 0 ] || return 2
+  service_do stop && service_wait stopped || { service_failure; return 1; }
+  if service_do enabled; then service_do disable || { ui_err '停用自启失败，已停止卸载'; return 1; }; fi
+  rm -f "$UNIT" "$BIN" || { ui_err '服务已停止，但文件删除失败'; return 1; }
+  CORE_VER=''
+  service_do reload || { ui_err '文件已删除，但服务管理器重载失败'; return 1; }
+  if [ "$purge" = 1 ]; then
+    rm -rf -- "$BASE" "$STATE_DIR" || { ui_err '内核已卸载，但配置清理失败'; return 1; }
+    if [ "$INIT" = openrc ]; then rm -f "$LOG" || return 1; fi
+    platform_remove_user || { ui_err '内核与配置已清除，但用户删除失败'; return 1; }
+    ui_ok '已卸载，配置已清除'
+  else ui_ok "已卸载，配置保留在 $BASE"; fi
+}
+app_logs() {
+  ui_page 查看日志
+  release_need_core || return 1
+  local choice
+  printf '  1  最近 100 行\n  2  实时日志\n\n'; ui_select choice 2 || return 2
+  if [ "$choice" = 2 ]; then
+    trap ':' INT
+    service_do logs -f
+    trap 'exit 130' INT
+  else service_do logs 100; HOLD=1; fi
+}
+ui_pick_inbound() {
+  local -a entries=()
+  local index choice display
+  store_validate "$INB_DIR" || return 1
+  store_list entries || { ui_warn '还没有入站'; return 2; }
+  for index in "${!entries[@]}"; do
+    display=$(jq -r '.name|gsub("[\\u0000-\\u001f\\u007f]";" ")' "${entries[$index]}") || return 1
+    printf '  %d  %s\n' "$((index+1))" "$display"
+  done
+  printf '\n'; ui_select choice "${#entries[@]}" || return 2
+  printf -v "$1" '%s' "${entries[$((choice-1))]}"
+}
+app_with_inbound() {
+  local title=$1 action=$2 selected
+  release_need_core || return 1
+  while [ "$UI_EOF" = 0 ]; do
+    ui_page "$title"
+    ui_pick_inbound selected || return $?
+    "$action" "$selected"
+    ui_settle
   done
 }
-
-modify_inbound() { with_inbound "修改入站" modify_one; }
-
-modify_one() {
-  local f=$SEL_FILE proto tag oport key old_cert="" old_domain=""
-  proto=$(jq -r .proto "$f"); tag=$(jq -r .inbound.tag "$f"); oport=$(jq -r .inbound.listen_port "$f")
-
-  local keys=(port) labels=("端口")
-  add_cred_fields "$proto"
-  tls_proto "$proto" && { keys+=(sni); labels+=(SNI); }
-  case $proto in
-    vless) keys+=(flow); labels+=("流控");;
-    tuic) keys+=(cc); labels+=("拥塞");;
-    hysteria2) keys+=(hcc); labels+=("拥塞");;
-  esac
-  tls_proto "$proto" && { keys+=(tls); labels+=(证书); }
-  keys+=(name); labels+=("备注")
-  pick_key || return
-
-  echo
-  snapshot
-  local nport="" nname="" cur
-  case $key in
-    port)
-      ask_port nport "$oport"
-      [ "$nport" = "$oport" ] && { drop_snap; return; }
-      jq_edit "$f" --argjson p "$nport" '.inbound.listen_port=$p' || { rollback; return; };;
-    name)
-      cur=$(jq -r .name "$f")
-      ask nname "新备注" "$cur"
-      [ "$nname" = "$cur" ] && { drop_snap; return; }
-      jq_edit "$f" --arg n "$nname" '.name=$n' || { rollback; return; }
-      drop_snap
-      secure_tree
-      ok "修改完成"
-      return;;
-    *)
-      old_cert=$(jq -r .cert "$f")
-      old_domain=$(jq -r .domain "$f")
-      take_edit "$key" "$f" || return;;
-  esac
-
-  commit || return
-  if [ "$key" = tls ]; then
-    local c; c=$(jq -r .cert "$f")
-    if is_acme "$c"; then rm_cert "$tag"; fi
+app_add() {
+  release_need_core && app_guard || return 1
+  local choice index label
+  local -a protocols=(socks shadowsocks vless hysteria2 anytls tuic snell)
+  while [ "$UI_EOF" = 0 ]; do
+    ui_page 添加入站
+    for index in "${!protocols[@]}"; do
+      label=$(proto_name "${protocols[$index]}")
+      proto_tls "${protocols[$index]}" && label+='（TLS）'
+      printf '  %d  %s\n' "$((index+1))" "$label"
+    done
+    printf '  %d  返回\n\n' "$(( ${#protocols[@]} + 1 ))"
+    ui_select choice "$(( ${#protocols[@]} + 1 ))" || return 2
+    [ "$choice" -le "${#protocols[@]}" ] || return 0
+    app_add_one "${protocols[$((choice-1))]}"
+    ui_settle
+  done
+}
+app_add_one() {
+  local proto=$1 port name tag method='' version=6 obfs_mode=none tls_choice mode=none domain='' email='' inbound tls_json='{}'
+  app_prepare && store_validate "$INB_DIR" || return 1
+  ui_port port || return $?
+  ui_ask name 备注名称 "$(proto_name "$proto")-$port" || return 2
+  tag=$proto-$(openssl rand -hex 8) || return 1
+  [ ! -e "$INB_DIR/$tag.json" ] || { ui_err '入站标识冲突，请重试'; return 1; }
+  if [ "$proto" = shadowsocks ]; then ui_ss_method method || return 2; fi
+  if [ "$proto" = snell ]; then ui_snell_options version obfs_mode || return 2; fi
+  if proto_tls "$proto"; then
+    ui_tls tls_choice "$port" || return $?
+    mode=$(jq -r .mode <<<"$tls_choice"); domain=$(jq -r .domain <<<"$tls_choice"); email=$(jq -r .email <<<"$tls_choice")
   fi
-  if { [ "$key" = tls ] || [ "$key" = sni ]; } && is_acme "$old_cert" \
-    && { [ "$old_cert" != "$(jq -r .cert "$f")" ] || [ "$old_domain" != "$(jq -r .domain "$f")" ]; }; then
-    forget_acme "$old_domain"
+  txn_begin add || return 1
+  if proto_tls "$proto"; then
+    tls_json=$(tls_build "$tag" "$proto" "$mode" "$domain" "$TXN_DIR/certs") || { txn_rollback; return 1; }
   fi
-  ok "修改完成"
-  show_share "$f"
+  inbound=$(proto_build "$proto" "$tag" "$port" "$tls_json" "$method" "$version" "$obfs_mode") || { txn_rollback; return 1; }
+  store_save "$TXN_DIR/inbounds/$tag.json" "$proto" "$name" "$mode" "$domain" "$email" "$inbound" || { txn_rollback; return 1; }
+  app_finish apply || return 1
+  ui_ok '入站已添加'; ui_share "$INB_DIR/$tag.json"
+}
+app_modify_one() {
+  local file=$1 proto key choice index status staged old_mode old_domain new_mode new_domain
+  local -a keys=() labels=()
+  app_prepare || return 1
+  proto=$(jq -r .proto "$file"); proto_fields "$proto" keys labels
+  for index in "${!keys[@]}"; do printf '  %d  %s\n' "$((index+1))" "${labels[$index]}"; done
+  printf '\n'; ui_select choice "${#keys[@]}" || return 2
+  key=${keys[$((choice-1))]}
+  old_mode=$(jq -r .cert "$file"); old_domain=$(jq -r '.domain//""' "$file")
+  txn_begin modify || return 1
+  staged=$TXN_DIR/inbounds/${file##*/}
+  proto_edit "$staged" "$key" "$TXN_DIR/certs"; status=$?
+  if [ "$status" != 0 ]; then txn_rollback || return 1; return "$status"; fi
+  if [ "$key" = name ]; then
+    if ! txn_stage "$file" "$staged" || ! txn_publish none; then txn_rollback; return 1; fi
+    ui_ok '修改完成'; return 0
+  fi
+  new_mode=$(jq -r .cert "$staged"); new_domain=$(jq -r '.domain//""' "$staged")
+  app_finish apply || return 1
+  if [ "$old_mode" = acme ] && { [ "$new_mode" != acme ] || [ "$old_domain" != "$new_domain" ]; }; then tls_forget "$old_domain" || true; fi
+  ui_ok '修改完成'; ui_share "$file"
+}
+app_delete_one() {
+  local file=$1 name tag mode domain
+  app_prepare || return 1
+  name=$(jq -r .name "$file"); tag=$(jq -r .inbound.tag "$file"); mode=$(jq -r .cert "$file"); domain=$(jq -r '.domain//""' "$file")
+  ui_confirm "确认删除「$name」？" n || return 2
+  txn_begin delete || return 1
+  rm -f "$TXN_DIR/inbounds/${file##*/}" "$TXN_DIR/certs/$tag.crt" "$TXN_DIR/certs/$tag.key" || { txn_rollback; return 1; }
+  app_finish apply || return 1
+  if [ "$mode" = acme ]; then tls_forget "$domain" || true; fi
+  ui_ok "已删除「$name」"
 }
 
-surge_name_ok() { [[ $1 == *$'\n'* || $1 == *','* || $1 == *'='* ]] && return 1; [ -n "$1" ]; }
-surge_psk_ok() { [[ $1 == *$'\n'* || $1 == *','* || $1 == *'='* || $1 == *' '* || $1 == *'"'* ]] && return 1; [ -n "$1" ]; }
-
-show_share() {
-  local f=$1 proto name port cert domain ins="" nm pw="" id="" m="" cs="" sniq flow="" cc=""
-  local su="" sp="" raw host lab url alpn="" hy_up="" hy_down="" brutal=0 pcs=""
+# 8. 分享编码与结果页。编码函数不做网络探测或服务操作。
+proto_snell_outbound() {
+  jq -c --arg host "$2" '
+    .inbound.version as $version
+    | {type:"snell",tag:.name,server:$host,server_port:.inbound.listen_port,
+       version:(if $version==5 then 4 else $version end),psk:.inbound.psk}
+    + (if $version==5 then {obfs_mode:(.inbound.obfs_mode//"none")}
+       + (if .inbound.obfs_mode=="http" then {obfs_host:"bing.com"} else {} end) else {} end)
+  ' "$1"
+}
+proto_share() {
+  local file=$1 fingerprint='' output
+  if jq -e '.proto=="vless" and .cert=="self"' "$file" >/dev/null; then
+    fingerprint=$(tls_fingerprint "$CERT_DIR/$(jq -r .inbound.tag "$file").crt") || fingerprint=''
+  fi
+  output=$(jq -r --arg host "$2" --arg fingerprint "$fingerprint" '
+    def component: @uri;
+    (.proto) as $proto
+    | (.name|component) as $name
+    | (.inbound.listen_port|tostring) as $port
+    | (.domain//"") as $domain
+    | ($domain|component) as $sni
+    | (if ($host|contains(":")) then "["+$host+"]" else $host end) as $address
+    | if $proto=="socks" then
+        "socks5://"+(.inbound.users[0].username|component)+":"+(.inbound.users[0].password|component)+"@"+$address+":"+$port+"#"+$name
+      elif $proto=="shadowsocks" then
+        "ss://"+((.inbound.method+":"+.inbound.password)|@base64|gsub("=";"")|gsub("\\+";"-")|gsub("/";"_"))+"@"+$address+":"+$port+"#"+$name
+      elif $proto=="vless" then
+        (.inbound.users[0].flow//"") as $flow
+        | (if $flow=="xtls-rprx-vision" then "http/1.1" else ((.inbound.tls.alpn//[])|join(",")) end) as $alpn
+        | "vless://"+.inbound.users[0].uuid+"@"+$address+":"+$port+"?encryption=none"
+          +(if $flow!="" then "&flow="+($flow|component) else "" end)
+          +"&security=tls&sni="+$sni+"&type=tcp"
+          +(if $alpn!="" then "&alpn="+($alpn|component) else "" end)
+          +(if .cert=="self" then "&allowInsecure=1"+(if $fingerprint!="" then "&pcs="+$fingerprint else "" end) else "" end)
+          +"#"+$name
+      elif $proto=="hysteria2" or $proto=="anytls" then
+        (.inbound.users[0].password|component) as $password
+        | $proto+"://"+$password+"@"+$address+":"+$port+"/?sni="+$sni
+          +(if .cert=="self" then "&insecure=1" else "" end)
+          +(if $proto=="hysteria2" and (.inbound.up_mbps|tostring|test("^[1-9][0-9]{0,8}$"))
+             and (.inbound.down_mbps|tostring|test("^[1-9][0-9]{0,8}$"))
+            then "&upmbps="+(.inbound.down_mbps|tostring)+"&downmbps="+(.inbound.up_mbps|tostring) else "" end)
+          +"#"+$name
+      elif $proto=="tuic" then
+        "tuic://"+(.inbound.users[0].uuid|component)+":"+(.inbound.users[0].password|component)
+          +"@"+$address+":"+$port+"/?sni="+$sni+"&alpn=h3&congestion_control="+((.inbound.congestion_control//"cubic")|component)
+          +(if .cert=="self" then "&allow_insecure=1" else "" end)+"#"+$name
+      elif $proto=="snell" then
+        (.inbound.version//6) as $version
+        | (.inbound.obfs_mode//"none") as $obfs
+        | if (.name|type=="string" and length>0 and (test("[\\n\\r\\t,=]")|not))
+          and (.inbound.psk|type=="string" and length>0 and (test("[\\n\\r\\t ,=\"]")|not))
+        then .name+" = snell, "+$host+", "+$port+", psk="+.inbound.psk+", version="+($version|tostring)
+          +(if $version==5 and $obfs=="http" then ", obfs=http, obfs-host=bing.com" else "" end)
+        else "" end
+      else error("unsupported protocol") end
+  ' "$file") || return $?
+  [ -n "$output" ] || return 2
+  printf '%s\n' "$output"
+}
+ui_share() {
+  local file=$1 proto name port mode domain host label output duplicate
   local -a hosts=()
-  proto=$(jq -r .proto "$f"); name=$(jq -r .name "$f")
-  cert=$(jq -r .cert "$f"); domain=$(jq -r .domain "$f")
-  port=$(jq -r .inbound.listen_port "$f")
-  get_ip
-  case $cert in
-    acme) cs="ACME";;
-    self) cs="自签名"; ins=1;;
-  esac
-  sniq=$domain
-  [[ $domain == *:* ]] && sniq=$(urlenc "$domain")
-  nm=$(urlenc "$name")
+  proto=$(jq -r .proto "$file"); name=$(jq -r .name "$file"); port=$(jq -r .inbound.listen_port "$file")
+  mode=$(jq -r .cert "$file"); domain=$(jq -r '.domain//""' "$file")
+  net_get_ip || return $?
   HOLD=1
-
-  echo; echo "  ${B}$name${N}  ${D}$(pname "$proto")${N}"; line
-  kv "IPv4" "${SERVER_IP4:-无}"
-  kv "IPv6" "${SERVER_IP6:-无}"
-  [ "$cert" = acme ] && kv "域名" "$domain"
-  kv "端口" "$port"
-
-  case $proto in
-    socks)
-      su=$(jq -r '.inbound.users[0].username' "$f"); sp=$(jq -r '.inbound.users[0].password' "$f")
-      kv "用户" "$su"; kv "密码" "$sp";;
-    shadowsocks)
-      m=$(jq -r .inbound.method "$f"); pw=$(jq -r .inbound.password "$f")
-      kv "加密" "$m"; kv "密码" "$pw";;
-    vless)
-      id=$(jq -r '.inbound.users[0].uuid' "$f")
-      flow=$(jq -r '.inbound.users[0].flow // ""' "$f")
-      alpn=$(jq -r '(.inbound.tls.alpn // []) | join(",")' "$f")
-      [ "$flow" = xtls-rprx-vision ] && alpn=http/1.1
-      if [ -n "$ins" ]; then pcs=$(leaf_sha256 "$CERT_DIR/$(jq -r .inbound.tag "$f").crt") || pcs=""; fi
-      kv "UUID" "$id"; kv "流控" "${flow:-无}"; kv "SNI " "$domain"; kv "证书" "$cs";;
-    hysteria2|anytls)
-      pw=$(jq -r '.inbound.users[0].password' "$f")
-      kv "密码" "$pw"; kv "SNI " "$domain"; kv "证书" "$cs"
-      if [ "$proto" = hysteria2 ]; then
-        hy_up=$(jq -r '.inbound.up_mbps // empty' "$f")
-        hy_down=$(jq -r '.inbound.down_mbps // empty' "$f")
-        kv "拥塞" "$(jq -r 'if .inbound.ignore_client_bandwidth==true then "BBR"
-          elif (.inbound.up_mbps and .inbound.down_mbps) then "Brutal \(.inbound.up_mbps)/\(.inbound.down_mbps) Mbps"
-          else "不限制" end' "$f")"
-      fi;;
-    tuic)
-      id=$(jq -r '.inbound.users[0].uuid' "$f"); pw=$(jq -r '.inbound.users[0].password' "$f")
-      cc=$(jq -r '.inbound.congestion_control // "cubic"' "$f")
-      kv "UUID" "$id"; kv "密码" "$pw"; kv "拥塞" "$cc"; kv "SNI " "$domain"; kv "证书" "$cs";;
-    snell)
-      pw=$(jq -r .inbound.psk "$f")
-      kv "PSK " "$pw"; kv "版本" "v6";;
-  esac
-
-  [ "$cert" = acme ] && hosts+=("$domain")
-  [ -n "$SERVER_IP4" ] && hosts+=("$SERVER_IP4")
-  [ -n "$SERVER_IP6" ] && hosts+=("$SERVER_IP6")
-  [ "$cert" != acme ] && [ ${#hosts[@]} -eq 0 ] && [ -n "$SERVER_IP" ] && hosts+=("$SERVER_IP")
-
-  if [[ $hy_up =~ ^[0-9]+$ ]] && [[ $hy_down =~ ^[0-9]+$ ]]; then brutal=1; fi
-
-  for raw in "${hosts[@]}"; do
-    raw=$(bare_ip "$raw")
-    host=$(host_fmt "$raw")
-    if valid_ip "$raw"; then [[ $raw == *:* ]] && lab=IPv6 || lab=IPv4; else lab=域名; fi
-    case $proto in
-      socks) url="socks5://$(urlenc "$su"):$(urlenc "$sp")@$host:$port#$nm";;
-      shadowsocks) url="ss://$(b64url "$m:$pw")@$host:$port#$nm";;
-      vless)
-        url="vless://$id@$host:$port?encryption=none${flow:+&flow=$flow}&security=tls&sni=$sniq&type=tcp"
-        [ -n "$alpn" ] && url+="&alpn=$(urlenc "$alpn")"
-        [ -n "$ins" ] && url+="&allowInsecure=1"
-        [ -n "$pcs" ] && url+="&pcs=$pcs"
-        url+="#$nm";;
-      hysteria2|anytls)
-        url="$proto://$(urlenc "$pw")@$host:$port/?sni=$sniq"
-        [ -n "$ins" ] && url+="&insecure=1"
-        [ "$brutal" = 1 ] && url+="&upmbps=${hy_down}&downmbps=${hy_up}"
-        url+="#$nm";;
-      tuic)
-        url="tuic://$(urlenc "$id"):$(urlenc "$pw")@$host:$port/?sni=$sniq&alpn=h3&congestion_control=$cc"
-        [ -n "$ins" ] && url+="&allow_insecure=1"
-        url+="#$nm";;
-      snell)
-        if surge_name_ok "$name" && surge_psk_ok "$pw"; then url="$name = snell, $raw, $port, psk=$pw, version=6"
-        else url=""; fi;;
-    esac
-    echo; echo "  ${D}${lab}${N}"
-    if [ "$proto" = snell ]; then
-      if [ -n "$url" ]; then
-        echo "  ${D}Surge 配置${N}"
-        printf '  %s\n' "$url"
-      else
-        tip "名称或 PSK 含保留字符，已省略 Surge 行"
-      fi
-      echo "  ${D}sing-box 出站${N}"
-      SB_NAME=$name SB_HOST=$raw SB_PSK=$pw jq -nc --argjson p "$port" \
-        '{type:"snell",tag:env.SB_NAME,server:env.SB_HOST,server_port:$p,version:6,psk:env.SB_PSK}' | sed 's/^/  /'
-    else
-      printf '  %s\n' "$url"
-    fi
-  done
-}
-
-share_selected() { show_share "$SEL_FILE"; }
-share_inbound() { with_inbound "分享入站" share_selected; }
-
-delete_inbound() { with_inbound "删除入站" delete_one; }
-
-delete_one() {
-  local f=$SEL_FILE tag name cert domain
-  tag=$(jq -r .inbound.tag "$f")
-  name=$(jq -r .name "$f")
-  cert=$(jq -r .cert "$f"); domain=$(jq -r .domain "$f")
-  echo
-  confirm "确认删除「$name」？" n || return
-  snapshot; rm -f "$f"
-  commit || return
-  rm_cert "$tag"
-  is_acme "$cert" && forget_acme "$domain"
-  ok "已删除「$name」"
-}
-
-home() {
-  local st v b
-  if installed; then
-    v="v$(core_ver)"
-    if [ -z "$SVC_ST" ]; then svc active && SVC_ST=1 || SVC_ST=0; fi
-    if [ "$SVC_ST" = 1 ]; then st="${G}● 运行中${N}"; else st="${R}○ 已停止${N}"; fi
-  else
-    v="未安装"; st="${D}○ 未安装${N}"
+  printf '\n  %s%s%s  %s%s%s\n' "$B" "$name" "$N" "$D" "$(proto_name "$proto")" "$N"; ui_line
+  ui_kv IPv4 "${SERVER_IP4:-无}"; ui_kv IPv6 "${SERVER_IP6:-无}"; ui_kv 端口 "$port"
+  if proto_tls "$proto"; then
+    ui_kv SNI "$domain"
+    if [ "$mode" = acme ]; then ui_kv 证书 ACME; else ui_kv 证书 自签名; fi
   fi
-  b=$'\n'"  ${B}sing-box${N} 管理面板"$'\n'"$RULE"$'\n'
-  b+="  $st    $v    入站 $(inb_count)"$'\n'"$RULE"$'\n'
-  if [ -n "$NOTICE" ]; then b+="$NOTICE$RULE"$'\n'; NOTICE=""; fi
-  b+=$'\n'"$MENU"$'\n'
-  paint "$b"
-}
-
-wait_back() {
-  local _c
-  while true; do
-    read -rp "  请选择 [回车返回]: " _c
-    [ -z "$_c" ] && return
+  case $proto in
+    socks) ui_kv 用户 "$(jq -r '.inbound.users[0].username' "$file")"; ui_kv 密码 "$(jq -r '.inbound.users[0].password' "$file")";;
+    shadowsocks) ui_kv 加密 "$(jq -r .inbound.method "$file")"; ui_kv 密码 "$(jq -r .inbound.password "$file")";;
+    vless) ui_kv UUID "$(jq -r '.inbound.users[0].uuid' "$file")"; ui_kv 流控 "$(jq -r '.inbound.users[0].flow//"无"' "$file")";;
+    tuic) ui_kv UUID "$(jq -r '.inbound.users[0].uuid' "$file")"; ui_kv 密码 "$(jq -r '.inbound.users[0].password' "$file")"; ui_kv 拥塞 "$(jq -r '.inbound.congestion_control//"cubic"' "$file")";;
+    hysteria2|anytls)
+      ui_kv 密码 "$(jq -r '.inbound.users[0].password' "$file")"
+      if [ "$proto" = hysteria2 ]; then ui_kv 拥塞 "$(jq -r 'if .inbound.ignore_client_bandwidth==true then "BBR" elif (.inbound.up_mbps and .inbound.down_mbps) then "Brutal \(.inbound.up_mbps)/\(.inbound.down_mbps) Mbps" else "不限制" end' "$file")"; fi;;
+    snell)
+      ui_kv PSK "$(jq -r .inbound.psk "$file")"
+      version=$(jq -r .inbound.version "$file"); ui_kv 版本 "v$version"
+      if [ "$version" = 5 ]; then ui_kv 混淆 "$(jq -r '.inbound.obfs_mode//"none"' "$file")"; fi;;
+  esac
+  if [ "$mode" = acme ]; then hosts+=("$domain"); fi
+  for host in "$SERVER_IP4" "$SERVER_IP6"; do
+    [ -n "$host" ] || continue
+    duplicate=0
+    for label in "${hosts[@]}"; do [ "$label" != "$host" ] || duplicate=1; done
+    [ "$duplicate" = 1 ] || hosts+=("$host")
   done
-}
-settle() {
-  if [ "$HOLD" = 1 ]; then echo; wait_back; HOLD=0; NOTICE=""; fi
-}
-
-acquire_lock() {
-  local dir=/run/lock pid
-  [ -d /run/lock ] || dir=/tmp
-  LOCKDIR=$dir/sb-sing-box.lock
-  while ! mkdir "$LOCKDIR" 2>/dev/null; do
-    pid=$(cat "$LOCKDIR/pid" 2>/dev/null || true)
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-      echo "另一个 sing-box.sh 正在运行"
-      exit 1
+  printf '\n  %s分享链接%s\n' "$B" "$N"
+  local primary=1
+  for host in "${hosts[@]}"; do
+    if valid_ip "$host"; then
+      if [[ $host == *:* ]]; then label=IPv6; else label=IPv4; fi
+    else label=域名; fi
+    [ "$primary" = 0 ] || label+='（主）'
+    printf '\n  %s%s%s\n' "$D" "$label" "$N"
+    if output=$(proto_share "$file" "$host"); then printf '  %s\n' "$output"
+    elif [ "$proto" = snell ]; then ui_tip '名称或 PSK 含保留字符，已省略 Surge 行'
+    else ui_err '分享内容生成失败'; return 1; fi
+    if [ "$proto" = snell ]; then
+      printf '  %ssing-box 出站%s\n' "$D" "$N"
+      proto_snell_outbound "$file" "$host" | sed 's/^/  /'
     fi
-    rm -rf "$LOCKDIR"
+    primary=0
   done
-  echo $$ > "$LOCKDIR/pid"
-  trap 'rm -rf "$LOCKDIR"' EXIT
 }
-
+ui_home() {
+  local state version body
+  if release_installed; then
+    release_core_version version || version=未知
+    version=v$version
+    if service_do active && service_process_alive; then state="${G}● 运行中${N}"; else state="${R}○ 已停止${N}"; fi
+  else version=未安装; state="${D}○ 未安装${N}"; fi
+  body=$'\n'"  ${B}sing-box${N} 管理面板"$'\n'"$RULE"$'\n'
+  body+="  $state    $version    入站 $(store_count "$INB_DIR")"$'\n'"$RULE"$'\n'
+  if [ -n "$NOTICE" ]; then body+="$NOTICE$RULE"$'\n'; NOTICE=''; fi
+  body+=$'\n  1   安装内核      6   查看日志\n  2   升级内核      7   添加入站\n  3   启动内核      8   修改入站\n  4   停止内核      9   分享入站\n  5   卸载内核      10  删除入站\n\n'
+  printf '%s%s' "$CLS" "$body"
+}
 main() {
-  local n
-  acquire_lock
-  while true; do
+  if ((BASH_VERSINFO[0]<4 || (BASH_VERSINFO[0]==4 && BASH_VERSINFO[1]<3))); then printf '需要 Bash >= 4.3\n' >&2; return 1; fi
+  [ "$(id -u)" = 0 ] || { printf '请使用 root 运行\n' >&2; return 1; }
+  runtime_paths ''
+  umask 077
+  export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+  platform_detect || return 1
+  if ! command -v flock >/dev/null 2>&1; then platform_packages util-linux || return 1; fi
+  runtime_lock || return 1
+  trap 'runtime_cleanup $?; exit $?' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  platform_deps || return 1
+  RUNTIME_DIR=$(mktemp -d "$RUN_ROOT/sb-panel.XXXXXX") || return 1
+  txn_recover || { RUNTIME_BLOCKED=1; ui_warn "遗留事务未恢复，修改功能已停用；备份：$TXN_DIR"; }
+  local choice
+  while [ "$UI_EOF" = 0 ]; do
     HOLD=0
-    home
-    sel n 10 退出 || { printf '%s' "$CLS"; exit 0; }
-    NOTICE=""
-    case $n in
-      1) install_core;;   2) upgrade_core;;    3) start_core;;
-      4) stop_core;;      5) uninstall_core;;  6) view_logs;;
-      7) add_inbound;;    8) modify_inbound;;
-      9) share_inbound;;  10) delete_inbound;;
+    ui_home
+    ui_select choice 10 退出 || break
+    NOTICE=''
+    case $choice in
+      1) app_install;; 2) app_upgrade;; 3) app_start;; 4) app_stop;; 5) app_uninstall;;
+      6) app_logs;; 7) app_add;; 8) app_with_inbound 修改入站 app_modify_one;;
+      9) app_with_inbound 分享入站 ui_share;; 10) app_with_inbound 删除入站 app_delete_one;;
     esac
-    settle
+    ui_settle
   done
+  printf '%s' "$CLS"
 }
 
-if [ "${BASH_SOURCE[0]}" = "$0" ]; then
-  main
-fi
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then main; fi
