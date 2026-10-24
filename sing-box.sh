@@ -862,9 +862,13 @@ github_asset_sha() {
 }
 
 download_release() {
-  local version=$1 dest=$2 machine url name sum actual inner
+  local version=$1 dest=$2 machine url name sum actual inner libc=""
   machine=$(asset_arch) || return 1
-  name="sing-box-${version#v}-linux-${machine}.tar.gz"
+  # 不带后缀的 linux-* 包链接 glibc。Alpine 必须用 -musl，否则动态链接器不存在，执行报 not found。
+  if [[ $OS == alpine ]]; then
+    libc="-musl"
+  fi
+  name="sing-box-${version#v}-linux-${machine}${libc}.tar.gz"
   url="https://github.com/${REPO}/releases/download/${version}/${name}"
   plainln "  下载 ${url}"
   if ! curl -fL --retry 5 --retry-delay 2 -o "$dest/sing-box.tar.gz" "$url"; then
@@ -889,7 +893,7 @@ download_release() {
     err "解压失败。"
     return 1
   fi
-  inner=$dest/sing-box-${version#v}-linux-${machine}
+  inner=$dest/sing-box-${version#v}-linux-${machine}${libc}
   if [[ ! -d $inner ]]; then
     inner=$(find "$dest" -mindepth 1 -maxdepth 1 -type d -name 'sing-box-*' | head -n 1)
   fi

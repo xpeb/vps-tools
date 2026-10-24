@@ -303,21 +303,23 @@ create_box_user() {
     warn "已存在 mihomo 用户，继续使用该账户运行内核。"
     return 0
   fi
-  if [[ $OS == debian ]] && command -v systemd-sysusers >/dev/null 2>&1; then
-    plainln "  创建 mihomo 用户"
+  plainln "  创建 mihomo 用户"
+  # systemd-sysusers 把 "Creating group/user" 写到 stderr，必须两路都丢掉。
+  # 装了 systemd 的 Alpine 也会走到这里，不能只看发行版。
+  if command -v systemd-sysusers >/dev/null 2>&1; then
     systemd-sysusers - >/dev/null 2>&1 <<'EOF' || true
 u mihomo - "mihomo" /var/empty
 EOF
   elif [[ $OS == alpine ]]; then
     if ! grep -q '^mihomo:' /etc/group 2>/dev/null; then
-      addgroup -S mihomo || return 1
+      addgroup -S mihomo >/dev/null 2>&1 || return 1
     fi
-    adduser -S -D -H -h /var/empty -s /sbin/nologin -G mihomo -g "mihomo" mihomo || true
+    adduser -S -D -H -h /var/empty -s /sbin/nologin -G mihomo -g "mihomo" mihomo >/dev/null 2>&1 || true
   else
     if ! getent group mihomo >/dev/null 2>&1; then
-      groupadd --system mihomo || return 1
+      groupadd --system mihomo >/dev/null 2>&1 || return 1
     fi
-    useradd --system --gid mihomo --home-dir /var/empty --shell /usr/sbin/nologin --comment "mihomo" mihomo || true
+    useradd --system --gid mihomo --home-dir /var/empty --shell /usr/sbin/nologin --comment "mihomo" mihomo >/dev/null 2>&1 || true
   fi
   if ! id -u mihomo >/dev/null 2>&1; then
     err "无法创建 mihomo 用户。"
@@ -614,7 +616,8 @@ depend() {
 }
 EOF
     chmod 755 /etc/init.d/mihomo
-    rc-update add mihomo default >/dev/null 2>&1 || rc-update add mihomo default || true
+    plainln "  设置开机启动"
+    rc-update add mihomo default >/dev/null 2>&1 || rc-update add mihomo default >/dev/null 2>&1 || true
     drop_file_caps "$BIN"
   else
     if ! command -v systemctl >/dev/null 2>&1; then
