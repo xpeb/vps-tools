@@ -5,7 +5,7 @@
 # 入站: Shadowsocks、VLESS REALITY、Hysteria2
 # 内核以 sing-box 用户运行
 #
-# 用法: sudo ./sing-box.sh
+# 用法: sudo sh sing-box.sh
 
 set -eu
 
@@ -39,27 +39,39 @@ CONF=/usr/local/etc/sing-box/config.json
 CONF_DIR=/usr/local/etc/sing-box
 LOG_DIR=/var/log/sing-box
 STATE_DIR=/var/lib/sing-box
+RUN_DIR=/var/lib/sing-box/runtime
+SERVICE_FILE=/etc/systemd/system/sing-box.service
+LOGROTATE_FILE=/etc/logrotate.d/sing-box
 META_DIR=/var/lib/sing-box/meta
 CERT_DIR=/var/lib/sing-box/certs
 STDOUT_LOG=/var/log/sing-box/stdout.log
 STDERR_LOG=/var/log/sing-box/stderr.log
-WIDTH=42
 REPO=SagerNet/sing-box
+LOCK_DIR=/run/lock
 
 GRN=$'\033[38;2;126;217;167m'
 RED=$'\033[38;2;255;107;107m'
 YEL=$'\033[38;2;240;200;120m'
-DIM=$'\033[38;2;90;122;104m'
+DIM=$'\033[38;2;145;155;170m'
+ACC=$'\033[38;2;116;180;255m'
 RST=$'\033[0m'
 BOLD=$'\033[1m'
-OFFBOLD=$'\033[22m'
+MENU_NUM_W=4
+MENU_LABEL_W=18
+PANEL_KERNEL=("1 安装内核 2 升级内核" "3 启动服务 4 停止服务")
+PANEL_INBOUND=("6 添加入站 7 修改入站" "8 分享链接 9 删除入站")
+PANEL_DIAG=("10 查看日志 q 退出面板")
 
 OS=""
 TX=""
+TX_MODE=""
+TX_WAS_RUNNING=0
+FOLLOW_PID=""
 CONFLICT_TAG=""
 PICKED=""
 TMP_PATHS=()
 RULE=""
+STORE_REV=""
 
 ui() { printf '%b' "$1" >&4; }
 uin() { printf '%b\n' "$1" >&4; }
@@ -68,11 +80,24 @@ err() { printf '  %b%s%b\n' "$RED" "$1" "$GRN" >&4; }
 warn() { printf '  %b%s%b\n' "$YEL" "$1" "$GRN" >&4; }
 note() { printf '  %b%s%b\n' "$DIM" "$1" "$GRN" >&4; }
 kv() { printf '  %s%s\n' "$(pad "$1" 8)" "$2" >&4; }
-item() { printf '  %s%s\n' "$(pad "$1" 3)" "$2" >&4; }
+item() { printf '  %b%s%b%s\n' "$ACC" "$(pad "$1" "$MENU_NUM_W")" "$RST" "$2" >&4; }
 blank() { uin ""; }
 
 cleanup() {
   local p
+  if [[ -n $FOLLOW_PID ]]; then
+    kill "$FOLLOW_PID" 2>/dev/null || true
+  fi
+  if [[ -n $TX && ! -f $TX/ready ]]; then
+    end_tx
+  fi
+  if [[ -n $TX ]]; then
+    warn "操作中断，正在恢复修改前的状态。"
+    ((TX_WAS_RUNNING)) && svc stop || true
+    if rollback_tx && ((TX_WAS_RUNNING)); then
+      svc restart || true
+    fi
+  fi
   if ((${#TMP_PATHS[@]})); then
     for p in "${TMP_PATHS[@]}"; do
       if [[ -n $p && -e $p ]]; then
@@ -83,34 +108,43 @@ cleanup() {
   printf '%b' "$RST" >&4 2>/dev/null || printf '%b' "$RST" || true
 }
 
-char_width() {
-  local cp=$1
-  if ((cp < 0x1100)); then
-    printf '1'
-    return
+menu_row_width() {
+  dw "$(pad "$1" "$MENU_NUM_W")$(pad "$2" "$MENU_LABEL_W")  $(pad "$3" "$MENU_NUM_W")$4"
+}
+
+# 分隔线与主菜单最宽的一行对齐。
+menu_rule() {
+  local max=0 w spec n1 l1 n2 l2
+  for spec in "$@"; do
+    read -r n1 l1 n2 l2 <<<"$spec"
+    w=$(menu_row_width "$n1" "$l1" "$n2" "$l2")
+    ((w > max)) && max=$w
+  done
+  printf '%*s' "$max" '' | tr ' ' '-'
+}
+
+init_ui() {
+  if [[ -n ${NO_COLOR:-} || ${TERM:-dumb} == dumb ]]; then
+    GRN='' RED='' YEL='' DIM='' ACC='' RST='' BOLD=''
   fi
-  if (( (cp >= 0x1100 && cp <= 0x115F) \
-     || (cp >= 0x2E80 && cp <= 0xA4CF) \
-     || (cp >= 0xAC00 && cp <= 0xD7A3) \
-     || (cp >= 0xF900 && cp <= 0xFAFF) \
-     || (cp >= 0xFE10 && cp <= 0xFE6F) \
-     || (cp >= 0xFF00 && cp <= 0xFF60) \
-     || (cp >= 0xFFE0 && cp <= 0xFFE6) \
-     || (cp >= 0x1F300 && cp <= 0x1FAFF) \
-     || (cp >= 0x20000 && cp <= 0x3FFFD) )); then
-    printf '2'
-  else
-    printf '1'
-  fi
+  RULE=$(menu_rule "${PANEL_KERNEL[@]}" "${PANEL_INBOUND[@]}" "${PANEL_DIAG[@]}")
 }
 
 dw() {
-  local s=$1 i n w cp
-  n=${#s}
-  w=0
-  for ((i = 0; i < n; i++)); do
-    cp=$(printf '%d' "'${s:i:1}")
-    w=$((w + $(char_width "$cp")))
+  local s=$1 i w=0 cp
+  for ((i = 0; i < ${#s}; i++)); do
+    printf -v cp '%d' "'${s:i:1}"
+    if ((cp < 32 || (cp >= 0x7F && cp < 0xA0) || (cp >= 0x300 && cp <= 0x36F))); then
+      continue
+    elif (( (cp >= 0x1100 && cp <= 0x115F) || (cp >= 0x2E80 && cp <= 0xA4CF) \
+         || (cp >= 0xAC00 && cp <= 0xD7A3) || (cp >= 0xF900 && cp <= 0xFAFF) \
+         || (cp >= 0xFE10 && cp <= 0xFE6F) || (cp >= 0xFF00 && cp <= 0xFF60) \
+         || (cp >= 0xFFE0 && cp <= 0xFFE6) || (cp >= 0x1F300 && cp <= 0x1FAFF) \
+         || (cp >= 0x20000 && cp <= 0x3FFFD) )); then
+      w=$((w + 2))
+    else
+      w=$((w + 1))
+    fi
   done
   printf '%s' "$w"
 }
@@ -119,29 +153,19 @@ pad() {
   local s=$1 width=$2 w
   w=$(dw "$s")
   printf '%s' "$s"
-  while ((w < width)); do
-    printf ' '
-    w=$((w + 1))
-  done
-}
-
-spaces() {
-  local n=$1 i s=""
-  for ((i = 0; i < n; i++)); do
-    s+=" "
-  done
-  printf '%s' "$s"
+  ((w >= width)) || printf '%*s' "$((width - w))" ''
 }
 
 cls() {
-  ui $'\033[H\033[2J'
-  ui "$GRN"
+  [[ ${TERM:-dumb} == dumb ]] || ui $'\033[H\033[2J'
+  ui "$RST"
 }
 
 header() {
   cls
-  uin "  ${BOLD}${1}${OFFBOLD}"
-  uin "  ${RULE}"
+  blank
+  printf '  %bSING-BOX%b  /  %s\n' "$ACC$BOLD" "$RST" "$1" >&4
+  uin "  ${DIM}${RULE}${RST}"
   blank
 }
 
@@ -158,6 +182,17 @@ trim_line() {
   s=${s#"${s%%[![:space:]]*}"}
   s=${s%"${s##*[![:space:]]}"}
   printf '%s' "$s"
+}
+
+read_fields() {
+  local data=$1 name i=0
+  local -a values=()
+  shift
+  mapfile -t values <<<"$data"
+  for name in "$@"; do
+    printf -v "$name" '%s' "${values[i]:-}"
+    i=$((i + 1))
+  done
 }
 
 tty_read() {
@@ -181,6 +216,10 @@ prompt() {
   fi
   p+=$(printf ': ')
   tty_read ans "$p" || return 2
+  if [[ $ans == *[[:cntrl:]]* ]]; then
+    err "输入不能包含控制字符。"
+    return 2
+  fi
   if [[ -z $ans ]]; then
     printf '%s' "$default"
   else
@@ -218,6 +257,9 @@ detect_os() {
   fi
   export LANG=C.UTF-8
   export LC_ALL=C.UTF-8
+  if [[ $OS == alpine ]]; then
+    SERVICE_FILE=/etc/init.d/sing-box
+  fi
 }
 
 asset_arch() {
@@ -259,10 +301,13 @@ asset_arch() {
 ensure_deps() {
   local pkgs=()
   command -v curl >/dev/null 2>&1 || pkgs+=(curl)
+  [[ -s /etc/ssl/certs/ca-certificates.crt ]] || pkgs+=(ca-certificates)
   command -v tar >/dev/null 2>&1 || pkgs+=(tar)
   command -v openssl >/dev/null 2>&1 || pkgs+=(openssl)
   command -v jq >/dev/null 2>&1 || pkgs+=(jq)
   command -v sha256sum >/dev/null 2>&1 || pkgs+=(coreutils)
+  command -v flock >/dev/null 2>&1 || pkgs+=(flock)
+  command -v su >/dev/null 2>&1 || pkgs+=(util-linux)
   if ((${#pkgs[@]} == 0)); then
     return 0
   fi
@@ -271,33 +316,33 @@ ensure_deps() {
     apk add --no-cache "${pkgs[@]}" ca-certificates
   else
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y
+    apt-get update -y || return 1
+    # Debian 将 flock 与 su 一并放在 util-linux 中。
+    local i
+    for i in "${!pkgs[@]}"; do
+      [[ ${pkgs[i]} == flock ]] && pkgs[i]=util-linux
+    done
     apt-get install -y --no-install-recommends "${pkgs[@]}" ca-certificates
   fi
 }
 
+deps_ok() {
+  ensure_deps || { err "依赖安装失败。"; pause; return 1; }
+}
+
 box_group_ok() {
-  local primary listed
-  if ! getent group sing-box >/dev/null 2>&1; then
-    return 1
-  fi
-  primary=$(id -gn sing-box 2>/dev/null || true)
-  if [[ $primary == sing-box ]]; then
-    return 0
-  fi
-  listed=$(id -nG sing-box 2>/dev/null || true)
-  [[ " ${listed} " == *" sing-box "* ]]
+  [[ $(id -gn sing-box 2>/dev/null) == sing-box ]]
 }
 
 create_box_user() {
-  install -d -m 755 -o root -g root /var/empty
+  install -d -m 755 -o root -g root /var/empty || return 1
   if id -u sing-box >/dev/null 2>&1; then
     if [[ $(id -u sing-box) -eq 0 || $(id -g sing-box) -eq 0 ]]; then
       err "已有的 sing-box 账户不能是 root。"
       return 1
     fi
     if ! box_group_ok; then
-      err "已有的 sing-box 账户不在 sing-box 组中，校验与服务会使用不同身份。"
+      err "已有的 sing-box 账户必须以 sing-box 为主组。"
       return 1
     fi
     warn "已存在 sing-box 用户，继续使用该账户运行内核。"
@@ -323,43 +368,42 @@ EOF
     err "无法创建 sing-box 用户。"
     return 1
   fi
-  if [[ $(id -u sing-box) -eq 0 || $(id -g sing-box) -eq 0 ]]; then
-    err "sing-box 账户不能是 root。"
+  if [[ $(id -u sing-box) -eq 0 || $(id -g sing-box) -eq 0 ]] || ! box_group_ok; then
+    err "sing-box 账户身份或主组不安全。"
     return 1
   fi
 }
 
 make_dir() {
   local mode=$1 owner=$2 group=$3 dir=$4
-  if [[ -d $dir ]]; then
-    return 0
+  if [[ -L $dir || ( -e $dir && ! -d $dir ) ]]; then
+    err "拒绝使用非目录或符号链接: ${dir}"
+    return 1
   fi
   install -d -m "$mode" -o "$owner" -g "$group" "$dir"
 }
 
 ensure_dirs() {
   local f
-  make_dir 750 root sing-box "$CONF_DIR"
-  make_dir 750 root sing-box "$LOG_DIR"
-  make_dir 750 root sing-box "$STATE_DIR"
-  make_dir 700 root root "$META_DIR"
-  make_dir 750 root sing-box "$CERT_DIR"
-  if [[ -d $STATE_DIR ]]; then
-    chown root:sing-box "$STATE_DIR"
-    chmod 750 "$STATE_DIR"
-  fi
+  make_dir 750 root sing-box "$CONF_DIR" || return 1
+  make_dir 750 root sing-box "$LOG_DIR" || return 1
+  make_dir 750 root sing-box "$STATE_DIR" || return 1
+  make_dir 700 root root "$META_DIR" || return 1
+  make_dir 750 root sing-box "$CERT_DIR" || return 1
+  make_dir 750 sing-box sing-box "$RUN_DIR" || return 1
   for f in "$STDOUT_LOG" "$STDERR_LOG"; do
+    [[ ! -L $f ]] || return 1
     if [[ ! -e $f ]]; then
-      install -m 600 -o sing-box -g sing-box /dev/null "$f"
+      install -m 600 -o sing-box -g sing-box /dev/null "$f" || return 1
     fi
   done
-  repair_conf_access
+  fix_tree_perms
 }
 
 atomic_json() {
   local dest=$1 mode=$2 owner=$3 group=$4 dir tmp
   dir=$(dirname "$dest")
-  if [[ ! -d $dir ]]; then
+  if [[ ! -d $dir || -L $dest ]]; then
     return 1
   fi
   tmp=$(mktemp -p "$dir") || return 1
@@ -375,7 +419,10 @@ atomic_json() {
     rm -f -- "$tmp"
     return 1
   fi
-  mv -f -- "$tmp" "$dest"
+  if ! mv -f -- "$tmp" "$dest"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
 }
 
 empty_config() {
@@ -383,6 +430,7 @@ empty_config() {
 }
 
 ensure_base_config() {
+  [[ ! -L $CONF ]] || return 1
   if [[ -f $CONF ]]; then
     return 0
   fi
@@ -391,71 +439,51 @@ ensure_base_config() {
 
 fix_tree_perms() {
   local f
-  if [[ -f $CONF ]]; then
-    chown root:sing-box "$CONF"
-    chmod 640 "$CONF"
-  fi
-  if [[ -d $CONF_DIR ]]; then
-    chown root:sing-box "$CONF_DIR"
-    chmod 750 "$CONF_DIR"
-  fi
-  if [[ -d $STATE_DIR ]]; then
-    chown root:sing-box "$STATE_DIR"
-    chmod 750 "$STATE_DIR"
-  fi
-  if [[ -d $LOG_DIR ]]; then
-    chown root:sing-box "$LOG_DIR"
-    chmod 750 "$LOG_DIR"
-  fi
+  for f in "$CONF_DIR" "$LOG_DIR" "$STATE_DIR" "$CERT_DIR"; do
+    [[ ! -L $f ]] || return 1
+    [[ -d $f ]] || continue
+    chown root:sing-box "$f" && chmod 750 "$f" || return 1
+  done
   if [[ -d $META_DIR ]]; then
-    chown root:root "$META_DIR"
-    chmod 700 "$META_DIR"
-    for f in "$META_DIR"/*.json; do
-      [[ -f $f ]] || continue
-      chown root:root "$f"
-      chmod 600 "$f"
-    done
+    [[ ! -L $META_DIR ]] || return 1
+    chown root:root "$META_DIR" && chmod 700 "$META_DIR" || return 1
   fi
-  if [[ -d $CERT_DIR ]]; then
-    chown root:sing-box "$CERT_DIR"
-    chmod 750 "$CERT_DIR"
-    for f in "$CERT_DIR"/*; do
-      [[ -e $f ]] || continue
-      chown root:sing-box "$f"
-      chmod 640 "$f"
-    done
-  fi
-  repair_conf_access
-}
-
-repair_conf_access() {
-  [[ -d $CONF_DIR ]] || return 0
-  if ! id -u sing-box >/dev/null 2>&1 || ! command -v su >/dev/null 2>&1; then
-    return 0
-  fi
-  if su -s /bin/sh -c "test -x $(printf '%q' "$CONF_DIR") && test -r $(printf '%q' "$CONF_DIR")" sing-box; then
-    return 0
-  fi
-  chown root:sing-box "$CONF_DIR"
-  chmod 750 "$CONF_DIR"
+  for f in "$META_DIR"/*.json "$CERT_DIR"/* "$CONF"; do
+    [[ ! -L $f ]] || { err "拒绝使用符号链接: ${f}"; return 1; }
+    [[ -f $f ]] || continue
+    if [[ $f == "$META_DIR/"* ]]; then
+      chown root:root "$f" && chmod 600 "$f" || return 1
+    else
+      chown root:sing-box "$f" && chmod 640 "$f" || return 1
+    fi
+  done
+  return 0
 }
 
 gc_certs() {
-  local f base
-  for f in "$CERT_DIR"/*; do
-    [[ -f $f ]] || continue
-    base=$(basename "$f")
-    base=${base%.*}
-    if [[ ! -f $META_DIR/${base}.json ]]; then
-      rm -f -- "$f"
-    fi
+  # 只清理由本事务删除的入站证书，不碰手工配置引用的文件。
+  local meta f tag
+  [[ -n $TX && -f $CONF ]] || return 0
+  for meta in "$TX/meta"/*.json; do
+    [[ -f $meta ]] || continue
+    [[ ! -f $META_DIR/${meta##*/} ]] || continue
+    tag=${meta##*/}; tag=${tag%.json}
+    valid_tag "$tag" || return 1
+    for f in "$CERT_DIR/${tag}.crt" "$CERT_DIR/${tag}.key"; do
+      [[ -f $f && ! -L $f ]] || continue
+      if jq -e --arg p "$f" 'any(.. | strings; . == $p)' "$CONF" >/dev/null; then
+        continue
+      fi
+      rm -f -- "$f" || return 1
+    done
   done
 }
 
 restore_tree() {
   local live=$1 snap=$2 f rel
   [[ -d $snap ]] || return 0
-  if [[ ! -d $live ]]; then
+  if [[ ! -d $live || -L $live ]]; then
+    rm -rf -- "$live" || return 1
     mkdir -p -- "$live" || return 1
   fi
   while IFS= read -r -d '' f; do
@@ -467,55 +495,163 @@ restore_tree() {
   cp -a "$snap"/. "$live"/
 }
 
+store_revision() {
+  local f
+  for f in "$CONF" "$META_DIR"/*.json; do
+    [[ -f $f ]] || continue
+    sha256sum "$f" || return 1
+  done | sha256sum
+}
+
+service_enabled() {
+  if [[ $OS == alpine ]]; then
+    [[ -L /etc/runlevels/default/sing-box ]]
+  else
+    systemctl is-enabled --quiet sing-box 2>/dev/null
+  fi
+}
+
+disable_service() {
+  if [[ $OS == alpine ]]; then
+    if service_enabled; then
+      rc-update del sing-box default
+    fi
+  else
+    if service_enabled; then
+      systemctl disable sing-box
+    fi
+  fi
+}
+
+tx_path() {
+  case $1 in
+    conf) printf '%s' "$CONF_DIR" ;;
+    meta) printf '%s' "$META_DIR" ;;
+    certs) printf '%s' "$CERT_DIR" ;;
+    service) printf '%s' "$SERVICE_FILE" ;;
+    logrotate) printf '%s' "$LOGROTATE_FILE" ;;
+    *) return 1 ;;
+  esac
+}
+
+snapshot_tx() {
+  local key path
+  if service_enabled; then
+    touch "$TX/enabled" || return 1
+  fi
+  for key in conf meta certs service logrotate; do
+    path=$(tx_path "$key") || return 1
+    [[ ! -L $path ]] || { err "拒绝备份符号链接: ${path}"; return 1; }
+    if [[ -e $path ]]; then
+      cp -a -- "$path" "$TX/$key" || return 1
+    fi
+  done
+  if [[ $TX_MODE == deploy && -e $BIN ]]; then
+    cp -a -- "$BIN" "$TX/binary" || return 1
+  fi
+  touch "$TX/ready"
+}
+
+end_tx() {
+  local saved=$TX
+  TX=""
+  TX_MODE=""
+  exec 9>&-
+  [[ -z $saved ]] || rm -rf -- "$saved"
+  STORE_REV=$(store_revision)
+}
+
 begin_tx() {
-  local lockdir=/run/lock
+  local lockdir=$LOCK_DIR
+  [[ -z $TX ]] || { err "已有未结束的事务。"; return 1; }
+  command -v flock >/dev/null 2>&1 || { err "缺少 flock，无法安全修改。"; return 1; }
   [[ -d $lockdir ]] || lockdir=/var/lock
-  if [[ ! -d $lockdir ]]; then
-    err "缺少锁目录，无法安全修改配置。"
-    return 1
-  fi
+  [[ -d $lockdir ]] || { err "缺少锁目录。"; return 1; }
+  [[ ! -L $lockdir/sing-box-panel.lock ]] || { err "锁文件不能是符号链接。"; return 1; }
   exec 9>"$lockdir/sing-box-panel.lock" || return 1
-  if command -v flock >/dev/null 2>&1 && ! flock -n 9; then
-    err "另一个面板正在修改配置。"
+  if ! flock -n 9; then
+    exec 9>&-
+    err "另一个面板正在修改，请稍后重试。"
     return 1
   fi
-  TX=$(mktemp -d) || return 1
-  TMP_PATHS+=("$TX")
-  mkdir -p "$TX/conf" "$TX/meta" "$TX/certs" || return 1
-  if [[ -d $CONF_DIR ]]; then
-    cp -a "$CONF_DIR"/. "$TX/conf"/ || return 1
+  TX=$(mktemp -d) || { exec 9>&-; return 1; }
+  TX_MODE=${1:-config}
+  if [[ $TX_MODE == config && -n $STORE_REV && $STORE_REV != "$(store_revision)" ]]; then
+    end_tx
+    err "配置已被其他进程修改，请重新进入此菜单。"
+    return 1
   fi
-  if [[ -d $META_DIR ]]; then
-    cp -a "$META_DIR"/. "$TX/meta"/ || return 1
-  fi
-  if [[ -d $CERT_DIR ]]; then
-    cp -a "$CERT_DIR"/. "$TX/certs"/ || return 1
+  TX_WAS_RUNNING=0
+  is_running && TX_WAS_RUNNING=1
+  if ! snapshot_tx; then
+    end_tx
+    return 1
   fi
 }
 
 rollback_tx() {
-  restore_tree "$CONF_DIR" "$TX/conf" || true
-  restore_tree "$META_DIR" "$TX/meta" || true
-  if [[ -d $CERT_DIR ]] || [[ -n $(ls -A "$TX/certs" 2>/dev/null) ]]; then
-    restore_tree "$CERT_DIR" "$TX/certs" || true
+  local key path failed=0 saved=$TX
+  [[ -n $TX && -f $TX/ready ]] || return 1
+  # 在恢复/删除服务文件前清掉本事务创建的启用链接。
+  if [[ ! -f $TX/enabled ]] && service_enabled; then
+    disable_service || failed=1
   fi
-  fix_tree_perms
-  gc_certs
+  for key in conf meta certs service logrotate; do
+    path=$(tx_path "$key") || return 1
+    if [[ -d $TX/$key ]]; then
+      restore_tree "$path" "$TX/$key" || failed=1
+    elif [[ -f $TX/$key ]]; then
+      cp -a -- "$TX/$key" "$path" || failed=1
+    else
+      rm -rf -- "$path" || failed=1
+    fi
+  done
+  if [[ $TX_MODE == deploy ]]; then
+    if [[ -f $TX/binary ]]; then
+      place_binary "$TX/binary" || failed=1
+    else
+      rm -f -- "$BIN" || failed=1
+    fi
+  fi
+  if [[ $OS == debian ]] && command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload || failed=1
+    if [[ -f $TX/enabled ]]; then
+      systemctl enable sing-box >/dev/null 2>&1 || failed=1
+    elif [[ -f $SERVICE_FILE ]]; then
+      systemctl disable sing-box >/dev/null 2>&1 || failed=1
+    fi
+  elif [[ $OS == alpine ]] && command -v rc-update >/dev/null 2>&1; then
+    if [[ -f $TX/enabled ]]; then
+      rc-update add sing-box default >/dev/null 2>&1 || failed=1
+    elif service_enabled; then
+      rc-update del sing-box default >/dev/null 2>&1 || failed=1
+    fi
+  fi
+  if ((failed)); then
+    # 恢复失败保留快照供人工救援，绝不把失败伪装成“已回滚”。
+    TX=""
+    TX_MODE=""
+    exec 9>&-
+    err "恢复不完整，请保留并检查快照: ${saved}"
+    return 1
+  fi
+  end_tx
 }
 
 box_as_user() {
-  local bin=$1 log=$2 conf=$3 cmd
-  cmd=$(printf '%q check -c %q' "$bin" "$conf")
-  if id -u sing-box >/dev/null 2>&1 && command -v su >/dev/null 2>&1; then
-    su -s /bin/sh -c "$cmd" sing-box >"$log" 2>&1
-  else
-    "$bin" check -c "$conf" >"$log" 2>&1
+  local bin=$1 log=$2 conf=$3
+  if ! id -u sing-box >/dev/null 2>&1 || ! command -v su >/dev/null 2>&1; then
+    printf '%s\n' '缺少 sing-box 用户或 su，拒绝以 root 代替校验。' >"$log"
+    return 1
   fi
+  # 参数由目标 /bin/sh 展开，而非当前 Bash；账户已校验 sing-box 为主组。
+  # shellcheck disable=SC2016
+  su -s /bin/sh -c 'exec "$1" check -c "$2"' sing-box sh "$bin" "$conf" >"$log" 2>&1
 }
 
 box_test() {
   local log
-  log=$(mktemp)
+  log=$(mktemp) || return 1
   TMP_PATHS+=("$log")
   if [[ ! -x $BIN ]]; then
     err "未找到 sing-box，无法校验配置。"
@@ -526,43 +662,29 @@ box_test() {
     return 1
   fi
   if box_as_user "$BIN" "$log" "$CONF"; then
+    rm -f -- "$log"
     return 0
   fi
   err "配置校验失败:"
   cat "$log" >&4 || true
+  rm -f -- "$log"
   ui "$GRN"
   return 1
 }
 
 is_running() {
-  if [[ ! -x $BIN ]]; then
-    return 1
-  fi
+  [[ -x $BIN ]] || return 1
   if [[ $OS == alpine ]]; then
     command -v rc-service >/dev/null 2>&1 || return 1
-    local out
-    out=$(rc-service sing-box status 2>/dev/null || true)
-    [[ $out == *started* ]]
+    rc-service sing-box status >/dev/null 2>&1
   else
     command -v systemctl >/dev/null 2>&1 || return 1
     systemctl is-active --quiet sing-box
   fi
 }
 
-service_installed() {
-  if [[ $OS == alpine ]]; then
-    [[ -x /etc/init.d/sing-box ]]
-  else
-    [[ -f /etc/systemd/system/sing-box.service ]]
-  fi
-}
-
 service_uses_panel_conf() {
-  if [[ $OS == alpine ]]; then
-    [[ -f /etc/init.d/sing-box ]] && grep -q -- 'run -c /usr/local/etc/sing-box/config.json' /etc/init.d/sing-box
-  else
-    [[ -f /etc/systemd/system/sing-box.service ]] && grep -q -- 'run -c /usr/local/etc/sing-box/config.json' /etc/systemd/system/sing-box.service
-  fi
+  [[ -f $SERVICE_FILE ]] && grep -qF 'sing-box-panel-v2' "$SERVICE_FILE"
 }
 
 drop_file_caps() {
@@ -576,16 +698,17 @@ drop_file_caps() {
 install_service() {
   if [[ $OS == alpine ]]; then
     if ! command -v rc-service >/dev/null 2>&1; then
-      apk add --no-cache openrc
+      apk add --no-cache openrc || return 1
     fi
-    cat >/etc/init.d/sing-box <<'EOF'
+    cat >"$SERVICE_FILE" <<'EOF' || return 1
 #!/sbin/openrc-run
+# sing-box-panel-v2
 
 description="sing-box Service"
 
 supervisor=supervise-daemon
 command="/usr/local/bin/sing-box"
-command_args="run -c /usr/local/etc/sing-box/config.json -D /var/lib/sing-box"
+command_args="run -c /usr/local/etc/sing-box/config.json -D /var/lib/sing-box/runtime"
 command_user="sing-box:sing-box"
 pidfile="/run/${RC_SVCNAME}.pid"
 capabilities="^cap_net_bind_service"
@@ -600,15 +723,16 @@ depend() {
 	after firewall
 }
 EOF
-    chmod 755 /etc/init.d/sing-box
-    rc-update add sing-box default >/dev/null 2>&1 || rc-update add sing-box default || true
+    chmod 755 "$SERVICE_FILE" || return 1
+    rc-update add sing-box default >/dev/null 2>&1 || return 1
     drop_file_caps "$BIN"
   else
     if ! command -v systemctl >/dev/null 2>&1; then
       err "Debian 需要 systemd。"
       return 1
     fi
-    cat >/etc/systemd/system/sing-box.service <<'EOF'
+    cat >"$SERVICE_FILE" <<'EOF' || return 1
+# sing-box-panel-v2
 [Unit]
 Description=sing-box Service
 Documentation=https://sing-box.sagernet.org/
@@ -621,21 +745,27 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=yes
 UMask=0077
-ExecStart=/usr/local/bin/sing-box run -c /usr/local/etc/sing-box/config.json -D /var/lib/sing-box
+ExecStart=/usr/local/bin/sing-box run -c /usr/local/etc/sing-box/config.json -D /var/lib/sing-box/runtime
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2s
 LimitNPROC=10000
 LimitNOFILE=1000000
-StateDirectory=sing-box
-StateDirectoryMode=0750
+# 面板的元数据和证书不属于内核的可写状态目录。
+WorkingDirectory=/var/lib/sing-box/runtime
+ProtectSystem=strict
+ReadWritePaths=/var/lib/sing-box/runtime /var/log/sing-box
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    chmod 644 /etc/systemd/system/sing-box.service
+    chmod 644 "$SERVICE_FILE" || return 1
     if [[ -d /etc/logrotate.d ]]; then
-      cat >/etc/logrotate.d/sing-box <<'EOF'
+      cat >"$LOGROTATE_FILE" <<'EOF' || return 1
 /var/log/sing-box/*.log {
     daily
     missingok
@@ -644,23 +774,23 @@ EOF
     delaycompress
     notifempty
     copytruncate
-    su sing-box sing-box
+    su root root
 }
 EOF
-      chmod 644 /etc/logrotate.d/sing-box
+      chmod 644 "$LOGROTATE_FILE" || return 1
     fi
-    systemctl daemon-reload
+    systemctl daemon-reload || return 1
     plainln "  设置开机启动"
-    systemctl enable sing-box >/dev/null 2>&1
+    systemctl enable sing-box >/dev/null 2>&1 || return 1
     drop_file_caps "$BIN"
   fi
 }
 
 svc() {
   if [[ $OS == alpine ]]; then
-    rc-service sing-box "$1"
+    rc-service sing-box "$1" 9>&-
   else
-    systemctl "$1" sing-box
+    systemctl "$1" sing-box 9>&-
   fi
 }
 
@@ -684,33 +814,48 @@ show_service_log() {
   ui "$GRN"
 }
 
+abort_tx() {
+  local message=$1 was=$TX_WAS_RUNNING
+  err "$message"
+  if ((was)) && is_running; then
+    svc stop || { err "无法停止服务，保留事务等待退出时恢复。"; return 1; }
+  fi
+  if rollback_tx; then
+    if ((was)); then
+      if kernel_stays_up restart; then
+        plainln "  已恢复修改前的配置与服务。"
+      else
+        err "文件已恢复，但服务未能恢复运行。"
+        show_service_log
+      fi
+    else
+      plainln "  已恢复修改前的文件。"
+    fi
+  fi
+  return 1
+}
+
 commit_tx() {
-  if ! box_test; then
-    rollback_tx
-    err "已回滚本次修改。"
+  if ! fix_tree_perms || ! box_test; then
+    abort_tx "配置校验失败。"
     return 1
   fi
-  fix_tree_perms
   if ! service_uses_panel_conf; then
-    plainln "  正在把服务切换到面板配置。"
-    if ! install_service; then
-      rollback_tx
-      err "无法更新服务文件，已回滚。"
-      return 1
-    fi
+    plainln "  正在更新服务配置。"
+    install_service || { abort_tx "服务更新失败。"; return 1; }
   fi
-  if is_running; then
+  if ((TX_WAS_RUNNING)); then
     if ! kernel_stays_up restart; then
-      rollback_tx
-      svc restart || true
-      err "重启失败，已回滚。"
       show_service_log
+      abort_tx "重启失败。"
       return 1
     fi
-    plainln "  配置已生效，内核已重启。"
+    plainln "  配置已生效，服务已重启。"
   else
-    plainln "  配置已保存。内核当前未运行，可在主菜单选择 3 启动。"
+    plainln "  配置已保存 · 服务未启动（主菜单 3）。"
   fi
+  gc_certs || warn "部分闲置证书未能清理。"
+  end_tx
 }
 
 current_version() {
@@ -761,7 +906,7 @@ latest_version() {
   url=$(curl -fsSL -o /dev/null -w '%{url_effective}' --retry 3 --retry-delay 2 \
     "https://github.com/${REPO}/releases/latest") || return 1
   tag=${url##*/}
-  if [[ ! $tag =~ ^v?[0-9] ]]; then
+  if [[ ! $tag =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     return 1
   fi
   printf 'v%s' "${tag#v}"
@@ -787,26 +932,27 @@ kernel_state() {
 }
 
 status_text() {
-  local state=$1 ver=$2 count=$3
-  local mark left mid right gap
-  case $state in
-    运行中) mark="${GRN}●${GRN}" ;;
-    未运行) mark="${YEL}●${GRN}" ;;
-    *) mark="${RED}●${GRN}" ;;
+  local color=$RED
+  case $1 in
+    运行中) color=$GRN ;;
+    未运行) color=$YEL ;;
   esac
-  left="● ${state}"
-  mid=$ver
-  right="入站 ${count}"
-  gap=$((WIDTH - $(dw "$left") - $(dw "$mid") - $(dw "$right")))
-  ((gap < 2)) && gap=2
-  printf '%b%s%b%s%s%s' "$mark" " ${state}" "$GRN" "$(spaces $((gap / 2)))" "$mid" "$(spaces $((gap - gap / 2)))$right"
+  printf '%b● %s%b  |  %s  |  面板入站 %s' "$color" "$1" "$RST" "$2" "$3"
 }
 
 menu_row() {
   local n1=$1 l1=$2 n2=$3 l2=$4
-  printf '  %s%s  %s%s\n' \
-    "$(pad "$n1" 3)" "$(pad "$l1" 16)" \
-    "$(pad "$n2" 3)" "$l2" >&4
+  printf '  %b%s%b%s  %b%s%b%s\n' \
+    "$ACC" "$(pad "$n1" "$MENU_NUM_W")" "$RST" "$(pad "$l1" "$MENU_LABEL_W")" \
+    "$ACC" "$(pad "$n2" "$MENU_NUM_W")" "$RST" "$l2" >&4
+}
+
+print_menu_rows() {
+  local spec n1 l1 n2 l2
+  for spec in "$@"; do
+    read -r n1 l1 n2 l2 <<<"$spec"
+    menu_row "$n1" "$l1" "$n2" "$l2"
+  done
 }
 
 draw_panel() {
@@ -816,20 +962,20 @@ draw_panel() {
   count=$(count_inbounds)
   cls
   blank
-  uin "  ${BOLD}sing-box${OFFBOLD}"
-  uin "  ${RULE}"
+  uin "  ${ACC}${BOLD}SING-BOX${RST}  ${DIM}服务与入站管理${RST}"
+  uin "  ${DIM}${RULE}${RST}"
   uin "  $(status_text "$state" "$ver" "$count")"
-  uin "  ${RULE}"
+  uin "  ${DIM}${RULE}${RST}"
   blank
-  note "内核"
-  menu_row "1" "安装" "2" "升级"
-  menu_row "3" "启动" "4" "停止"
-  item "5" "卸载"
+  note "01 / 内核服务"
+  print_menu_rows "${PANEL_KERNEL[@]}"
+  item "5" "卸载内核"
   blank
-  note "入站"
-  menu_row "6" "添加" "7" "修改"
-  menu_row "8" "分享" "9" "删除"
-  item "10" "日志"
+  note "02 / 入站配置"
+  print_menu_rows "${PANEL_INBOUND[@]}"
+  blank
+  note "03 / 诊断"
+  print_menu_rows "${PANEL_DIAG[@]}"
   blank
 }
 
@@ -864,7 +1010,7 @@ github_asset_sha() {
 download_release() {
   local version=$1 dest=$2 machine url name sum actual inner libc=""
   machine=$(asset_arch) || return 1
-  # 不带后缀的 linux-* 包链接 glibc。Alpine 必须用 -musl，否则动态链接器不存在，执行报 not found。
+  # Alpine 显式选择 musl 构建，避免依赖 glibc 动态链接器。
   if [[ $OS == alpine ]]; then
     libc="-musl"
   fi
@@ -885,7 +1031,8 @@ download_release() {
     err "SHA256 校验失败。"
     return 1
   fi
-  if tar -tzf "$dest/sing-box.tar.gz" | grep -qE '(^|/)\.\.(/|$)|^/'; then
+  if ! tar -tzf "$dest/sing-box.tar.gz" >"$dest/entries" \
+    || grep -qE '(^|/)\.\.(/|$)|^/' "$dest/entries"; then
     err "压缩包路径不安全。"
     return 1
   fi
@@ -897,13 +1044,13 @@ download_release() {
   if [[ ! -d $inner ]]; then
     inner=$(find "$dest" -mindepth 1 -maxdepth 1 -type d -name 'sing-box-*' | head -n 1)
   fi
-  if [[ -z $inner || ! -f $inner/sing-box ]]; then
+  if [[ -z $inner || ! -f $inner/sing-box || -L $inner || -L $inner/sing-box ]]; then
     err "压缩包中没有 sing-box。"
     return 1
   fi
-  mkdir -p "$dest/pack"
-  cp -- "$inner/sing-box" "$dest/pack/sing-box"
-  chmod 755 "$dest/pack/sing-box"
+  mkdir -p "$dest/pack" || return 1
+  cp -- "$inner/sing-box" "$dest/pack/sing-box" || return 1
+  chmod 755 "$dest/pack/sing-box" || return 1
   if ! "$dest/pack/sing-box" version >/dev/null 2>&1; then
     err "二进制无法执行，请确认架构是否匹配。"
     return 1
@@ -912,12 +1059,16 @@ download_release() {
 
 place_binary() {
   local src=$1 new
-  new=/usr/local/bin/sing-box.new
-  cp -- "$src" "$new" || return 1
+  [[ ! -L $BIN ]] || return 1
+  new=$(mktemp -p "$(dirname "$BIN")" .sing-box.XXXXXX) || return 1
+  cp -- "$src" "$new" || { rm -f -- "$new"; return 1; }
   chown root:root "$new" || { rm -f -- "$new"; return 1; }
   chmod 755 "$new" || { rm -f -- "$new"; return 1; }
   drop_file_caps "$new"
-  mv -f -- "$new" "$BIN"
+  if ! mv -f -- "$new" "$BIN"; then
+    rm -f -- "$new"
+    return 1
+  fi
 }
 
 deploy_pack() {
@@ -927,17 +1078,47 @@ deploy_pack() {
   place_binary "$src/sing-box" || return 1
   ensure_base_config || return 1
   rebuild_config || return 1
-  fix_tree_perms || return 1
+  fix_tree_perms && box_test || return 1
   install_service
 }
 
-restore_binary() {
-  local saved=$1
-  if [[ -n $saved && -f $saved ]]; then
-    place_binary "$saved" || return 1
-  else
-    rm -f -- "$BIN"
+apply_pack() {
+  local src=$1
+  begin_tx deploy || return 1
+  if ! deploy_pack "$src"; then
+    abort_tx "内核部署失败。"
+    return 1
   fi
+  if ((TX_WAS_RUNNING)) && ! kernel_stays_up restart; then
+    show_service_log
+    abort_tx "新内核未能保持运行。"
+    return 1
+  fi
+  end_tx
+}
+
+resolve_latest() {
+  local version
+  plainln "  获取最新版本..."
+  version=$(latest_version) || {
+    err "无法获取 sing-box 版本，请检查到 GitHub 的网络。"
+    pause
+    return 1
+  }
+  plainln "  最新版本 ${version}"
+  printf '%s' "$version"
+}
+
+stage_release() {
+  local work
+  work=$(mktemp -d) || { err "无法创建下载目录。"; pause; return 1; }
+  TMP_PATHS+=("$work")
+  if ! download_release "$1" "$work"; then
+    rm -rf -- "$work"
+    pause
+    return 1
+  fi
+  printf '%s' "$work"
 }
 
 install_kernel() {
@@ -948,31 +1129,11 @@ install_kernel() {
     pause
     return 0
   fi
-  if ! ensure_deps; then
-    err "依赖安装失败。"
-    pause
-    return 0
-  fi
-  plainln "  获取最新版本..."
-  version=$(latest_version) || {
-    err "无法获取 sing-box 版本，请检查到 GitHub 的网络。"
-    pause
-    return 0
-  }
-  plainln "  最新版本 ${version}"
-  work=$(mktemp -d)
-  TMP_PATHS+=("$work")
-  mkdir -p "$work/pack"
-  if ! download_release "$version" "$work"; then
-    pause
-    return 0
-  fi
-  deploy_pack "$work/pack" || { pause; return 0; }
-  if ! box_test; then
-    warn "内核已安装，但基础配置未通过校验。"
-    pause
-    return 0
-  fi
+  deps_ok || return 0
+  version=$(resolve_latest) || return 0
+  work=$(stage_release "$version") || return 0
+  apply_pack "$work/pack" || { rm -rf -- "$work"; pause; return 0; }
+  rm -rf -- "$work"
   blank
   plainln "  安装完成。"
   kv "版本" "$(current_version)"
@@ -986,27 +1147,17 @@ install_kernel() {
 }
 
 upgrade_kernel() {
-  local work version current cmp was=0 saved=""
+  local work version current cmp
   header "升级内核"
   if [[ ! -x $BIN ]]; then
     err "请先安装内核。"
     pause
     return 0
   fi
-  if ! ensure_deps; then
-    err "依赖安装失败。"
-    pause
-    return 0
-  fi
+  deps_ok || return 0
   current=$(current_version)
   plainln "  当前版本 ${current}"
-  plainln "  获取最新版本..."
-  version=$(latest_version) || {
-    err "无法获取 sing-box 版本，请检查到 GitHub 的网络。"
-    pause
-    return 0
-  }
-  plainln "  最新版本 ${version}"
+  version=$(resolve_latest) || return 0
   cmp=$(ver_cmp "$version" "$current")
   if [[ $cmp -le 0 ]]; then
     if [[ $cmp -eq 0 ]]; then
@@ -1016,54 +1167,25 @@ upgrade_kernel() {
     fi
     confirm "是否仍要重新安装此版本？" || return 0
   fi
-  work=$(mktemp -d)
-  TMP_PATHS+=("$work")
-  mkdir -p "$work/pack"
-  if ! download_release "$version" "$work"; then
-    pause
-    return 0
-  fi
+  work=$(stage_release "$version") || return 0
   if [[ -f $CONF ]]; then
     plainln "  用新版本校验现有配置..."
-    chmod 755 "$work" "$work/pack" "$work/pack/sing-box"
+    # 只让服务账户穿越目录，不公开列出下载及诊断文件。
+    chmod 711 "$work" "$work/pack" || { pause; return 0; }
     if ! box_as_user "$work/pack/sing-box" "$work/test.err" "$CONF"; then
       err "新版本无法加载当前配置，已取消升级。"
       cat "$work/test.err" >&4 || true
+      rm -rf -- "$work"
       ui "$GRN"
       pause
       return 0
     fi
   fi
-  is_running && was=1
-  if [[ -x $BIN ]]; then
-    saved=$work/sing-box.prev
-    cp -a -- "$BIN" "$saved" || {
-      err "无法备份当前内核，已取消升级。"
-      pause
-      return 0
-    }
+  if apply_pack "$work/pack"; then
+    plainln "  已升级到 $(current_version)。"
+    is_running || note "服务未启动，可在主菜单选择 3。"
   fi
-  if ! deploy_pack "$work/pack"; then
-    restore_binary "$saved" || err "恢复旧内核失败。"
-    pause
-    return 0
-  fi
-  if [[ $was -eq 1 ]]; then
-    if kernel_stays_up restart; then
-      plainln "  已升级到 $(current_version)，内核已重启。"
-    else
-      err "新内核未能保持运行，正在恢复旧版本。"
-      show_service_log
-      if restore_binary "$saved" && install_service && kernel_stays_up restart; then
-        plainln "  已恢复到 ${current}。"
-      else
-        err "恢复旧内核失败。"
-        show_service_log
-      fi
-    fi
-  else
-    plainln "  已升级到 $(current_version)。内核当前未运行。"
-  fi
+  rm -rf -- "$work"
   pause
 }
 
@@ -1074,12 +1196,21 @@ start_kernel() {
     pause
     return 0
   fi
-  if ! service_installed; then
-    plainln "  服务文件不存在，正在修复..."
-    create_box_user || { pause; return 0; }
-    ensure_dirs
-    ensure_base_config
-    install_service || { pause; return 0; }
+  deps_ok || return 0
+  if ! service_uses_panel_conf; then
+    plainln "  正在修复服务与运行目录..."
+    begin_tx service || { pause; return 0; }
+    if ! create_box_user || ! ensure_dirs || ! ensure_base_config || ! box_test || ! install_service; then
+      abort_tx "服务修复失败。"
+      pause
+      return 0
+    fi
+    if ((TX_WAS_RUNNING)) && ! kernel_stays_up restart; then
+      abort_tx "服务迁移失败。"
+      pause
+      return 0
+    fi
+    end_tx
   fi
   if is_running; then
     plainln "  内核已在运行。"
@@ -1117,65 +1248,56 @@ stop_kernel() {
 }
 
 uninstall_kernel() {
+  local purge=0 kept=0
   header "卸载内核"
-  if [[ ! -x $BIN && ! -f $CONF ]] && ! service_installed; then
-    plainln "  内核未安装。"
-    pause
-    return 0
+  if [[ ! -x $BIN && ! -f $CONF && ! -f $SERVICE_FILE ]]; then
+    note "内核未安装。"; pause; return 0
   fi
-  plainln "  将停止服务并删除内核程序和服务文件。"
-  local purge=0
+  note "停止服务并删除内核；默认保留所有配置。"
   confirm "确认卸载？" || return 0
-  if confirm "是否同时清除面板配置、证书、日志和 sing-box 用户？"; then
-    purge=1
+  confirm "同时清除面板入站和日志？（手工入站仍保留）" && purge=1
+  if ! ensure_deps || ! begin_tx deploy; then
+    pause; return 0
   fi
-  if is_running || service_installed; then
-    if [[ $OS == alpine ]]; then
-      rc-service sing-box stop >/dev/null 2>&1 || true
-      rc-update del sing-box default >/dev/null 2>&1 || true
-    else
-      systemctl disable --now sing-box >/dev/null 2>&1 || true
-    fi
+  if ((TX_WAS_RUNNING)) && ! svc stop; then
+    abort_tx "无法停止服务，已取消卸载。"; pause; return 0
   fi
-  rm -f -- "$BIN" /usr/local/bin/sing-box.new
-  if [[ $OS == alpine ]]; then
-    rm -f -- /etc/init.d/sing-box
-  else
-    rm -f -- /etc/systemd/system/sing-box.service /etc/logrotate.d/sing-box
-    if command -v systemctl >/dev/null 2>&1; then
-      systemctl daemon-reload || true
-    fi
+  if ! disable_service; then
+    abort_tx "无法取消开机启动。"; pause; return 0
   fi
-  if [[ $purge -eq 1 ]]; then
-    local f kept=0
-    if [[ -f $CONF ]]; then
-      rm -f -- "$CONF"
+  if ((purge)); then
+    if ! rm -f -- "$META_DIR"/*.json || ! rebuild_config; then
+      abort_tx "无法清理面板入站。"; pause; return 0
     fi
-    for f in "$CONF_DIR"/*; do
-      [[ -e $f ]] || continue
+    gc_certs || warn "部分闲置证书未能删除。"
+    if jq -e '.inbounds | length > 0' "$CONF" >/dev/null; then
       kept=1
-    done
-    rm -rf -- "$LOG_DIR" "$STATE_DIR"
-    if [[ $kept -eq 0 ]]; then
-      rmdir "$CONF_DIR" 2>/dev/null || true
-      if id -u sing-box >/dev/null 2>&1; then
-        if [[ $OS == alpine ]]; then
-          deluser sing-box >/dev/null 2>&1 || true
-          delgroup sing-box >/dev/null 2>&1 || true
-        else
-          userdel sing-box >/dev/null 2>&1 || true
-          groupdel sing-box >/dev/null 2>&1 || true
-        fi
-      fi
-      plainln "  内核、面板配置、日志和用户已清除。"
     else
-      plainln "  内核和面板配置已清除。已保留原有配置文件，因此未删除 sing-box 用户。"
+      rm -f -- "$CONF" || { abort_tx "无法删除配置。"; pause; return 0; }
     fi
-  else
-    plainln "  内核已卸载。配置与日志仍保留在:"
-    plainln "  ${CONF}"
-    plainln "  ${LOG_DIR}"
   fi
+  if ! rm -f -- "$BIN" "$SERVICE_FILE" "$LOGROTATE_FILE"; then
+    abort_tx "无法删除内核或服务文件。"; pause; return 0
+  fi
+  if [[ $OS == debian ]]; then
+    systemctl daemon-reload || { abort_tx "无法重载服务管理器。"; pause; return 0; }
+  fi
+  end_tx
+  if ((purge)); then
+    [[ -z $(find "$CONF_DIR" -mindepth 1 -print -quit 2>/dev/null) ]] || kept=1
+    if ((kept)); then
+      note "手工配置、证书与 sing-box 用户已保留。"
+    else
+      rm -rf -- "$STATE_DIR" || warn "状态目录未能完全删除。"
+      rmdir "$CONF_DIR" 2>/dev/null || true
+      # 不自动删除可能由系统管理员创建或被其他服务使用的账户。
+      note "保留 sing-box 系统账户，便于安全重装。"
+    fi
+    rm -rf -- "$LOG_DIR" || warn "日志未能完全删除。"
+  else
+    note "已保留配置: ${CONF}"
+  fi
+  plainln "  卸载完成。"
   pause
 }
 
@@ -1194,39 +1316,35 @@ show_file() {
 }
 
 follow_log() {
-  local file=$1 pid
   header "实时日志"
-  if [[ ! -f $file ]]; then
-    plainln "  暂无日志。"
+  note "Ctrl+C 返回"
+  blank
+  if [[ $OS == debian ]]; then
+    journalctl -u sing-box -n 20 -f --no-pager >&4 &
+  elif [[ -f $STDERR_LOG ]]; then
+    tail -n 20 -f -- "$STDERR_LOG" >&4 &
+  else
+    note "暂无日志。"
     pause
     return 0
   fi
-  note "Ctrl+C 返回"
-  blank
-  tail -n 20 -f -- "$file" >&4 &
-  pid=$!
-  trap 'kill "$pid" 2>/dev/null || true' INT
-  wait "$pid" 2>/dev/null || true
-  trap - INT
-  ui "$GRN"
+  FOLLOW_PID=$!
+  trap 'kill "$FOLLOW_PID" 2>/dev/null || true' INT
+  wait "$FOLLOW_PID" 2>/dev/null || true
+  FOLLOW_PID=""
+  trap 'exit 130' INT
+  ui "$RST"
   ui $'\n'
 }
 
 view_logs() {
   local choice
   while true; do
-    choice=$(choose "日志" "返回" "错误日志" "实时跟踪错误日志" "服务日志") || return 0
+    choice=$(choose "日志" "返回" "最近服务日志" "实时跟踪" "标准输出日志（OpenRC）") || return 0
     case $choice in
-      1) show_file "错误日志" "$STDERR_LOG" ;;
-      2) follow_log "$STDERR_LOG" ;;
-      3)
-        header "服务日志"
-        show_service_log
-        if ! is_running && [[ ! -s $STDERR_LOG ]]; then
-          plainln "  暂无服务日志。"
-        fi
-        pause
-        ;;
+      1) header "服务日志"; show_service_log; pause ;;
+      2) follow_log ;;
+      3) show_file "标准输出日志" "$STDOUT_LOG" ;;
     esac
   done
 }
@@ -1247,7 +1365,7 @@ uses_udp() {
   if [[ $proto == hysteria2 ]]; then
     return 0
   fi
-  if [[ $proto == shadowsocks && $net == *udp* ]]; then
+  if [[ $proto == shadowsocks && ( -z $net || $net == *udp* ) ]]; then
     return 0
   fi
   return 1
@@ -1255,7 +1373,9 @@ uses_udp() {
 
 listen_clash() {
   local a=$1 b=$2
-  [[ $a == "$b" || $a == 0.0.0.0 || $b == 0.0.0.0 || $a == :: || $b == :: ]]
+  [[ $a == "$b" || $a == :: || $b == :: ]] && return 0
+  # IPv4 通配监听不会占用一个独立 IPv6 地址。
+  [[ $a == 0.0.0.0 && $b != *:* || $b == 0.0.0.0 && $a != *:* ]]
 }
 
 endpoint_hits() {
@@ -1276,7 +1396,7 @@ endpoint_hits() {
 
 port_conflict() {
   local port=$1 except=$2 proto=$3 network=$4 listen=${5:-0.0.0.0}
-  local f etag ep eproto enet elisten base nt=0 nu=0 rc
+  local f etag ep eproto enet elisten nt=0 nu=0 rc
   CONFLICT_TAG=""
   uses_tcp "$proto" "$network" && nt=1
   uses_udp "$proto" "$network" && nu=1
@@ -1312,7 +1432,7 @@ port_conflict() {
 }
 
 is_domain() {
-  [[ $1 =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,62}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,62}[A-Za-z0-9])?)+$ ]]
+  [[ ${#1} -le 253 && $1 =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]]
 }
 
 is_ipv4() {
@@ -1373,15 +1493,11 @@ ask_port() {
   while true; do
     ans=$(prompt "端口" "$default" "q 取消") || return 2
     cancelled "$ans" && return 2
-    if [[ ! $ans =~ ^[0-9]+$ ]]; then
+    if [[ ! $ans =~ ^[0-9]{1,5}$ ]] || ((10#$ans < 1 || 10#$ans > 65535)); then
       err "端口须为 1-65535。"
       continue
     fi
     p=$((10#$ans))
-    if ((p < 1 || p > 65535)); then
-      err "端口须为 1-65535。"
-      continue
-    fi
     if port_conflict "$p" "$except" "$proto" "$network" "$listen"; then
       err "端口 ${p} 与入站 ${CONFLICT_TAG} 冲突。"
       continue
@@ -1396,8 +1512,8 @@ ask_remark() {
   while true; do
     ans=$(prompt "备注" "$default" "q 取消") || return 2
     cancelled "$ans" && return 2
-    if [[ -z $ans ]]; then
-      err "备注不能为空。"
+    if [[ -z $ans || ${#ans} -gt 80 || $ans == *[[:cntrl:]]* ]]; then
+      err "备注须为 1–80 个字符，不能包含控制字符。"
       continue
     fi
     printf '%s' "$ans"
@@ -1419,21 +1535,21 @@ ask_name() {
     if ! is_ipv6 "$ans" && [[ $ans =~ ^([A-Za-z0-9.-]+):([0-9]+)$ ]]; then
       host=${BASH_REMATCH[1]}
       tport=${BASH_REMATCH[2]}
-      if ((10#$tport < 1 || 10#$tport > 65535)); then
+      if [[ ${#tport} -gt 5 ]] || ((10#$tport < 1 || 10#$tport > 65535)); then
         err "端口不合法。"
         continue
       fi
     fi
     if [[ $mode == domain ]]; then
       if [[ $host =~ [A-Za-z] ]] && is_domain "$host"; then
-        printf '%s\n%s' "$host" "$tport"
+        printf '%s\n%s' "$host" "$((10#$tport))"
         return 0
       fi
       err "请输入域名，例如 www.microsoft.com。不要使用 Cloudflare CDN 站点。"
       continue
     fi
     if is_ipv4 "$host" || is_ipv6 "$host" || is_domain "$host"; then
-      printf '%s\n%s' "$host" "$tport"
+      printf '%s\n%s' "$host" "$((10#$tport))"
       return 0
     fi
     err "请输入域名、IPv4 或 IPv6。"
@@ -1447,39 +1563,45 @@ ask_choice() {
   if [[ -z $ans ]]; then
     return 5
   fi
-  if [[ $ans =~ ^[0-9]+$ ]] && ((10#$ans >= 1 && 10#$ans <= max)); then
+  if [[ $ans =~ ^[0-9]{1,3}$ ]] && ((10#$ans >= 1 && 10#$ans <= max)); then
     printf '%s' "$((10#$ans))"
     return 0
   fi
   return 4
 }
 
+choice_menu() {
+  local mode=$1 title=$2 hint=$3 subtitle=$4
+  shift 4
+  local -a rows=("$@")
+  local choice msg='' rc i
+  while true; do
+    header "$title"
+    [[ -z $subtitle ]] || { note "$subtitle"; blank; }
+    for ((i = 0; i < ${#rows[@]}; i++)); do
+      if [[ $mode == fields ]]; then
+        printf '  %b%s%b%s%s\n' "$ACC" "$(pad "$((i + 1))" "$MENU_NUM_W")" "$RST" \
+          "$(pad "${rows[i]%%=*}" 9)" "${rows[i]#*=}" >&4
+      else
+        item "$((i + 1))" "${rows[i]}"
+      fi
+    done
+    blank
+    [[ -z $msg ]] || err "$msg"
+    next_choice choice msg "${#rows[@]}" "$hint"
+    rc=$?
+    case $rc in
+      0) printf '%s' "$choice"; return 0 ;;
+      1) ;;
+      *) return "$rc" ;;
+    esac
+  done
+}
+
 choose() {
   local title=$1 hint=$2
   shift 2
-  local -a rows=("$@")
-  local choice msg="" rc n=${#rows[@]}
-  while true; do
-    header "$title"
-    for ((choice = 0; choice < n; choice++)); do
-      item "$((choice + 1))" "${rows[choice]}"
-    done
-    blank
-    if [[ -n $msg ]]; then
-      err "$msg"
-    fi
-    msg=""
-    next_choice choice msg "$n" "$hint"
-    rc=$?
-    if [[ $rc -eq 0 ]]; then
-      printf '%s' "$choice"
-      return 0
-    fi
-    if [[ $rc -eq 1 ]]; then
-      continue
-    fi
-    return "$rc"
-  done
+  choice_menu items "$title" "$hint" '' "$@"
 }
 
 next_choice() {
@@ -1532,13 +1654,21 @@ ask_ss_network() {
   esac
 }
 
-gen_ss_password() {
-  local method=$1
-  case $method in
-    2022-blake3-aes-128-gcm) openssl rand -base64 16 | tr -d '\n' ;;
-    2022-blake3-aes-256-gcm | 2022-blake3-chacha20-poly1305) openssl rand -base64 32 | tr -d '\n' ;;
-    *) openssl rand -base64 24 | tr -d '\n' ;;
+ss_key_bytes() {
+  case $1 in
+    2022-blake3-aes-128-gcm) printf '16' ;;
+    2022-blake3-aes-256-gcm | 2022-blake3-chacha20-poly1305) printf '32' ;;
+    *) return 1 ;;
   esac
+}
+
+gen_ss_password() {
+  local need
+  if need=$(ss_key_bytes "$1"); then
+    openssl rand -base64 "$need" | tr -d '\n'
+  else
+    openssl rand -base64 24 | tr -d '\n'
+  fi
 }
 
 gen_uuid() {
@@ -1563,7 +1693,7 @@ gen_reality_pair() {
     err "请先安装内核，才能生成 REALITY 密钥。"
     return 1
   fi
-  out=$("$BIN" generate reality-keypair 2>&1 | tr -d '\r') || true
+  out=$("$BIN" generate reality-keypair 2>&1 | tr -d '\r') || return 1
   priv=$(printf '%s\n' "$out" | awk '/[Pp]rivate[Kk]ey/{print $NF; exit}')
   pub=$(printf '%s\n' "$out" | awk '/[Pp]ublic[Kk]ey/{print $NF; exit}')
   if [[ -z $priv || -z $pub ]]; then
@@ -1578,7 +1708,7 @@ is_uuid() {
 }
 
 ask_uuid() {
-  local current=$1 ans bytes
+  local current=$1 ans
   while true; do
     if [[ -n $current ]]; then
       ans=$(prompt "UUID" "" "回车保留，g 重新生成，q 取消") || return 2
@@ -1590,20 +1720,19 @@ ask_uuid() {
       if [[ -n $current ]]; then
         printf '%s' "$current"
       else
-        gen_uuid
+        gen_uuid || return 1
       fi
       return 0
     fi
     if is_regen "$ans"; then
-      gen_uuid
+      gen_uuid || return 1
       return 0
     fi
-    bytes=$(printf '%s' "$ans" | wc -c | tr -d ' ')
-    if is_uuid "$ans" || ((bytes > 0 && bytes < 30)); then
+    if is_uuid "$ans"; then
       printf '%s' "$ans"
       return 0
     fi
-    err "UUID 不合法。可留空自动生成，或输入少于 30 字节的字符串。"
+    err "请输入标准 UUID，或留空自动生成。"
   done
 }
 
@@ -1623,17 +1752,17 @@ ask_password() {
         fi
         printf '%s' "$current"
       elif [[ -n $method ]]; then
-        gen_ss_password "$method"
+        gen_ss_password "$method" || return 1
       else
-        gen_auth
+        gen_auth || return 1
       fi
       return 0
     fi
     if is_regen "$ans"; then
       if [[ -n $method ]]; then
-        gen_ss_password "$method"
+        gen_ss_password "$method" || return 1
       else
-        gen_auth
+        gen_auth || return 1
       fi
       return 0
     fi
@@ -1669,15 +1798,14 @@ ask_reality_keys() {
   fi
   local pair priv pub sid
   pair=$(gen_reality_pair) || return 1
-  priv=$(printf '%s\n' "$pair" | sed -n '1p')
-  pub=$(printf '%s\n' "$pair" | sed -n '2p')
-  sid=$(gen_shortid)
+  read_fields "$pair" priv pub
+  sid=$(gen_shortid) || return 1
   printf '%s\n%s\n%s\n' "$priv" "$pub" "$sid"
 }
 
 make_self_signed() {
   local cn=$1 dir san crt key
-  dir=$(mktemp -d)
+  dir=$(mktemp -d) || return 1
   crt=$dir/cert.crt
   key=$dir/cert.key
   if is_ipv4 "$cn" || is_ipv6 "$cn"; then
@@ -1693,21 +1821,39 @@ make_self_signed() {
     err "生成证书失败。"
     return 1
   fi
-  chmod 600 "$crt" "$key"
+  chmod 600 "$crt" "$key" || { rm -rf -- "$dir"; return 1; }
   printf 'temp\n%s\n%s\n1\n' "$crt" "$key"
 }
 
 copy_cert_pair() {
-  local tag=$1 src_crt=$2 src_key=$3 crt key
-  crt=$CERT_DIR/${tag}.crt
-  key=$CERT_DIR/${tag}.key
+  local tag=$1 src_crt=$2 src_key=$3 crt key staged cert_pub key_pub
+  valid_tag "$tag" || return 1
   if [[ ! -f $src_crt || ! -r $src_crt || ! -f $src_key || ! -r $src_key ]]; then
     err "证书或私钥不可读。"
     return 1
   fi
-  install -d -m 750 -o root -g sing-box "$CERT_DIR"
-  install -m 640 -o root -g sing-box "$src_crt" "$crt"
-  install -m 640 -o root -g sing-box "$src_key" "$key"
+  make_dir 750 root sing-box "$CERT_DIR" || return 1
+  staged=$(mktemp -d -p "$CERT_DIR") || return 1
+  if ! install -m 640 -o root -g sing-box "$src_crt" "$staged/cert" \
+    || ! install -m 640 -o root -g sing-box "$src_key" "$staged/key"; then
+    rm -rf -- "$staged"
+    return 1
+  fi
+  cert_pub=$(openssl x509 -in "$staged/cert" -pubkey -noout 2>/dev/null) || cert_pub=""
+  key_pub=$(openssl pkey -in "$staged/key" -passin pass: -pubout 2>/dev/null) || key_pub=""
+  if [[ -z $cert_pub || $cert_pub != "$key_pub" ]] \
+    || ! openssl x509 -in "$staged/cert" -checkend 0 -noout >/dev/null 2>&1; then
+    rm -rf -- "$staged"
+    err "证书已过期、与私钥不匹配，或私钥需要密码。"
+    return 1
+  fi
+  crt=$CERT_DIR/${tag}.crt
+  key=$CERT_DIR/${tag}.key
+  if [[ -L $crt || -L $key ]] || ! mv -f -- "$staged/cert" "$crt" || ! mv -f -- "$staged/key" "$key"; then
+    rm -rf -- "$staged"
+    return 1
+  fi
+  rmdir "$staged"
   printf '%s\n%s\n' "$crt" "$key"
 }
 
@@ -1740,6 +1886,7 @@ ask_cert() {
         return 1
       fi
       ans=$(prompt "跳过证书校验" "n" "q 取消") || return 2
+      cancelled "$ans" && return 2
       if [[ $ans == y || $ans == Y ]]; then
         insecure=1
       else
@@ -1753,7 +1900,7 @@ ask_cert() {
 }
 
 tag_used() {
-  local tag=$1 f
+  local tag=$1
   [[ -f $META_DIR/${tag}.json ]] && return 0
   if [[ -f $CONF ]] && jq -e --arg t "$tag" 'any(.inbounds[]?; .tag == $t)' "$CONF" >/dev/null 2>&1; then
     return 0
@@ -1840,30 +1987,80 @@ render_inbound() {
       | {type:"hysteria2", tag:$m.tag, listen:$m.listen, listen_port:$m.port,
           users:[{name:$m.tag, password:$m.auth}],
           tls:($m | tls_cert | . + {alpn:["h3"]}),
-          masquerade:"404 not found"}
+          masquerade:{type:"string",status_code:404,content:"404 not found"}}
     else
       error("unknown protocol")
     end
   '
 }
 
+valid_tag() {
+  [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$ ]]
+}
+
+validate_meta() {
+  local file=$1 tag
+  [[ -f $file && ! -L $file ]] || return 1
+  tag=${file##*/}
+  tag=${tag%.json}
+  valid_tag "$tag" || return 1
+  jq -e --arg tag "$tag" '
+    type == "object" and .tag == $tag
+    and (.protocol == "shadowsocks" or .protocol == "vless" or .protocol == "hysteria2")
+    and (.port | type == "number" and . == floor and . >= 1 and . <= 65535)
+    and (.listen | type == "string")
+    and (.remark | type == "string" and (test("[\u0000-\u001f\u007f]") | not))
+  ' "$file" >/dev/null
+}
+
 rebuild_config() {
-  local f parts='[]' doc inbound
-  for f in "$META_DIR"/*.json; do
-    [[ -f $f ]] || continue
-    inbound=$(render_inbound <"$f") || return 1
-    parts=$(jq -n --argjson a "$parts" --argjson b "$inbound" '$a + [$b]') || return 1
-  done
-  if [[ -f $CONF ]]; then
-    doc=$(jq --argjson ins "$parts" '.log = (.log // {level:"warn", timestamp:true}) | .outbounds = (if (.outbounds | type) == "array" and (.outbounds | length) > 0 then .outbounds else [{type:"direct", tag:"direct"}] end) | .inbounds = $ins' "$CONF") || return 1
-  else
-    doc=$(jq -n --argjson ins "$parts" '{log:{level:"warn", timestamp:true}, inbounds:$ins, outbounds:[{type:"direct", tag:"direct"}]}') || return 1
+  local staged
+  staged=$(mktemp -d) || return 1
+  # 通过临时文件传递密钥，避免出现在 jq 的进程参数里。
+  if ! build_config_parts "$staged"; then
+    rm -rf -- "$staged"
+    return 1
   fi
-  printf '%s' "$doc" | atomic_json "$CONF" 640 root sing-box
+  if ! jq -s --slurpfile ins "$staged/inbounds" --slurpfile owned "$staged/owned" '
+    .[0]
+    | .log = (.log // {level:"warn",timestamp:true})
+    | .outbounds = (if (.outbounds | type) == "array" and (.outbounds | length) > 0
+                    then .outbounds else [{type:"direct",tag:"direct"}] end)
+    | .inbounds = ([.inbounds[]? | select(.tag as $t | $owned | index($t) | not)] + $ins)
+  ' "$staged/base" | atomic_json "$CONF" 640 root sing-box; then
+    rm -rf -- "$staged"
+    return 1
+  fi
+  rm -rf -- "$staged"
+}
+
+build_config_parts() {
+  local staged=$1 f
+  : >"$staged/inbounds"
+  : >"$staged/owned"
+  for f in "$META_DIR"/*.json; do
+    validate_meta "$f" || { err "元数据不合法: ${f}"; return 1; }
+    render_inbound <"$f" >>"$staged/inbounds" || return 1
+    jq '.tag' "$f" >>"$staged/owned" || return 1
+  done
+  # 删除操作也要从现有配置中移除事务开始时属于面板的 tag。
+  if [[ -n $TX ]]; then
+    for f in "$TX/meta"/*.json; do
+      validate_meta "$f" || return 1
+      jq '.tag' "$f" >>"$staged/owned" || return 1
+    done
+  fi
+  if [[ -f $CONF ]]; then
+    jq -e 'type == "object" and ((.inbounds // []) | type == "array")' "$CONF" >/dev/null || return 1
+    cp -- "$CONF" "$staged/base"
+  else
+    empty_config >"$staged/base"
+  fi
 }
 
 save_meta_and_inbound() {
   local tag=$1 meta_json
+  valid_tag "$tag" || return 1
   meta_json=$(cat)
   if [[ -z $meta_json ]] || ! printf '%s' "$meta_json" | jq -e . >/dev/null; then
     return 1
@@ -1876,6 +2073,7 @@ list_meta_files() {
   local f
   for f in "$META_DIR"/*.json; do
     [[ -f $f ]] || continue
+    validate_meta "$f" || { err "跳过损坏的元数据: ${f}"; continue; }
     jq -r '[.port, .tag] | @tsv' "$f"
   done | sort -n -k1,1 | while IFS=$'\t' read -r _port tag; do
     printf '%s\n' "$META_DIR/${tag}.json"
@@ -1912,6 +2110,7 @@ pick_inbound() {
     pause
     return 1
   fi
+  STORE_REV=$(store_revision)
   local f label port remark choice
   local -a rows=()
   for f in "${files[@]}"; do
@@ -1957,10 +2156,7 @@ finish_inbound() {
 }
 
 load_cert_fields() {
-  cert_mode=$(printf '%s\n' "$1" | sed -n '1p')
-  cert=$(printf '%s\n' "$1" | sed -n '2p')
-  key=$(printf '%s\n' "$1" | sed -n '3p')
-  insecure=$(printf '%s\n' "$1" | sed -n '4p')
+  read_fields "$1" cert_mode cert key insecure
   if [[ $cert_mode == temp ]]; then
     cert_show="自签证书"
     TMP_PATHS+=("$(dirname "$cert")")
@@ -1993,8 +2189,7 @@ install_chosen_cert() {
   src_crt=$cert
   src_key=$key
   paths=$(materialize_cert "$1" "$cert_mode" "$src_crt" "$src_key") || return 1
-  cert=$(printf '%s\n' "$paths" | sed -n '1p')
-  key=$(printf '%s\n' "$paths" | sed -n '2p')
+  read_fields "$paths" cert key
   drop_temp_cert "$cert_mode" "$src_crt"
   cert_mode=keep
 }
@@ -2010,6 +2205,7 @@ stage_chosen_cert() {
 }
 
 ss_wizard() {
+  STORE_REV=$(store_revision)
   local tag="" listen port remark method password network doc
   listen=$(ask_listen "0.0.0.0") || return 0
   network=$(ask_ss_network) || return 0
@@ -2034,6 +2230,7 @@ ss_wizard() {
 }
 
 vless_wizard() {
+  STORE_REV=$(store_revision)
   local tag="" listen port remark uuid flow sni target tport priv pub sid
   local name_pack host keys doc
   flow=xtls-rprx-vision
@@ -2045,14 +2242,11 @@ vless_wizard() {
   remark=$(ask_remark "vless-${port}") || return 0
   note "伪装站点需要 TLS 1.3，不要用 Cloudflare CDN。"
   name_pack=$(ask_name "伪装域名" "www.microsoft.com:443" domain) || return 0
-  host=$(printf '%s\n' "$name_pack" | sed -n '1p')
-  tport=$(printf '%s\n' "$name_pack" | sed -n '2p')
+  read_fields "$name_pack" host tport
   sni=$host
   target=$host
   keys=$(ask_reality_keys "" "" "") || { [[ $? -eq 1 ]] && pause; return 0; }
-  priv=$(printf '%s\n' "$keys" | sed -n '1p')
-  pub=$(printf '%s\n' "$keys" | sed -n '2p')
-  sid=$(printf '%s\n' "$keys" | sed -n '3p')
+  read_fields "$keys" priv pub sid
   uuid=$(ask_uuid "") || return 0
   blank
   kv "协议" "VLESS / REALITY"
@@ -2073,6 +2267,7 @@ vless_wizard() {
 }
 
 hy_wizard() {
+  STORE_REV=$(store_revision)
   local tag="" listen port remark auth sni cert key insecure
   local name_pack host cert_pack cert_mode="" cert_show="" doc
   note "Hysteria2 使用 QUIC，必须启用 TLS。"
@@ -2082,7 +2277,7 @@ hy_wizard() {
   tag=$(new_tag hy2 "$port")
   remark=$(ask_remark "hy2-${port}") || return 0
   name_pack=$(ask_name "证书域名或 IP" "" name) || return 0
-  host=$(printf '%s\n' "$name_pack" | sed -n '1p')
+  read_fields "$name_pack" host
   sni=$host
   cert_pack=$(ask_cert "$sni" "" "" 1) || { [[ $? -eq 1 ]] && pause; return 0; }
   load_cert_fields "$cert_pack"
@@ -2110,17 +2305,14 @@ prepare_store() {
     pause
     return 1
   fi
-  ensure_dirs
+  ensure_dirs || return 1
+  STORE_REV=$(store_revision)
 }
 
 add_inbound() {
   local choice
   require_kernel || return 0
-  if ! ensure_deps; then
-    err "依赖安装失败。"
-    pause
-    return 0
-  fi
+  deps_ok || return 0
   prepare_store || return 0
   while true; do
     choice=$(choose "添加入站" "返回" "Shadowsocks" "VLESS REALITY" "Hysteria2") || return 0
@@ -2131,7 +2323,7 @@ add_inbound() {
         ;;
       2)
         header "VLESS / REALITY"
-        vless_wizard reality
+        vless_wizard
         ;;
       3)
         header "Hysteria2"
@@ -2141,49 +2333,32 @@ add_inbound() {
   done
 }
 
-show_field() {
-  printf '  %s%s%s\n' "$(pad "$1" 3)" "$(pad "$2" 9)" "$3" >&4
-}
-
 edit_loop() {
   local title=$1 remark=$2
   shift 2
-  local -a rows=("$@")
-  local choice msg="" rc n=${#rows[@]}
-  while true; do
-    header "$title"
-    note "$remark"
-    blank
-    for ((choice = 0; choice < n; choice++)); do
-      show_field "$((choice + 1))" "${rows[choice]%%=*}" "${rows[choice]#*=}"
-    done
-    blank
-    if [[ -n $msg ]]; then
-      err "$msg"
-    fi
-    msg=""
-    next_choice choice msg "$n" "返回"
-    rc=$?
-    if [[ $rc -eq 0 ]]; then
-      printf '%s' "$choice"
-      return 0
-    fi
-    if [[ $rc -eq 1 ]]; then
-      continue
-    fi
+  choice_menu fields "$title" 返回 "$remark" "$@"
+}
+
+apply_edited() {
+  local tag=$1 proto=$2 port=$3 network=$4 listen=$5 doc=$6
+  if port_conflict "$port" "$tag" "$proto" "$network" "$listen"; then
+    err "监听端点与 ${CONFLICT_TAG} 冲突。"
+    pause
     return 1
-  done
+  fi
+  confirm_write || return 1
+  need_tx || return 1
+  finish_inbound "$tag" "$proto" "$port" "$doc"
 }
 
 ss_key_ok() {
-  local method=$1 password=$2 need got
-  case $method in
-    2022-blake3-aes-128-gcm) need=16 ;;
-    2022-blake3-aes-256-gcm | 2022-blake3-chacha20-poly1305) need=32 ;;
-    *) return 0 ;;
-  esac
+  local method=$1 password=$2 need got canonical
+  need=$(ss_key_bytes "$method") || return 0
+  [[ $password =~ ^[A-Za-z0-9+/]+={0,2}$ ]] || return 1
   got=$(printf '%s' "$password" | openssl base64 -d -A 2>/dev/null | wc -c | tr -d ' ') || return 1
-  [[ ${got:-0} -eq $need ]]
+  [[ ${got:-0} -eq $need ]] || return 1
+  canonical=$(printf '%s' "$password" | openssl base64 -d -A | openssl base64 -A) || return 1
+  [[ $canonical == "$password" ]]
 }
 
 apply_field_cert() {
@@ -2201,6 +2376,8 @@ edit_ss() {
   local meta=$1 choice doc
   local tag listen port remark method password network
   while true; do
+    STORE_REV=$(store_revision)
+    validate_meta "$meta" || return 1
     tag=$(jq -r '.tag' "$meta")
     listen=$(jq -r '.listen' "$meta")
     port=$(jq -r '.port' "$meta")
@@ -2210,35 +2387,25 @@ edit_ss() {
     network=$(jq -r '.network' "$meta")
     choice=$(edit_loop "修改 Shadowsocks" "$remark" \
       "监听=$listen" "端口=$port" "传输=$network" \
-      "备注=$remark" "加密=$method" "密码=$password") || return 0
+      "备注=$remark" "加密=$method" "密码=已设置 · 选择修改") || return 0
     case $choice in
       1) listen=$(ask_listen "$listen") || continue ;;
       2) port=$(ask_port "$port" "$tag" shadowsocks "$network" "$listen") || continue ;;
-      3)
-        network=$(ask_ss_network) || continue
-        if port_conflict "$port" "$tag" shadowsocks "$network" "$listen"; then
-          err "端口 ${port} 与入站 ${CONFLICT_TAG} 冲突。"
-          pause
-          continue
-        fi
-        ;;
+      3) network=$(ask_ss_network) || continue ;;
       4) remark=$(ask_remark "$remark") || continue ;;
       5)
         method=$(ask_method) || continue
         if ! ss_key_ok "$method" "$password"; then
-          err "当前密码长度与新的加密方式不匹配，请改为修改密码。"
-          pause
-          continue
+          note "新加密方式需要不同长度的密钥，请设置密码。"
+          password=$(ask_password "密码" "" "$method") || continue
         fi
         ;;
       6) password=$(ask_password "密码" "$password" "$method") || continue ;;
       *) continue ;;
     esac
-    confirm_write || continue
     doc=$(meta_ss "$tag" "$remark" "$listen" "$port" "$method" "$password" "$network") \
       || { err "写入失败。"; pause; continue; }
-    need_tx || continue
-    finish_inbound "$tag" shadowsocks "$port" "$doc" || continue
+    apply_edited "$tag" shadowsocks "$port" "$network" "$listen" "$doc" || continue
   done
 }
 
@@ -2247,6 +2414,8 @@ edit_vless() {
   local tag listen port remark uuid flow sni target tport priv pub sid
   local name_pack host keys dest
   while true; do
+    STORE_REV=$(store_revision)
+    validate_meta "$meta" || return 1
     tag=$(jq -r '.tag' "$meta")
     listen=$(jq -r '.listen' "$meta")
     port=$(jq -r '.port' "$meta")
@@ -2273,8 +2442,7 @@ edit_vless() {
         [[ -n $tport && $tport != null && $tport != 443 ]] && dest="${dest}:${tport}"
         plainln "  伪装站点需要支持 TLS 1.3，并避免 Cloudflare CDN。"
         name_pack=$(ask_name "伪装域名" "$dest" domain) || continue
-        host=$(printf '%s\n' "$name_pack" | sed -n '1p')
-        tport=$(printf '%s\n' "$name_pack" | sed -n '2p')
+        read_fields "$name_pack" host tport
         sni=$host
         target=$host
         ;;
@@ -2283,26 +2451,25 @@ edit_vless() {
           [[ $? -eq 1 ]] && pause
           continue
         }
-        priv=$(printf '%s\n' "$keys" | sed -n '1p')
-        pub=$(printf '%s\n' "$keys" | sed -n '2p')
-        sid=$(printf '%s\n' "$keys" | sed -n '3p')
+        read_fields "$keys" priv pub sid
         ;;
       6) uuid=$(ask_uuid "$uuid") || continue ;;
       *) continue ;;
     esac
-    confirm_write || continue
     doc=$(meta_vless "$tag" "$remark" "$listen" "$port" "$uuid" "$flow" \
       "$sni" "$target" "$tport" "$priv" "$pub" "$sid") \
       || { err "写入失败。"; pause; continue; }
-    need_tx || continue
-    finish_inbound "$tag" vless "$port" "$doc" || continue
+    apply_edited "$tag" vless "$port" tcp "$listen" "$doc" || continue
   done
 }
 
 edit_hy() {
   local meta=$1 choice doc
   local tag listen port remark auth sni cert key insecure name_pack
+  local cert_mode="" cert_show=""
   while true; do
+    STORE_REV=$(store_revision)
+    validate_meta "$meta" || return 1
     tag=$(jq -r '.tag' "$meta")
     listen=$(jq -r '.listen' "$meta")
     port=$(jq -r '.port' "$meta")
@@ -2314,14 +2481,14 @@ edit_hy() {
     insecure=$(jq -r 'if .insecure then 1 else 0 end' "$meta")
     choice=$(edit_loop "修改 Hysteria2" "$remark" \
       "监听=$listen" "端口=$port" "备注=$remark" \
-      "域名=$sni" "证书=$cert" "认证=$auth") || return 0
+      "域名=$sni" "证书=$cert" "认证=已设置 · 选择修改") || return 0
     case $choice in
       1) listen=$(ask_listen "$listen") || continue ;;
       2) port=$(ask_port "$port" "$tag" hysteria2 udp "$listen") || continue ;;
       3) remark=$(ask_remark "$remark") || continue ;;
       4)
         name_pack=$(ask_name "证书域名或 IP" "$sni" name) || continue
-        sni=$(printf '%s\n' "$name_pack" | sed -n '1p')
+        read_fields "$name_pack" sni
         ;;
       5)
         apply_field_cert "$sni" "$cert" "$key" "$insecure" || continue
@@ -2335,22 +2502,16 @@ edit_hy() {
       6) auth=$(ask_password "认证密码" "$auth" "") || continue ;;
       *) continue ;;
     esac
-    confirm_write || continue
     doc=$(meta_hy "$tag" "$remark" "$listen" "$port" "$auth" "$sni" "$cert" "$key" "$insecure") \
       || { err "写入失败。"; pause; continue; }
-    need_tx || continue
-    finish_inbound "$tag" hysteria2 "$port" "$doc" || continue
+    apply_edited "$tag" hysteria2 "$port" udp "$listen" "$doc" || continue
   done
 }
 
 edit_inbound() {
   local picked
   require_kernel || return 0
-  if ! ensure_deps; then
-    err "依赖安装失败。"
-    pause
-    return 0
-  fi
+  deps_ok || return 0
   prepare_store || return 0
   while true; do
     pick_inbound "修改入站" || return 0
@@ -2383,10 +2544,8 @@ delete_inbound() {
   blank
   kv "删除" "$(proto_label "$picked")  $(jq -r '.port' "$picked")  $(jq -r '.remark' "$picked")"
   confirm "确认删除？" || return 0
-  prepare_store || return 0
   need_tx || return 0
-  rm -f -- "$META_DIR/${tag}.json"
-  gc_certs
+  rm -f -- "$META_DIR/${tag}.json" || { rollback_tx; return 0; }
   if ! rebuild_config; then
     rollback_tx
     err "写入失败。"
@@ -2396,7 +2555,8 @@ delete_inbound() {
   if [[ -x $BIN ]]; then
     commit_tx || { pause; return 0; }
   else
-    fix_tree_perms
+    gc_certs
+    end_tx
     plainln "  已删除。"
   fi
   pause
@@ -2462,10 +2622,16 @@ build_share() {
     shadowsocks)
       method=$(jq -r '.method' "$meta")
       password=$(jq -r '.password' "$meta")
-      printf 'ss://%s@%s:%s#%s\n' "$(b64url "${method}:${password}")" "$host" "$port" "$enc"
+      local userinfo
+      if [[ $method == 2022-* ]]; then
+        userinfo="$(urlenc "$method"):$(urlenc "$password")"
+      else
+        userinfo=$(b64url "${method}:${password}")
+      fi
+      printf 'ss://%s@%s:%s#%s\n' "$userinfo" "$host" "$port" "$enc"
       ;;
     vless)
-      uuid=$(jq -r '.uuid' "$meta")
+      uuid=$(urlenc "$(jq -r '.uuid' "$meta")")
       flow=$(jq -r '.flow' "$meta")
       sni=$(urlenc "$(jq -r '.sni' "$meta")")
       fp=$(urlenc "$(jq -r '.fingerprint // "chrome"' "$meta")")
@@ -2551,15 +2717,9 @@ share_inbound() {
     pause
     return 0
   fi
-  if [[ ! -d $STATE_DIR ]]; then
-    install -d -m 750 -o root -g sing-box "$STATE_DIR" || {
-      err "无法保存服务器地址。"
-      pause
-      return 0
-    }
-  else
-    chown root:sing-box "$STATE_DIR"
-    chmod 750 "$STATE_DIR"
+  make_dir 750 root sing-box "$STATE_DIR" || { pause; return 0; }
+  if [[ -L $STATE_DIR/server_addr ]]; then
+    err "服务器地址文件不能是符号链接。"; pause; return 0
   fi
   printf '%s\n' "$host" >"$STATE_DIR/server_addr" || {
     err "无法保存服务器地址。"
@@ -2609,7 +2769,7 @@ usage() {
   cat <<'EOF'
 sing-box 管理面板
 
-用法: sudo ./sing-box.sh
+用法: sudo sh sing-box.sh
 
 文档: https://sing-box.sagernet.org/
 系统: Debian / Ubuntu（systemd）、Alpine（OpenRC）
@@ -2619,7 +2779,6 @@ EOF
 }
 
 main() {
-  local i
   if [[ ${1:-} == -h || ${1:-} == --help ]]; then
     usage
     return 0
@@ -2635,10 +2794,7 @@ main() {
     echo "请在交互终端中运行。" >&2
     return 1
   fi
-  RULE=""
-  for ((i = 0; i < WIDTH; i++)); do
-    RULE+="─"
-  done
+  init_ui
   main_menu
 }
 
@@ -2652,6 +2808,8 @@ if [[ ${SINGBOX_PANEL_SOURCE:-0} != 1 ]]; then
     exit 1
   fi
   trap cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM HUP
   main "$@"
 fi
 SINGBOX_PANEL_PAYLOAD

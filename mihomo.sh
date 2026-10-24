@@ -39,23 +39,32 @@ shopt -s nullglob
 : "${CONF_DIR:=/usr/local/etc/mihomo}"
 : "${LOG_DIR:=/var/log/mihomo}"
 : "${STATE_DIR:=/var/lib/mihomo}"
+: "${RUNTIME_DIR:=/var/lib/mihomo/runtime}"
 : "${META_DIR:=/var/lib/mihomo/meta}"
 : "${CERT_DIR:=/var/lib/mihomo/certs}"
 : "${STDOUT_LOG:=/var/log/mihomo/stdout.log}"
 : "${STDERR_LOG:=/var/log/mihomo/stderr.log}"
-WIDTH=42
+: "${SYSTEMD_UNIT:=/etc/systemd/system/mihomo.service}"
+: "${OPENRC_SERVICE:=/etc/init.d/mihomo}"
+: "${LOGROTATE_FILE:=/etc/logrotate.d/mihomo}"
+: "${SYSTEMD_ENABLE_LINK:=/etc/systemd/system/multi-user.target.wants/mihomo.service}"
+: "${OPENRC_ENABLE_LINK:=/etc/runlevels/default/mihomo}"
 REPO=MetaCubeX/mihomo
 
 GRN=$'\033[38;2;126;217;167m'
 RED=$'\033[38;2;255;107;107m'
 YEL=$'\033[38;2;240;200;120m'
-DIM=$'\033[38;2;90;122;104m'
+DIM=$'\033[38;2;145;155;170m'
+ACC=$'\033[38;2;116;180;255m'
 RST=$'\033[0m'
 BOLD=$'\033[1m'
-OFFBOLD=$'\033[22m'
 
 OS=""
 TX=""
+TX_RESTART=0
+TX_READY=0
+TX_WAS_RUNNING=0
+TX_FILES=()
 CONFLICT_TAG=""
 PICKED=""
 TMP_PATHS=()
@@ -68,11 +77,45 @@ err() { printf '  %b%s%b\n' "$RED" "$1" "$GRN" >&4; }
 warn() { printf '  %b%s%b\n' "$YEL" "$1" "$GRN" >&4; }
 note() { printf '  %b%s%b\n' "$DIM" "$1" "$GRN" >&4; }
 kv() { printf '  %s%s\n' "$(pad "$1" 8)" "$2" >&4; }
-item() { printf '  %s%s\n' "$(pad "$1" 3)" "$2" >&4; }
+item() { printf '  %b%s%b%s\n' "$ACC" "$(pad "$1" "$MENU_NUM_W")" "$RST" "$2" >&4; }
 blank() { uin ""; }
+
+MENU_NUM_W=4
+MENU_LABEL_W=18
+PANEL_KERNEL=("1 安装内核 2 升级内核" "3 启动服务 4 停止服务")
+PANEL_INBOUND=("6 添加入站 7 修改入站" "8 分享链接 9 删除入站")
+PANEL_DIAG=("10 查看日志 q 退出面板")
+
+menu_row_width() {
+  dw "$(pad "$1" "$MENU_NUM_W")$(pad "$2" "$MENU_LABEL_W")  $(pad "$3" "$MENU_NUM_W")$4"
+}
+
+menu_rule() {
+  local max=0 w spec n1 l1 n2 l2
+  for spec in "$@"; do
+    read -r n1 l1 n2 l2 <<<"$spec"
+    w=$(menu_row_width "$n1" "$l1" "$n2" "$l2")
+    if ((w > max)); then
+      max=$w
+    fi
+  done
+  printf '%*s' "$max" '' | tr ' ' '-'
+}
+
+init_ui() {
+  if [[ -n ${NO_COLOR:-} || ${TERM:-dumb} == dumb ]]; then
+    GRN='' RED='' YEL='' DIM='' ACC='' RST='' BOLD=''
+  fi
+  RULE=$(menu_rule "${PANEL_KERNEL[@]}" "${PANEL_INBOUND[@]}" "${PANEL_DIAG[@]}")
+}
 
 cleanup() {
   local p
+  if [[ -n $TX ]]; then
+    if ((TX_READY)); then rollback_tx || true; else end_tx; fi
+  else
+    release_lock
+  fi
   if ((${#TMP_PATHS[@]})); then
     for p in "${TMP_PATHS[@]}"; do
       if [[ -n $p && -e $p ]]; then
@@ -83,34 +126,21 @@ cleanup() {
   printf '%b' "$RST" >&4 2>/dev/null || printf '%b' "$RST" || true
 }
 
-char_width() {
-  local cp=$1
-  if ((cp < 0x1100)); then
-    printf '1'
-    return
-  fi
-  if (( (cp >= 0x1100 && cp <= 0x115F) \
-     || (cp >= 0x2E80 && cp <= 0xA4CF) \
-     || (cp >= 0xAC00 && cp <= 0xD7A3) \
-     || (cp >= 0xF900 && cp <= 0xFAFF) \
-     || (cp >= 0xFE10 && cp <= 0xFE6F) \
-     || (cp >= 0xFF00 && cp <= 0xFF60) \
-     || (cp >= 0xFFE0 && cp <= 0xFFE6) \
-     || (cp >= 0x1F300 && cp <= 0x1FAFF) \
-     || (cp >= 0x20000 && cp <= 0x3FFFD) )); then
-    printf '2'
-  else
-    printf '1'
-  fi
-}
-
 dw() {
-  local s=$1 i n w cp
-  n=${#s}
-  w=0
-  for ((i = 0; i < n; i++)); do
-    cp=$(printf '%d' "'${s:i:1}")
-    w=$((w + $(char_width "$cp")))
+  local s=$1 i w=0 cp
+  for ((i = 0; i < ${#s}; i++)); do
+    printf -v cp '%d' "'${s:i:1}"
+    if ((cp < 32 || (cp >= 0x7F && cp < 0xA0) || (cp >= 0x300 && cp <= 0x36F))); then
+      continue
+    elif (( (cp >= 0x1100 && cp <= 0x115F) || (cp >= 0x2E80 && cp <= 0xA4CF) \
+         || (cp >= 0xAC00 && cp <= 0xD7A3) || (cp >= 0xF900 && cp <= 0xFAFF) \
+         || (cp >= 0xFE10 && cp <= 0xFE6F) || (cp >= 0xFF00 && cp <= 0xFF60) \
+         || (cp >= 0xFFE0 && cp <= 0xFFE6) || (cp >= 0x1F300 && cp <= 0x1FAFF) \
+         || (cp >= 0x20000 && cp <= 0x3FFFD) )); then
+      w=$((w + 2))
+    else
+      w=$((w + 1))
+    fi
   done
   printf '%s' "$w"
 }
@@ -119,29 +149,19 @@ pad() {
   local s=$1 width=$2 w
   w=$(dw "$s")
   printf '%s' "$s"
-  while ((w < width)); do
-    printf ' '
-    w=$((w + 1))
-  done
-}
-
-spaces() {
-  local n=$1 i s=""
-  for ((i = 0; i < n; i++)); do
-    s+=" "
-  done
-  printf '%s' "$s"
+  ((w >= width)) || printf '%*s' "$((width - w))" ''
 }
 
 cls() {
-  ui $'\033[H\033[2J'
-  ui "$GRN"
+  [[ ${TERM:-dumb} == dumb ]] || ui $'\033[H\033[2J'
+  ui "$RST"
 }
 
 header() {
   cls
-  uin "  ${BOLD}${1}${OFFBOLD}"
-  uin "  ${RULE}"
+  blank
+  printf '  %bMIHOMO%b  /  %s\n' "$ACC$BOLD" "$RST" "$1" >&4
+  uin "  ${DIM}${RULE}${RST}"
   blank
 }
 
@@ -150,6 +170,17 @@ pause() {
   ui "  ${DIM}回车继续${RST}${GRN}"
   IFS= read -r _ </dev/tty || true
   ui $'\n'
+}
+
+read_fields() {
+  local data=$1 name i=0
+  local -a values=()
+  shift
+  mapfile -t values <<<"$data"
+  for name in "$@"; do
+    printf -v "$name" '%s' "${values[i]:-}"
+    i=$((i + 1))
+  done
 }
 
 trim_line() {
@@ -201,6 +232,14 @@ cancelled() {
 
 is_regen() {
   [[ ${1:-} == g || ${1:-} == G ]]
+}
+
+regen_prompt() {
+  if [[ -n ${2:-} ]]; then
+    prompt "$1" "" "回车保留，g 重新生成，q 取消"
+  else
+    prompt "$1" "" "回车生成，q 取消"
+  fi
 }
 
 detect_os() {
@@ -263,6 +302,12 @@ ensure_deps() {
   command -v openssl >/dev/null 2>&1 || pkgs+=(openssl)
   command -v jq >/dev/null 2>&1 || pkgs+=(jq)
   command -v sha256sum >/dev/null 2>&1 || pkgs+=(coreutils)
+  if ! command -v flock >/dev/null 2>&1; then
+    if [[ $OS == alpine ]]; then pkgs+=(flock); else pkgs+=(util-linux); fi
+  fi
+  if ! command -v ss >/dev/null 2>&1; then
+    if [[ $OS == alpine ]]; then pkgs+=(iproute2-ss); else pkgs+=(iproute2); fi
+  fi
   if ((${#pkgs[@]} == 0)); then
     return 0
   fi
@@ -329,6 +374,7 @@ EOF
     err "mihomo 账户不能是 root。"
     return 1
   fi
+  box_group_ok || { err "mihomo 用户与组不匹配。"; return 1; }
 }
 
 make_dir() {
@@ -339,23 +385,31 @@ make_dir() {
   install -d -m "$mode" -o "$owner" -g "$group" "$dir"
 }
 
+own_dir() {
+  local mode=$1 owner=$2 group=$3 dir=$4
+  [[ -d $dir ]] || return 0
+  chown "${owner}:${group}" "$dir" || return 1
+  chmod "$mode" "$dir"
+}
+
 ensure_dirs() {
-  local f
-  make_dir 750 root mihomo "$CONF_DIR"
-  make_dir 750 root mihomo "$LOG_DIR"
-  make_dir 750 root mihomo "$STATE_DIR"
-  make_dir 700 root root "$META_DIR"
-  make_dir 750 root mihomo "$CERT_DIR"
-  if [[ -d $STATE_DIR ]]; then
-    chown root:mihomo "$STATE_DIR"
-    chmod 750 "$STATE_DIR"
-  fi
+  local spec mode owner group dir f
+  for spec in \
+    "750 root mihomo $CONF_DIR" \
+    "750 root mihomo $LOG_DIR" \
+    "750 root mihomo $STATE_DIR" \
+    "750 mihomo mihomo $RUNTIME_DIR" \
+    "700 root root $META_DIR" \
+    "750 root mihomo $CERT_DIR"; do
+    read -r mode owner group dir <<<"$spec"
+    make_dir "$mode" "$owner" "$group" "$dir" || return 1
+  done
   for f in "$STDOUT_LOG" "$STDERR_LOG"; do
     if [[ ! -e $f ]]; then
-      install -m 600 -o mihomo -g mihomo /dev/null "$f"
+      install -m 600 -o mihomo -g mihomo /dev/null "$f" || return 1
     fi
   done
-  repair_conf_access
+  fix_tree_perms
 }
 
 atomic_text() {
@@ -377,7 +431,10 @@ atomic_text() {
     rm -f -- "$tmp"
     return 1
   fi
-  mv -f -- "$tmp" "$dest"
+  if ! mv -f -- "$tmp" "$dest"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
 }
 
 empty_config() {
@@ -403,38 +460,32 @@ ensure_base_config() {
 fix_tree_perms() {
   local f
   if [[ -f $CONF ]]; then
-    chown root:mihomo "$CONF"
-    chmod 640 "$CONF"
+    chown root:mihomo "$CONF" || return 1
+    chmod 640 "$CONF" || return 1
   fi
-  if [[ -d $CONF_DIR ]]; then
-    chown root:mihomo "$CONF_DIR"
-    chmod 750 "$CONF_DIR"
-  fi
-  if [[ -d $STATE_DIR ]]; then
-    chown root:mihomo "$STATE_DIR"
-    chmod 750 "$STATE_DIR"
-  fi
-  if [[ -d $LOG_DIR ]]; then
-    chown root:mihomo "$LOG_DIR"
-    chmod 750 "$LOG_DIR"
-  fi
+  own_dir 750 root mihomo "$CONF_DIR" || return 1
+  own_dir 750 root mihomo "$STATE_DIR" || return 1
+  own_dir 750 mihomo mihomo "$RUNTIME_DIR" || return 1
+  own_dir 750 root mihomo "$LOG_DIR" || return 1
   if [[ -d $META_DIR ]]; then
-    chown root:root "$META_DIR"
-    chmod 700 "$META_DIR"
+    own_dir 700 root root "$META_DIR" || return 1
     for f in "$META_DIR"/*.json; do
       [[ -f $f ]] || continue
-      chown root:root "$f"
-      chmod 600 "$f"
+      chown root:root "$f" || return 1
+      chmod 600 "$f" || return 1
     done
   fi
   if [[ -d $CERT_DIR ]]; then
-    chown root:mihomo "$CERT_DIR"
-    chmod 750 "$CERT_DIR"
+    own_dir 750 root mihomo "$CERT_DIR" || return 1
     for f in "$CERT_DIR"/*; do
       [[ -e $f ]] || continue
-      chown root:mihomo "$f"
-      chmod 640 "$f"
+      chown root:mihomo "$f" || return 1
+      chmod 640 "$f" || return 1
     done
+  fi
+  if [[ -f $STATE_DIR/server_addr ]]; then
+    chown root:root "$STATE_DIR/server_addr" || return 1
+    chmod 600 "$STATE_DIR/server_addr" || return 1
   fi
   repair_conf_access
 }
@@ -444,10 +495,11 @@ repair_conf_access() {
   if ! id -u mihomo >/dev/null 2>&1 || ! command -v su >/dev/null 2>&1; then
     return 0
   fi
-  if su -s /bin/sh -c "test -x $(printf '%q' "$CONF_DIR") && test -r $(printf '%q' "$CONF_DIR")" mihomo; then
+  # shellcheck disable=SC2016
+  if su -s /bin/sh -c 'test -x "$1" && test -r "$1"' mihomo sh "$CONF_DIR"; then
     return 0
   fi
-  chown root:mihomo "$CONF_DIR"
+  chown root:mihomo "$CONF_DIR" || return 1
   chmod 750 "$CONF_DIR"
 }
 
@@ -472,56 +524,136 @@ restore_tree() {
   while IFS= read -r -d '' f; do
     rel=${f#"$live"/}
     if [[ ! -e $snap/$rel && ! -L $snap/$rel ]]; then
-      rm -rf -- "$f"
+      rm -rf -- "$f" || return 1
     fi
   done < <(find "$live" -mindepth 1 -depth -print0)
   cp -a "$snap"/. "$live"/
 }
 
-begin_tx() {
-  local lockdir=/run/lock
+acquire_lock() {
+  local lockdir=${LOCK_DIR:-/run/lock}
   [[ -d $lockdir ]] || lockdir=/var/lock
-  if [[ ! -d $lockdir ]]; then
-    err "缺少锁目录，无法安全修改配置。"
+  if [[ ! -d $lockdir ]] || ! command -v flock >/dev/null 2>&1; then
+    err "缺少锁目录或 flock，无法安全修改配置。"
     return 1
   fi
   exec 9>"$lockdir/mihomo-panel.lock" || return 1
-  if command -v flock >/dev/null 2>&1 && ! flock -n 9; then
+  if ! flock -n 9; then
+    exec 9>&-
     err "另一个面板正在修改配置。"
     return 1
   fi
-  TX=$(mktemp -d) || return 1
-  TMP_PATHS+=("$TX")
-  mkdir -p "$TX/conf" "$TX/meta" "$TX/certs" || return 1
-  if [[ -d $CONF_DIR ]]; then
-    cp -a "$CONF_DIR"/. "$TX/conf"/ || return 1
+}
+
+release_lock() {
+  flock -u 9 2>/dev/null || true
+  exec 9>&-
+}
+
+end_tx() {
+  local snap=$TX
+  TX=""
+  TX_RESTART=0
+  TX_READY=0
+  TX_FILES=()
+  [[ -z $snap ]] || rm -rf -- "$snap"
+  release_lock
+}
+
+snapshot_tx() {
+  local mode=$1 name dir i
+  mkdir -p "$TX/files" || return 1
+  for name in conf meta certs; do
+    case $name in
+      conf) dir=$CONF_DIR ;;
+      meta) dir=$META_DIR ;;
+      certs) dir=$CERT_DIR ;;
+    esac
+    if [[ -d $dir ]]; then
+      mkdir "$TX/$name" || return 1
+      cp -a "$dir"/. "$TX/$name"/ || return 1
+    fi
+  done
+  TX_FILES=("$CONF" "$SYSTEMD_UNIT" "$OPENRC_SERVICE" "$LOGROTATE_FILE"
+    "$SYSTEMD_ENABLE_LINK" "$OPENRC_ENABLE_LINK")
+  [[ $mode != deploy ]] || TX_FILES+=("$BIN")
+  for ((i = 0; i < ${#TX_FILES[@]}; i++)); do
+    if [[ -e ${TX_FILES[i]} || -L ${TX_FILES[i]} ]]; then
+      cp -a -- "${TX_FILES[i]}" "$TX/files/$i" || return 1
+    fi
+  done
+}
+
+begin_tx() {
+  if [[ -n $TX ]]; then
+    err "已有未结束的事务。"
+    return 1
   fi
-  if [[ -d $META_DIR ]]; then
-    cp -a "$META_DIR"/. "$TX/meta"/ || return 1
+  acquire_lock || return 1
+  TX=$(mktemp -d) || { release_lock; return 1; }
+  TX_RESTART=0
+  TX_READY=0
+  TX_WAS_RUNNING=0
+  is_running && TX_WAS_RUNNING=1
+  if ! snapshot_tx "${1:-config}"; then
+    end_tx
+    return 1
   fi
-  if [[ -d $CERT_DIR ]]; then
-    cp -a "$CERT_DIR"/. "$TX/certs"/ || return 1
-  fi
+  TX_READY=1
 }
 
 rollback_tx() {
-  restore_tree "$CONF_DIR" "$TX/conf" || true
-  restore_tree "$META_DIR" "$TX/meta" || true
-  if [[ -d $CERT_DIR ]] || [[ -n $(ls -A "$TX/certs" 2>/dev/null) ]]; then
-    restore_tree "$CERT_DIR" "$TX/certs" || true
+  [[ -n $TX ]] || return 0
+  local name dir i rc=0 snap=$TX
+  for name in conf meta certs; do
+    case $name in
+      conf) dir=$CONF_DIR ;;
+      meta) dir=$META_DIR ;;
+      certs) dir=$CERT_DIR ;;
+    esac
+    if [[ -d $snap/$name ]]; then
+      restore_tree "$dir" "$snap/$name" || rc=1
+    else
+      rm -rf -- "$dir" || rc=1
+    fi
+  done
+  for ((i = 0; i < ${#TX_FILES[@]}; i++)); do
+    if [[ -e $snap/files/$i || -L $snap/files/$i ]]; then
+      mkdir -p -- "$(dirname "${TX_FILES[i]}")" || { rc=1; continue; }
+      rm -f -- "${TX_FILES[i]}" || { rc=1; continue; }
+      cp -a -- "$snap/files/$i" "${TX_FILES[i]}" || rc=1
+    else
+      rm -f -- "${TX_FILES[i]}" || rc=1
+    fi
+  done
+  fix_tree_perms || rc=1
+  if [[ $OS == debian ]] && command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload || rc=1
   fi
-  fix_tree_perms
-  gc_certs
+  if ((TX_RESTART)); then
+    if ((TX_WAS_RUNNING)); then
+      kernel_stays_up restart || rc=1
+    else
+      svc stop || rc=1
+    fi
+  fi
+  if ((rc)); then
+    # 不销毁唯一的恢复副本；失败时保留给管理员手动恢复。
+    err "回滚未完全成功，快照保留在 ${snap}。"
+    TX=""
+    release_lock
+    return 1
+  fi
+  end_tx
 }
 
 box_as_user() {
-  local bin=$1 log=$2 conf=$3 dir cmd
+  local bin=$1 log=$2 conf=$3 dir
   dir=$(dirname "$conf")
-  # -f 传绝对路径。相对路径会被拼到 -d 上，而 mihomo 用户进不了
-  # 校验时的工作目录，相对名会变成 permission denied。
-  cmd=$(printf '%q -t -d %q -f %q' "$bin" "$dir" "$conf")
   if id -u mihomo >/dev/null 2>&1 && command -v su >/dev/null 2>&1; then
-    su -s /bin/sh -c "$cmd" mihomo >"$log" 2>&1
+    # 参数传递而非拼接 shell 命令，同时兼容 /bin/sh 不支持的 bash %q 转义。
+    # shellcheck disable=SC2016
+    su -s /bin/sh -c 'exec "$1" -t -d "$2" -f "$3"' mihomo sh "$bin" "$dir" "$conf" >"$log" 2>&1
   else
     "$bin" -t -d "$dir" -f "$conf" >"$log" 2>&1
   fi
@@ -529,7 +661,7 @@ box_as_user() {
 
 box_test() {
   local log
-  log=$(mktemp)
+  log=$(mktemp) || return 1
   TMP_PATHS+=("$log")
   if [[ ! -x $BIN ]]; then
     err "未找到 mihomo，无法校验配置。"
@@ -563,20 +695,18 @@ is_running() {
   fi
 }
 
-service_installed() {
-  if [[ $OS == alpine ]]; then
-    [[ -x /etc/init.d/mihomo ]]
-  else
-    [[ -f /etc/systemd/system/mihomo.service ]]
-  fi
-}
-
 service_uses_panel_conf() {
+  local unit
   if [[ $OS == alpine ]]; then
-    [[ -f /etc/init.d/mihomo ]] && grep -qF -- '-f /usr/local/etc/mihomo/config.yaml' /etc/init.d/mihomo
+    unit=$OPENRC_SERVICE
   else
-    [[ -f /etc/systemd/system/mihomo.service ]] && grep -qF -- '-f /usr/local/etc/mihomo/config.yaml' /etc/systemd/system/mihomo.service
+    unit=$SYSTEMD_UNIT
   fi
+  # -d 必须是服务用户可写的运行目录。配置目录保持 root 所有，
+  # 否则 mihomo 无法创建 cache.db。
+  [[ -f $unit ]] && grep -qF -- "-d /var/lib/mihomo/runtime" "$unit" \
+    && grep -qF -- "-f $CONF" "$unit" \
+    && ! grep -Eq '^[[:space:]]*StateDirectory=' "$unit"
 }
 
 drop_file_caps() {
@@ -590,18 +720,18 @@ drop_file_caps() {
 install_service() {
   if [[ $OS == alpine ]]; then
     if ! command -v rc-service >/dev/null 2>&1; then
-      apk add --no-cache openrc
+      apk add --no-cache openrc || return 1
     fi
-    cat >/etc/init.d/mihomo <<'EOF'
+    atomic_text "$OPENRC_SERVICE" 755 root root <<'EOF' || return 1
 #!/sbin/openrc-run
 
 description="mihomo Service"
 
 supervisor=supervise-daemon
 command="/usr/local/bin/mihomo"
-command_args="-d /usr/local/etc/mihomo -f /usr/local/etc/mihomo/config.yaml"
+command_args="-d /var/lib/mihomo/runtime -f /usr/local/etc/mihomo/config.yaml"
 command_user="mihomo:mihomo"
-directory="/var/lib/mihomo"
+directory="/var/lib/mihomo/runtime"
 pidfile="/run/${RC_SVCNAME}.pid"
 capabilities="^cap_net_bind_service"
 output_log="/var/log/mihomo/stdout.log"
@@ -615,16 +745,15 @@ depend() {
 	after firewall
 }
 EOF
-    chmod 755 /etc/init.d/mihomo
     plainln "  设置开机启动"
-    rc-update add mihomo default >/dev/null 2>&1 || rc-update add mihomo default >/dev/null 2>&1 || true
+    rc-update add mihomo default >/dev/null 2>&1 || return 1
     drop_file_caps "$BIN"
   else
     if ! command -v systemctl >/dev/null 2>&1; then
       err "Debian 需要 systemd。"
       return 1
     fi
-    cat >/etc/systemd/system/mihomo.service <<'EOF'
+    atomic_text "$SYSTEMD_UNIT" 644 root root <<'EOF' || return 1
 [Unit]
 Description=mihomo Service
 Documentation=https://wiki.metacubex.one/
@@ -637,21 +766,18 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=yes
 UMask=0077
-WorkingDirectory=/var/lib/mihomo
-ExecStart=/usr/local/bin/mihomo -d /usr/local/etc/mihomo -f /usr/local/etc/mihomo/config.yaml
+WorkingDirectory=/var/lib/mihomo/runtime
+ExecStart=/usr/local/bin/mihomo -d /var/lib/mihomo/runtime -f /usr/local/etc/mihomo/config.yaml
 Restart=on-failure
 RestartSec=2s
 LimitNPROC=10000
 LimitNOFILE=1000000
-StateDirectory=mihomo
-StateDirectoryMode=0750
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    chmod 644 /etc/systemd/system/mihomo.service
-    if [[ -d /etc/logrotate.d ]]; then
-      cat >/etc/logrotate.d/mihomo <<'EOF'
+    if [[ -d $(dirname "$LOGROTATE_FILE") ]]; then
+      atomic_text "$LOGROTATE_FILE" 644 root root <<'EOF' || return 1
 /var/log/mihomo/*.log {
     daily
     missingok
@@ -663,11 +789,10 @@ EOF
     su mihomo mihomo
 }
 EOF
-      chmod 644 /etc/logrotate.d/mihomo
     fi
-    systemctl daemon-reload
+    systemctl daemon-reload || return 1
     plainln "  设置开机启动"
-    systemctl enable mihomo >/dev/null 2>&1
+    systemctl enable mihomo >/dev/null 2>&1 || return 1
     drop_file_caps "$BIN"
   fi
 }
@@ -680,6 +805,39 @@ svc() {
   fi
 }
 
+socket_owned_by_kernel() {
+  local transport=$1 listen=$2 port=$3 output pid filter
+  filter="sport = :${port} and src $(uri_host "$listen")"
+  # ss 负责 IPv6 地址规范化；验证 socket 属主，而非仅检查端口被占用。
+  output=$(ss -H -lnp "-$transport" "$filter" 2>/dev/null) || return 1
+  while [[ $output =~ pid=([0-9]+) ]]; do
+    pid=${BASH_REMATCH[1]}
+    if [[ /proc/$pid/exe -ef $BIN ]]; then
+      return 0
+    fi
+    output=${output#*pid="$pid"}
+  done
+  return 1
+}
+
+listeners_ready() {
+  local f proto net listen port
+  command -v ss >/dev/null 2>&1 || return 1
+  for f in "$META_DIR"/*.json; do
+    [[ -f $f ]] || continue
+    proto=$(jq -er '.protocol' "$f") || return 1
+    net=$(jq -r '.network // ""' "$f") || return 1
+    listen=$(jq -er '.listen' "$f") || return 1
+    port=$(jq -er '.port' "$f") || return 1
+    if uses_tcp "$proto" "$net"; then
+      socket_owned_by_kernel t "$listen" "$port" || return 1
+    fi
+    if uses_udp "$proto" "$net"; then
+      socket_owned_by_kernel u "$listen" "$port" || return 1
+    fi
+  done
+}
+
 kernel_stays_up() {
   local i
   svc "$1" || return 1
@@ -687,6 +845,13 @@ kernel_stays_up() {
     sleep 0.5
     is_running || return 1
   done
+  for ((i = 0; i < 14; i++)); do
+    listeners_ready && return 0
+    sleep 0.5
+    is_running || return 1
+  done
+  err "入站未能完成 TCP/UDP 监听，或监听端口不属于 mihomo。"
+  return 1
 }
 
 show_service_log() {
@@ -700,13 +865,32 @@ show_service_log() {
   ui "$GRN"
 }
 
+validate_managed_endpoints() {
+  local f tag port proto network listen
+  for f in "$META_DIR"/*.json; do
+    [[ -f $f ]] || continue
+    tag=$(jq -er '.tag' "$f") || return 1
+    port=$(jq -er '.port' "$f") || return 1
+    proto=$(jq -er '.protocol' "$f") || return 1
+    network=$(jq -r '.network // ""' "$f") || return 1
+    listen=$(jq -er '.listen' "$f") || return 1
+    if port_conflict "$port" "$tag" "$proto" "$network" "$listen"; then
+      err "入站 ${tag} 与 ${CONFLICT_TAG} 的监听端点冲突。"
+      return 1
+    fi
+  done
+}
+
 commit_tx() {
-  if ! box_test; then
+  if ! validate_managed_endpoints || ! box_test; then
     rollback_tx
     err "已回滚本次修改。"
     return 1
   fi
-  fix_tree_perms
+  if ! fix_tree_perms; then
+    rollback_tx
+    return 1
+  fi
   if ! service_uses_panel_conf; then
     plainln "  正在把服务切换到面板配置。"
     if ! install_service; then
@@ -715,11 +899,11 @@ commit_tx() {
       return 1
     fi
   fi
-  if is_running; then
+  if ((TX_WAS_RUNNING)); then
+    TX_RESTART=1
     if ! kernel_stays_up restart; then
       rollback_tx
-      svc restart || true
-      err "重启失败，已回滚。"
+      err "入站启动失败，已尝试恢复原配置和服务。"
       show_service_log
       return 1
     fi
@@ -727,6 +911,7 @@ commit_tx() {
   else
     plainln "  配置已保存。内核当前未运行，可在主菜单选择 3 启动。"
   fi
+  end_tx
 }
 
 current_version() {
@@ -803,26 +988,27 @@ kernel_state() {
 }
 
 status_text() {
-  local state=$1 ver=$2 count=$3
-  local mark left mid right gap
-  case $state in
-    运行中) mark="${GRN}●${GRN}" ;;
-    未运行) mark="${YEL}●${GRN}" ;;
-    *) mark="${RED}●${GRN}" ;;
+  local color=$RED
+  case $1 in
+    运行中) color=$GRN ;;
+    未运行) color=$YEL ;;
   esac
-  left="● ${state}"
-  mid=$ver
-  right="入站 ${count}"
-  gap=$((WIDTH - $(dw "$left") - $(dw "$mid") - $(dw "$right")))
-  ((gap < 2)) && gap=2
-  printf '%b%s%b%s%s%s' "$mark" " ${state}" "$GRN" "$(spaces $((gap / 2)))" "$mid" "$(spaces $((gap - gap / 2)))$right"
+  printf '%b● %s%b  |  %s  |  面板入站 %s' "$color" "$1" "$RST" "$2" "$3"
 }
 
 menu_row() {
   local n1=$1 l1=$2 n2=$3 l2=$4
-  printf '  %s%s  %s%s\n' \
-    "$(pad "$n1" 3)" "$(pad "$l1" 16)" \
-    "$(pad "$n2" 3)" "$l2" >&4
+  printf '  %b%s%b%s  %b%s%b%s\n' \
+    "$ACC" "$(pad "$n1" "$MENU_NUM_W")" "$RST" "$(pad "$l1" "$MENU_LABEL_W")" \
+    "$ACC" "$(pad "$n2" "$MENU_NUM_W")" "$RST" "$l2" >&4
+}
+
+print_menu_rows() {
+  local spec n1 l1 n2 l2
+  for spec in "$@"; do
+    read -r n1 l1 n2 l2 <<<"$spec"
+    menu_row "$n1" "$l1" "$n2" "$l2"
+  done
 }
 
 draw_panel() {
@@ -832,20 +1018,20 @@ draw_panel() {
   count=$(count_inbounds)
   cls
   blank
-  uin "  ${BOLD}mihomo${OFFBOLD}"
-  uin "  ${RULE}"
+  uin "  ${ACC}${BOLD}MIHOMO${RST}  ${DIM}服务与入站管理${RST}"
+  uin "  ${DIM}${RULE}${RST}"
   uin "  $(status_text "$state" "$ver" "$count")"
-  uin "  ${RULE}"
+  uin "  ${DIM}${RULE}${RST}"
   blank
-  note "内核"
-  menu_row "1" "安装" "2" "升级"
-  menu_row "3" "启动" "4" "停止"
-  item "5" "卸载"
+  note "01 / 内核服务"
+  print_menu_rows "${PANEL_KERNEL[@]}"
+  item "5" "卸载内核"
   blank
-  note "入站"
-  menu_row "6" "添加" "7" "修改"
-  menu_row "8" "分享" "9" "删除"
-  item "10" "日志"
+  note "02 / 入站配置"
+  print_menu_rows "${PANEL_INBOUND[@]}"
+  blank
+  note "03 / 诊断"
+  print_menu_rows "${PANEL_DIAG[@]}"
   blank
 }
 
@@ -912,14 +1098,29 @@ download_release() {
   fi
 }
 
+stage_release() {
+  local version=$1 dest
+  dest=$(mktemp -d) || {
+    err "无法创建临时目录。"
+    return 1
+  }
+  TMP_PATHS+=("$dest")
+  mkdir -p "$dest/pack" || return 1
+  download_release "$version" "$dest" || return 1
+  printf '%s' "$dest"
+}
+
 place_binary() {
   local src=$1 new
-  new=/usr/local/bin/mihomo.new
-  cp -- "$src" "$new" || return 1
+  new=$(mktemp -p "$(dirname "$BIN")" .mihomo.XXXXXXXX) || return 1
+  cp -- "$src" "$new" || { rm -f -- "$new"; return 1; }
   chown root:root "$new" || { rm -f -- "$new"; return 1; }
   chmod 755 "$new" || { rm -f -- "$new"; return 1; }
   drop_file_caps "$new"
-  mv -f -- "$new" "$BIN"
+  if ! mv -f -- "$new" "$BIN"; then
+    rm -f -- "$new"
+    return 1
+  fi
 }
 
 deploy_pack() {
@@ -931,15 +1132,6 @@ deploy_pack() {
   rebuild_config || return 1
   fix_tree_perms || return 1
   install_service
-}
-
-restore_binary() {
-  local saved=$1
-  if [[ -n $saved && -f $saved ]]; then
-    place_binary "$saved" || return 1
-  else
-    rm -f -- "$BIN"
-  fi
 }
 
 install_kernel() {
@@ -962,19 +1154,22 @@ install_kernel() {
     return 0
   }
   plainln "  最新版本 ${version}"
-  work=$(mktemp -d)
-  TMP_PATHS+=("$work")
-  mkdir -p "$work/pack"
-  if ! download_release "$version" "$work"; then
+  work=$(stage_release "$version") || {
+    pause
+    return 0
+  }
+  if ! begin_tx deploy; then
+    err "无法创建安装快照。"
     pause
     return 0
   fi
-  deploy_pack "$work/pack" || { pause; return 0; }
-  if ! box_test; then
-    warn "内核已安装，但基础配置未通过校验。"
+  if ! deploy_pack "$work/pack" || ! validate_managed_endpoints || ! box_test; then
+    rollback_tx
+    err "安装失败，已尝试恢复安装前的文件。"
     pause
     return 0
   fi
+  end_tx
   blank
   plainln "  安装完成。"
   kv "版本" "$(current_version)"
@@ -988,7 +1183,7 @@ install_kernel() {
 }
 
 upgrade_kernel() {
-  local work version current cmp was=0 saved=""
+  local work version current cmp
   header "升级内核"
   if [[ ! -x $BIN ]]; then
     err "请先安装内核。"
@@ -1018,10 +1213,12 @@ upgrade_kernel() {
     fi
     confirm "是否仍要重新安装此版本？" || return 0
   fi
-  work=$(mktemp -d)
-  TMP_PATHS+=("$work")
-  mkdir -p "$work/pack"
-  if ! download_release "$version" "$work"; then
+  work=$(stage_release "$version") || {
+    pause
+    return 0
+  }
+  if ! begin_tx deploy; then
+    err "无法创建升级快照。"
     pause
     return 0
   fi
@@ -1032,40 +1229,36 @@ upgrade_kernel() {
       err "新版本无法加载当前配置，已取消升级。"
       cat "$work/test.err" >&4 || true
       ui "$GRN"
+      end_tx
       pause
       return 0
     fi
   fi
-  is_running && was=1
-  if [[ -x $BIN ]]; then
-    saved=$work/mihomo.prev
-    cp -a -- "$BIN" "$saved" || {
-      err "无法备份当前内核，已取消升级。"
-      pause
-      return 0
-    }
-  fi
-  if ! deploy_pack "$work/pack"; then
-    restore_binary "$saved" || err "恢复旧内核失败。"
+  if ! deploy_pack "$work/pack" || ! validate_managed_endpoints || ! box_test; then
+    rollback_tx
+    err "升级失败，已尝试恢复原内核、配置和服务文件。"
     pause
     return 0
   fi
-  if [[ $was -eq 1 ]]; then
+  if ((TX_WAS_RUNNING)); then
+    TX_RESTART=1
     if kernel_stays_up restart; then
       plainln "  已升级到 $(current_version)，内核已重启。"
     else
-      err "新内核未能保持运行，正在恢复旧版本。"
+      err "新版本入站未就绪，正在恢复升级前状态。"
       show_service_log
-      if restore_binary "$saved" && install_service && kernel_stays_up restart; then
+      if rollback_tx; then
         plainln "  已恢复到 ${current}。"
       else
-        err "恢复旧内核失败。"
         show_service_log
       fi
+      pause
+      return 0
     fi
   else
     plainln "  已升级到 $(current_version)。内核当前未运行。"
   fi
+  end_tx
   pause
 }
 
@@ -1076,24 +1269,34 @@ start_kernel() {
     pause
     return 0
   fi
-  if ! service_installed; then
-    plainln "  服务文件不存在，正在修复..."
-    create_box_user || { pause; return 0; }
-    ensure_dirs
-    ensure_base_config
-    install_service || { pause; return 0; }
+  if ! ensure_deps; then
+    err "依赖安装失败。"
+    pause
+    return 0
   fi
+  if ! service_uses_panel_conf; then
+    plainln "  服务文件需要更新，正在修复..."
+    begin_tx || { pause; return 0; }
+    if ! create_box_user || ! ensure_dirs || ! ensure_base_config || ! install_service; then
+      rollback_tx
+      pause
+      return 0
+    fi
+    end_tx
+  fi
+  fix_tree_perms || { pause; return 0; }
   if is_running; then
     plainln "  内核已在运行。"
     pause
     return 0
   fi
-  if ! box_test; then
+  if ! validate_managed_endpoints || ! box_test; then
     pause
     return 0
   fi
   if ! kernel_stays_up start; then
-    err "启动失败。"
+    svc stop || true
+    err "启动失败，已停止未就绪的服务。"
     show_service_log
     pause
     return 0
@@ -1120,7 +1323,7 @@ stop_kernel() {
 
 uninstall_kernel() {
   header "卸载内核"
-  if [[ ! -x $BIN && ! -f $CONF ]] && ! service_installed; then
+  if [[ ! -x $BIN && ! -f $CONF ]] && ! service_uses_panel_conf; then
     plainln "  内核未安装。"
     pause
     return 0
@@ -1131,7 +1334,8 @@ uninstall_kernel() {
   if confirm "是否同时清除面板配置、证书、日志和 mihomo 用户？"; then
     purge=1
   fi
-  if is_running || service_installed; then
+  acquire_lock || { pause; return 0; }
+  if is_running || service_uses_panel_conf; then
     if [[ $OS == alpine ]]; then
       rc-service mihomo stop >/dev/null 2>&1 || true
       rc-update del mihomo default >/dev/null 2>&1 || true
@@ -1139,11 +1343,11 @@ uninstall_kernel() {
       systemctl disable --now mihomo >/dev/null 2>&1 || true
     fi
   fi
-  rm -f -- "$BIN" /usr/local/bin/mihomo.new
+  rm -f -- "$BIN"
   if [[ $OS == alpine ]]; then
-    rm -f -- /etc/init.d/mihomo
+    rm -f -- "$OPENRC_SERVICE" "$OPENRC_ENABLE_LINK"
   else
-    rm -f -- /etc/systemd/system/mihomo.service /etc/logrotate.d/mihomo
+    rm -f -- "$SYSTEMD_UNIT" "$SYSTEMD_ENABLE_LINK" "$LOGROTATE_FILE"
     if command -v systemctl >/dev/null 2>&1; then
       systemctl daemon-reload || true
     fi
@@ -1153,8 +1357,8 @@ uninstall_kernel() {
     if [[ -f $CONF ]]; then
       rm -f -- "$CONF"
     fi
-    for f in "$CONF_DIR"/*; do
-      [[ -e $f ]] || continue
+    for f in "$CONF_DIR"/* "$CONF_DIR"/.[!.]* "$CONF_DIR"/..?*; do
+      [[ -e $f || -L $f ]] || continue
       kept=1
     done
     rm -rf -- "$LOG_DIR" "$STATE_DIR"
@@ -1178,6 +1382,7 @@ uninstall_kernel() {
     plainln "  ${CONF}"
     plainln "  ${LOG_DIR}"
   fi
+  release_lock
   pause
 }
 
@@ -1209,7 +1414,7 @@ follow_log() {
   pid=$!
   trap 'kill "$pid" 2>/dev/null || true' INT
   wait "$pid" 2>/dev/null || true
-  trap - INT
+  trap 'exit 130' INT
   ui "$GRN"
   ui $'\n'
 }
@@ -1234,13 +1439,11 @@ view_logs() {
 }
 
 uses_tcp() {
-  local proto=$1 net=$2
+  local proto=$1
   if [[ $proto == hysteria2 ]]; then
     return 1
   fi
-  if [[ $proto == shadowsocks && -n $net && $net != *tcp* ]]; then
-    return 1
-  fi
+  # Shadowsocks 的 udp 开关只增加 UDP 监听，TCP 始终启用。
   return 0
 }
 
@@ -1362,6 +1565,13 @@ ask_port() {
       err "端口须为 1-65535。"
       continue
     fi
+    # 先限制位数，避免超长输入触发 shell 整数溢出。
+    ans=${ans#"${ans%%[!0]*}"}
+    [[ -n $ans ]] || ans=0
+    if ((${#ans} > 5)); then
+      err "端口须为 1-65535。"
+      continue
+    fi
     p=$((10#$ans))
     if ((p < 1 || p > 65535)); then
       err "端口须为 1-65535。"
@@ -1404,10 +1614,13 @@ ask_name() {
     if ! is_ipv6 "$ans" && [[ $ans =~ ^([A-Za-z0-9.-]+):([0-9]+)$ ]]; then
       host=${BASH_REMATCH[1]}
       tport=${BASH_REMATCH[2]}
-      if ((10#$tport < 1 || 10#$tport > 65535)); then
+      tport=${tport#"${tport%%[!0]*}"}
+      [[ -n $tport ]] || tport=0
+      if ((${#tport} > 5)) || ((10#$tport < 1 || 10#$tport > 65535)); then
         err "端口不合法。"
         continue
       fi
+      tport=$((10#$tport))
     fi
     if [[ $mode == domain ]]; then
       if [[ $host =~ [A-Za-z] ]] && is_domain "$host"; then
@@ -1432,39 +1645,47 @@ ask_choice() {
   if [[ -z $ans ]]; then
     return 5
   fi
-  if [[ $ans =~ ^[0-9]+$ ]] && ((10#$ans >= 1 && 10#$ans <= max)); then
+  ans=${ans#"${ans%%[!0]*}"}
+  [[ -n $ans ]] || ans=0
+  if [[ $ans =~ ^[0-9]+$ ]] && ((${#ans} <= ${#max})) && ((10#$ans >= 1 && 10#$ans <= max)); then
     printf '%s' "$((10#$ans))"
     return 0
   fi
   return 4
 }
 
+choice_menu() {
+  local mode=$1 title=$2 hint=$3 subtitle=$4
+  shift 4
+  local -a rows=("$@")
+  local choice msg='' rc i
+  while true; do
+    header "$title"
+    [[ -z $subtitle ]] || { note "$subtitle"; blank; }
+    for ((i = 0; i < ${#rows[@]}; i++)); do
+      if [[ $mode == fields ]]; then
+        printf '  %b%s%b%s%s\n' "$ACC" "$(pad "$((i + 1))" "$MENU_NUM_W")" "$RST" \
+          "$(pad "${rows[i]%%=*}" 9)" "${rows[i]#*=}" >&4
+      else
+        item "$((i + 1))" "${rows[i]}"
+      fi
+    done
+    blank
+    [[ -z $msg ]] || err "$msg"
+    next_choice choice msg "${#rows[@]}" "$hint"
+    rc=$?
+    case $rc in
+      0) printf '%s' "$choice"; return 0 ;;
+      1) ;;
+      *) return "$rc" ;;
+    esac
+  done
+}
+
 choose() {
   local title=$1 hint=$2
   shift 2
-  local -a rows=("$@")
-  local choice msg="" rc n=${#rows[@]}
-  while true; do
-    header "$title"
-    for ((choice = 0; choice < n; choice++)); do
-      item "$((choice + 1))" "${rows[choice]}"
-    done
-    blank
-    if [[ -n $msg ]]; then
-      err "$msg"
-    fi
-    msg=""
-    next_choice choice msg "$n" "$hint"
-    rc=$?
-    if [[ $rc -eq 0 ]]; then
-      printf '%s' "$choice"
-      return 0
-    fi
-    if [[ $rc -eq 1 ]]; then
-      continue
-    fi
-    return "$rc"
-  done
+  choice_menu items "$title" "$hint" '' "$@"
 }
 
 next_choice() {
@@ -1509,10 +1730,9 @@ ask_method() {
 
 ask_ss_network() {
   local choice
-  choice=$(choose "传输" "取消" "tcp,udp" "tcp" "udp") || return $?
+  choice=$(choose "传输" "取消" "tcp,udp" "tcp") || return $?
   case $choice in
     2) printf 'tcp' ;;
-    3) printf 'udp' ;;
     *) printf 'tcp,udp' ;;
   esac
 }
@@ -1589,11 +1809,7 @@ is_uuid() {
 ask_uuid() {
   local current=$1 ans bytes
   while true; do
-    if [[ -n $current ]]; then
-      ans=$(prompt "UUID" "" "回车保留，g 重新生成，q 取消") || return 2
-    else
-      ans=$(prompt "UUID" "" "回车生成，q 取消") || return 2
-    fi
+    ans=$(regen_prompt "UUID" "$current") || return 2
     cancelled "$ans" && return 2
     if [[ -z $ans ]]; then
       if [[ -n $current ]]; then
@@ -1619,11 +1835,7 @@ ask_uuid() {
 ask_password() {
   local label=$1 current=$2 method=$3 ans
   while true; do
-    if [[ -n $current ]]; then
-      ans=$(prompt "$label" "" "回车保留，g 重新生成，q 取消") || return 2
-    else
-      ans=$(prompt "$label" "" "回车生成，q 取消") || return 2
-    fi
+    ans=$(regen_prompt "$label" "$current") || return 2
     if [[ -z $ans ]]; then
       if [[ -n $current ]]; then
         if [[ -n $method ]] && ! ss_key_ok "$method" "$current"; then
@@ -1662,7 +1874,7 @@ ask_reality_keys() {
   local cur_priv=$1 cur_pub=$2 cur_sid=$3 ans
   if [[ -n $cur_priv && -n $cur_pub ]]; then
     while true; do
-      ans=$(prompt "REALITY 密钥" "" "回车保留，g 重新生成，q 取消") || return 2
+      ans=$(regen_prompt "REALITY 密钥" "$cur_priv") || return 2
       if [[ -z $ans ]]; then
         printf '%s\n%s\n%s\n' "$cur_priv" "$cur_pub" "$cur_sid"
         return 0
@@ -1678,15 +1890,14 @@ ask_reality_keys() {
   fi
   local pair priv pub sid
   pair=$(gen_reality_pair) || return 1
-  priv=$(printf '%s\n' "$pair" | sed -n '1p')
-  pub=$(printf '%s\n' "$pair" | sed -n '2p')
+  read_fields "$pair" priv pub
   sid=$(gen_shortid)
   printf '%s\n%s\n%s\n' "$priv" "$pub" "$sid"
 }
 
 make_self_signed() {
   local cn=$1 dir san crt key
-  dir=$(mktemp -d)
+  dir=$(mktemp -d) || return 1
   crt=$dir/cert.crt
   key=$dir/cert.key
   if is_ipv4 "$cn" || is_ipv6 "$cn"; then
@@ -1714,9 +1925,17 @@ copy_cert_pair() {
     err "证书或私钥不可读。"
     return 1
   fi
-  install -d -m 750 -o root -g mihomo "$CERT_DIR"
-  install -m 640 -o root -g mihomo "$src_crt" "$crt"
-  install -m 640 -o root -g mihomo "$src_key" "$key"
+  install -d -m 750 -o root -g mihomo "$CERT_DIR" || return 1
+  # 用户选择当前目标文件时不原地 install；先暂存，任何复制失败都必须上报。
+  local staged
+  staged=$(mktemp -d) || return 1
+  if ! cp -- "$src_crt" "$staged/cert" || ! cp -- "$src_key" "$staged/key" \
+    || ! atomic_text "$crt" 640 root mihomo <"$staged/cert" \
+    || ! atomic_text "$key" 640 root mihomo <"$staged/key"; then
+    rm -rf -- "$staged"
+    return 1
+  fi
+  rm -rf -- "$staged"
   printf '%s\n%s\n' "$crt" "$key"
 }
 
@@ -1749,6 +1968,7 @@ ask_cert() {
         return 1
       fi
       ans=$(prompt "跳过证书校验" "n" "q 取消") || return 2
+      cancelled "$ans" && return 2
       if [[ $ans == y || $ans == Y ]]; then
         insecure=1
       else
@@ -1838,8 +2058,7 @@ render_managed() {
 
 render_listener() {
   jq -r '
-    def q:
-      gsub("\\\\"; "\\\\") | gsub("\""; "\\\"") | "\"" + . + "\"";
+    def q: tojson;
     def listen_line:
       "  - name: " + (.tag | q) + "\n"
       + "    type: " + .protocol + "\n"
@@ -1849,9 +2068,7 @@ render_listener() {
       listen_line
       + "\n    cipher: " + (.method | q)
       + "\n    password: " + (.password | q)
-      + (if .network == "tcp" then "\n    udp: false"
-         elif .network == "udp" then "\n    udp: true"
-         else "\n    udp: true" end)
+      + (if .network == "tcp" then "\n    udp: false" else "\n    udp: true" end)
     elif .protocol == "vless" then
       listen_line
       + "\n    users:"
@@ -1879,29 +2096,37 @@ render_listener() {
   '
 }
 
-# 面板段落是 listeners 的唯一来源。早期版本的基础配置自带
-# listeners: []，会和面板段落重复，这里把段落之外的那一行去掉。
+# 只迁移早期基础配置中的空行内列表。手写的非空/多行 listeners
+# 无法在不解析 YAML 的情况下安全合并，明确拒绝，绝不静默删除。
 drop_stray_listeners() {
-  local file=$1 begin end
-  grep -q '^listeners:' "$file" || return 0
-  if grep -q '^# mihomo-panel:begin$' "$file"; then
-    begin=$(grep -n '^# mihomo-panel:begin$' "$file" | head -n 1 | cut -d: -f1)
-    end=$(grep -n '^# mihomo-panel:end$' "$file" | head -n 1 | cut -d: -f1)
-  else
-    begin=0
-    end=0
-  fi
-  awk -v begin="$begin" -v end="$end" '
-    NR < begin || NR > end { if ($0 ~ /^listeners:/) next }
+  local file=$1
+  if ! awk '
+    /^# mihomo-panel:begin$/ { managed = 1 }
+    /^# mihomo-panel:end$/ { managed = 0; print; next }
+    !managed && /^listeners[[:space:]]*:/ {
+      if ($0 ~ /^listeners:[[:space:]]*\[\][[:space:]]*(#.*)?$/) next
+      exit 1
+    }
     { print }
-  ' "$file" >"$file.clean" && mv -f -- "$file.clean" "$file"
+  ' "$file" >"$file.clean"; then
+    rm -f -- "$file.clean"
+    err "配置含有面板外的 listeners；请先合并或迁移这些入站，原配置未改动。"
+    return 1
+  fi
+  mv -f -- "$file.clean" "$file"
 }
 
 rebuild_config() {
-  local managed tmp begin end
+  local managed tmp begin end begins ends
   managed=$(render_managed) || return 1
   if [[ -f $CONF ]]; then
-    tmp=$(mktemp)
+    begins=$(grep -c '^# mihomo-panel:begin$' "$CONF" || true)
+    ends=$(grep -c '^# mihomo-panel:end$' "$CONF" || true)
+    if ((begins != ends || begins > 1)); then
+      err "配置中的面板标记不完整或重复。"
+      return 1
+    fi
+    tmp=$(mktemp) || return 1
     TMP_PATHS+=("$tmp")
     if grep -q '^# mihomo-panel:begin$' "$CONF"; then
       begin=$(grep -n '^# mihomo-panel:begin$' "$CONF" | head -n 1 | cut -d: -f1)
@@ -1922,7 +2147,7 @@ rebuild_config() {
       } >"$tmp" || return 1
     fi
   else
-    tmp=$(mktemp)
+    tmp=$(mktemp) || return 1
     TMP_PATHS+=("$tmp")
     {
       empty_config
@@ -2002,7 +2227,7 @@ firewall_hint() {
     shadowsocks)
       case $network in
         tcp) plainln "  请放行 TCP ${port}。" ;;
-        udp) plainln "  请放行 UDP ${port}。" ;;
+        udp) plainln "  请放行 TCP/UDP ${port}（旧版 udp 选项也会启用 TCP）。" ;;
         *) plainln "  请放行 TCP/UDP ${port}。" ;;
       esac
       ;;
@@ -2020,7 +2245,8 @@ need_tx() {
 
 finish_inbound() {
   local tag=$1 proto=$2 port=$3 network
-  printf '%s' "$4" | save_meta_and_inbound "$tag" || { rollback_tx; err "写入失败。"; pause; return 1; }
+  # 在当前 shell 中重建配置，临时文件和事务清理状态不能丢在管道子 shell。
+  save_meta_and_inbound "$tag" <<<"$4" || { rollback_tx; err "写入失败。"; pause; return 1; }
   commit_tx || { pause; return 1; }
   network=$(printf '%s' "$4" | jq -r '.network // ""')
   firewall_hint "$proto" "$port" "$network"
@@ -2028,10 +2254,7 @@ finish_inbound() {
 }
 
 load_cert_fields() {
-  cert_mode=$(printf '%s\n' "$1" | sed -n '1p')
-  cert=$(printf '%s\n' "$1" | sed -n '2p')
-  key=$(printf '%s\n' "$1" | sed -n '3p')
-  insecure=$(printf '%s\n' "$1" | sed -n '4p')
+  read_fields "$1" cert_mode cert key insecure
   if [[ $cert_mode == temp ]]; then
     cert_show="自签证书"
     TMP_PATHS+=("$(dirname "$cert")")
@@ -2064,8 +2287,7 @@ install_chosen_cert() {
   src_crt=$cert
   src_key=$key
   paths=$(materialize_cert "$1" "$cert_mode" "$src_crt" "$src_key") || return 1
-  cert=$(printf '%s\n' "$paths" | sed -n '1p')
-  key=$(printf '%s\n' "$paths" | sed -n '2p')
+  read_fields "$paths" cert key
   drop_temp_cert "$cert_mode" "$src_crt"
   cert_mode=keep
 }
@@ -2116,14 +2338,11 @@ vless_wizard() {
   remark=$(ask_remark "vless-${port}") || return 0
   note "伪装站点需要 TLS 1.3，不要用 Cloudflare CDN。"
   name_pack=$(ask_name "伪装域名" "www.microsoft.com:443" domain) || return 0
-  host=$(printf '%s\n' "$name_pack" | sed -n '1p')
-  tport=$(printf '%s\n' "$name_pack" | sed -n '2p')
+  read_fields "$name_pack" host tport
   sni=$host
   target=$host
   keys=$(ask_reality_keys "" "" "") || { [[ $? -eq 1 ]] && pause; return 0; }
-  priv=$(printf '%s\n' "$keys" | sed -n '1p')
-  pub=$(printf '%s\n' "$keys" | sed -n '2p')
-  sid=$(printf '%s\n' "$keys" | sed -n '3p')
+  read_fields "$keys" priv pub sid
   uuid=$(ask_uuid "") || return 0
   blank
   kv "协议" "VLESS / REALITY"
@@ -2153,7 +2372,7 @@ hy_wizard() {
   tag=$(new_tag hy2 "$port")
   remark=$(ask_remark "hy2-${port}") || return 0
   name_pack=$(ask_name "证书域名或 IP" "" name) || return 0
-  host=$(printf '%s\n' "$name_pack" | sed -n '1p')
+  read_fields "$name_pack" host
   sni=$host
   cert_pack=$(ask_cert "$sni" "" "" 1) || { [[ $? -eq 1 ]] && pause; return 0; }
   load_cert_fields "$cert_pack"
@@ -2184,15 +2403,19 @@ prepare_store() {
   ensure_dirs
 }
 
-add_inbound() {
-  local choice
-  require_kernel || return 0
+ready_panel() {
+  require_kernel || return 1
   if ! ensure_deps; then
     err "依赖安装失败。"
     pause
-    return 0
+    return 1
   fi
-  prepare_store || return 0
+  prepare_store
+}
+
+add_inbound() {
+  local choice
+  ready_panel || return 0
   while true; do
     choice=$(choose "添加入站" "返回" "Shadowsocks" "VLESS REALITY" "Hysteria2") || return 0
     case $choice in
@@ -2212,38 +2435,10 @@ add_inbound() {
   done
 }
 
-show_field() {
-  printf '  %s%s%s\n' "$(pad "$1" 3)" "$(pad "$2" 9)" "$3" >&4
-}
-
 edit_loop() {
   local title=$1 remark=$2
   shift 2
-  local -a rows=("$@")
-  local choice msg="" rc n=${#rows[@]}
-  while true; do
-    header "$title"
-    note "$remark"
-    blank
-    for ((choice = 0; choice < n; choice++)); do
-      show_field "$((choice + 1))" "${rows[choice]%%=*}" "${rows[choice]#*=}"
-    done
-    blank
-    if [[ -n $msg ]]; then
-      err "$msg"
-    fi
-    msg=""
-    next_choice choice msg "$n" "返回"
-    rc=$?
-    if [[ $rc -eq 0 ]]; then
-      printf '%s' "$choice"
-      return 0
-    fi
-    if [[ $rc -eq 1 ]]; then
-      continue
-    fi
-    return 1
-  done
+  choice_menu fields "$title" "返回" "$remark" "$@"
 }
 
 ss_key_ok() {
@@ -2278,7 +2473,7 @@ edit_ss() {
     remark=$(jq -r '.remark' "$meta")
     method=$(jq -r '.method' "$meta")
     password=$(jq -r '.password' "$meta")
-    network=$(jq -r '.network' "$meta")
+    network=$(jq -r 'if .network == "udp" then "tcp,udp" else .network end' "$meta")
     choice=$(edit_loop "修改 Shadowsocks" "$remark" \
       "监听=$listen" "端口=$port" "传输=$network" \
       "备注=$remark" "加密=$method" "密码=$password") || return 0
@@ -2344,8 +2539,7 @@ edit_vless() {
         [[ -n $tport && $tport != null && $tport != 443 ]] && dest="${dest}:${tport}"
         plainln "  伪装站点需要支持 TLS 1.3，并避免 Cloudflare CDN。"
         name_pack=$(ask_name "伪装域名" "$dest" domain) || continue
-        host=$(printf '%s\n' "$name_pack" | sed -n '1p')
-        tport=$(printf '%s\n' "$name_pack" | sed -n '2p')
+        read_fields "$name_pack" host tport
         sni=$host
         target=$host
         ;;
@@ -2354,9 +2548,7 @@ edit_vless() {
           [[ $? -eq 1 ]] && pause
           continue
         }
-        priv=$(printf '%s\n' "$keys" | sed -n '1p')
-        pub=$(printf '%s\n' "$keys" | sed -n '2p')
-        sid=$(printf '%s\n' "$keys" | sed -n '3p')
+        read_fields "$keys" priv pub sid
         ;;
       6) uuid=$(ask_uuid "$uuid") || continue ;;
       *) continue ;;
@@ -2392,7 +2584,7 @@ edit_hy() {
       3) remark=$(ask_remark "$remark") || continue ;;
       4)
         name_pack=$(ask_name "证书域名或 IP" "$sni" name) || continue
-        sni=$(printf '%s\n' "$name_pack" | sed -n '1p')
+        read_fields "$name_pack" sni
         ;;
       5)
         apply_field_cert "$sni" "$cert" "$key" "$insecure" || continue
@@ -2416,13 +2608,7 @@ edit_hy() {
 
 edit_inbound() {
   local picked
-  require_kernel || return 0
-  if ! ensure_deps; then
-    err "依赖安装失败。"
-    pause
-    return 0
-  fi
-  prepare_store || return 0
+  ready_panel || return 0
   while true; do
     pick_inbound "修改入站" || return 0
     picked=$PICKED
@@ -2467,7 +2653,12 @@ delete_inbound() {
   if [[ -x $BIN ]]; then
     commit_tx || { pause; return 0; }
   else
-    fix_tree_perms
+    if ! fix_tree_perms; then
+      rollback_tx
+      pause
+      return 0
+    fi
+    end_tx
     plainln "  已删除。"
   fi
   pause
@@ -2546,7 +2737,7 @@ build_share() {
       if [[ -n $flow && $flow != null ]]; then
         query+="&flow=$(urlenc "$flow")"
       fi
-      printf 'vless://%s@%s:%s?%s#%s\n' "$uuid" "$host" "$port" "$query" "$enc"
+      printf 'vless://%s@%s:%s?%s#%s\n' "$(urlenc "$uuid")" "$host" "$port" "$query" "$enc"
       ;;
     hysteria2)
       auth=$(urlenc "$(jq -r '.auth' "$meta")")
@@ -2574,7 +2765,7 @@ share_details() {
   case $proto in
     shadowsocks)
       kv "加密" "$(jq -r '.method' "$meta")"
-      kv "传输" "$(jq -r '.network' "$meta")"
+      kv "传输" "$(jq -r 'if .network == "udp" then "tcp,udp" else .network end' "$meta")"
       kv "密码" "$(jq -r '.password' "$meta")"
       ;;
     vless)
@@ -2629,14 +2820,15 @@ share_inbound() {
       return 0
     }
   else
-    chown root:mihomo "$STATE_DIR"
-    chmod 750 "$STATE_DIR"
+    chown root:mihomo "$STATE_DIR" || { pause; return 0; }
+    chmod 750 "$STATE_DIR" || { pause; return 0; }
   fi
   printf '%s\n' "$host" >"$STATE_DIR/server_addr" || {
     err "无法保存服务器地址。"
     pause
     return 0
   }
+  chown root:root "$STATE_DIR/server_addr"
   chmod 600 "$STATE_DIR/server_addr"
   link=$(build_share "$picked" "$host") || { err "无法生成链接。"; pause; return 0; }
   header "分享入站"
@@ -2690,7 +2882,6 @@ EOF
 }
 
 main() {
-  local i
   if [[ ${1:-} == -h || ${1:-} == --help ]]; then
     usage
     return 0
@@ -2706,10 +2897,7 @@ main() {
     echo "请在交互终端中运行。" >&2
     return 1
   fi
-  RULE=""
-  for ((i = 0; i < WIDTH; i++)); do
-    RULE+="─"
-  done
+  init_ui
   main_menu
 }
 
@@ -2723,6 +2911,9 @@ if [[ ${MIHOMO_PANEL_SOURCE:-0} != 1 ]]; then
     exit 1
   fi
   trap cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
   main "$@"
 fi
 MIHOMO_PANEL_PAYLOAD
