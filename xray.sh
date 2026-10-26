@@ -2035,8 +2035,6 @@ meta_hy() {
       certFile:$cert,keyFile:$key,insecure:$insecure}'
 }
 
-# 不写 minClientVer 时，Xray 26.7.11 与 26.7.28 会默认要求 26.3.27。
-# 第三方客户端在 REALITY 握手里上报的版本低于该值会被拒绝。显式写成 1.0.0 以覆盖该默认值。
 render_inbound() {
   jq '
     def hy_sni:
@@ -2053,8 +2051,7 @@ render_inbound() {
             clients:[{id:$m.uuid, flow:$m.flow, email:$m.tag}]},
           streamSettings:{network:"tcp", security:"reality",
             realitySettings:{target:($m.target + ":" + ($m.targetPort | tostring)),
-              serverNames:[$m.sni], privateKey:$m.privateKey, shortIds:[$m.shortId],
-              minClientVer:"1.0.0"}}}
+              serverNames:[$m.sni], privateKey:$m.privateKey, shortIds:[$m.shortId]}}}
     elif .protocol == "hysteria2" then
       . as $m
       | {tag:$m.tag, listen:$m.listen, port:$m.port, protocol:"hysteria",
