@@ -362,9 +362,53 @@ box_group_ok() {
   [[ $(id -gn sing-box 2>/dev/null) == sing-box ]]
 }
 
+# 复用账户不能是 root，也不能带登录 shell、附加组或未锁定的口令。
+box_account_ok() {
+  local uid gid shell pw g primary groups
+  uid=$(id -u sing-box 2>/dev/null) || { err "缺少 sing-box 用户。"; return 1; }
+  gid=$(id -g sing-box 2>/dev/null) || return 1
+  if [[ $uid -eq 0 || $gid -eq 0 ]]; then
+    err "sing-box 账户不能是 root。"
+    return 1
+  fi
+  if ! box_group_ok; then
+    err "sing-box 账户必须以 sing-box 为主组。"
+    return 1
+  fi
+  shell=$( { getent passwd sing-box 2>/dev/null || awk -F: '$1=="sing-box"' /etc/passwd; } | awk -F: '{print $7; exit}' )
+  case $shell in
+    /sbin/nologin | /usr/sbin/nologin | /bin/false | /usr/bin/false) ;;
+    *)
+      err "sing-box 账户不能有登录 shell。"
+      return 1
+      ;;
+  esac
+  primary=$(id -g sing-box) || return 1
+  groups=$(id -G sing-box) || { err "无法读取 sing-box 的用户组。"; return 1; }
+  [[ -n $groups ]] || { err "无法读取 sing-box 的用户组。"; return 1; }
+  for g in $groups; do
+    if [[ $g != "$primary" ]]; then
+      err "sing-box 账户不能属于其他用户组。"
+      return 1
+    fi
+  done
+  pw=$(awk -F: '$1=="sing-box"{print $2; exit}' /etc/passwd)
+  if [[ $pw == x || ( $pw == '*' && -r /etc/shadow ) ]]; then
+    if [[ ! -r /etc/shadow ]]; then
+      err "无法确认 sing-box 账户口令已锁定。"
+      return 1
+    fi
+    pw=$(awk -F: '$1=="sing-box"{print $2; exit}' /etc/shadow)
+  fi
+  if [[ $pw != '!'* && $pw != '*'* ]]; then
+    err "sing-box 账户口令必须锁定。"
+    return 1
+  fi
+}
+
 # 只把 /var/empty 这类共享家目录换掉，自定义家目录不动。
 pin_box_home() {
-  local home tmp
+  local home tmp owner mode locked=0
   [[ $(id -u sing-box) -eq 0 || $(id -g sing-box) -eq 0 ]] && { err "已有的 sing-box 账户不能是 root。"; return 1; }
   home=$( { getent passwd sing-box 2>/dev/null || awk -F: '$1=="sing-box"' /etc/passwd; } | awk -F: '{print $6; exit}' )
   case $home in
@@ -376,16 +420,35 @@ pin_box_home() {
     usermod -d "$BOX_HOME" sing-box
     return
   fi
-  tmp=$(mktemp) || return 1
-  if awk -F: -v OFS=: -v home="$BOX_HOME" '$1=="sing-box" {$6=home} {print}' /etc/passwd >"$tmp" \
-    && awk -F: -v home="$BOX_HOME" '$1=="sing-box" && $6==home {ok=1} END{exit !ok}' "$tmp" \
-    && cat "$tmp" >/etc/passwd; then
-    rm -f -- "$tmp"
-    return 0
+  # 先写入同目录临时文件再改名，cat 重定向会先截断 /etc/passwd。
+  [[ -f /etc/passwd && ! -L /etc/passwd ]] || { err "拒绝修改异常的 /etc/passwd。"; return 1; }
+  if command -v flock >/dev/null 2>&1; then
+    exec 8>>/etc/.pwd.lock || return 1
+    if ! flock 8; then
+      exec 8>&-
+      return 1
+    fi
+    locked=1
   fi
-  rm -f -- "$tmp"
-  err "无法把 sing-box 的家目录改到 ${BOX_HOME}。"
-  return 1
+  tmp=$(mktemp /etc/passwd.XXXXXX) || { ((locked)) && exec 8>&-; return 1; }
+  owner=$(stat -c '%u:%g' /etc/passwd 2>/dev/null) || owner=""
+  mode=$(stat -c '%a' /etc/passwd 2>/dev/null) || mode=""
+  if [[ ! $owner =~ ^[0-9]+:[0-9]+$ || ! $mode =~ ^[0-7]{3,4}$ ]] \
+    || ! awk -F: -v OFS=: -v home="$BOX_HOME" '$1=="sing-box" {$6=home} {print}' /etc/passwd >"$tmp" \
+    || ! awk -F: -v home="$BOX_HOME" '$1=="sing-box" && $6==home {ok=1} END{exit !ok}' "$tmp" \
+    || ! chown "$owner" "$tmp" \
+    || ! chmod "$mode" "$tmp" \
+    || ! mv -f -- "$tmp" /etc/passwd; then
+    rm -f -- "$tmp"
+    if ((locked)); then
+      exec 8>&-
+    fi
+    err "无法把 sing-box 的家目录改到 ${BOX_HOME}。"
+    return 1
+  fi
+  if ((locked)); then
+    exec 8>&-
+  fi
 }
 
 ensure_box_home() {
@@ -395,15 +458,13 @@ ensure_box_home() {
 }
 
 create_box_user() {
-  ensure_box_home || return 1
   if id -u sing-box >/dev/null 2>&1; then
-    if ! box_group_ok; then
-      err "已有的 sing-box 账户必须以 sing-box 为主组。"
-      return 1
-    fi
+    box_account_ok || return 1
+    ensure_box_home || return 1
     warn "已有 sing-box 用户，继续使用。"
     return 0
   fi
+  ensure_box_home || return 1
   if [[ $OS == debian ]] && command -v systemd-sysusers >/dev/null 2>&1; then
     plainln "  创建 sing-box 用户"
     systemd-sysusers - >/dev/null 2>&1 <<EOF || true
@@ -424,10 +485,7 @@ EOF
     err "无法创建 sing-box 用户。"
     return 1
   fi
-  if [[ $(id -u sing-box) -eq 0 || $(id -g sing-box) -eq 0 ]] || ! box_group_ok; then
-    err "sing-box 账户身份或主组不安全。"
-    return 1
-  fi
+  box_account_ok || return 1
   ensure_box_home
 }
 
@@ -1234,10 +1292,15 @@ download_release() {
     return 1
   fi
   chmod 755 "$dest/pack/sing-box" || return 1
-  if ! "$dest/pack/sing-box" version >/dev/null 2>&1; then
+  if ! "$dest/pack/sing-box" version >"$dest/version.err" 2>&1; then
     err "程序无法执行，请确认架构。"
+    if [[ -s $dest/version.err ]]; then
+      cat "$dest/version.err" >&4 || true
+      ui "$GRN"
+    fi
     return 1
   fi
+  rm -f -- "$dest/version.err"
 }
 
 place_binary() {
@@ -1342,10 +1405,29 @@ resolve_latest() {
   printf '%s' "$version"
 }
 
+# 下载目录要能执行试跑。不使用常被挂成 noexec 的 /tmp，也不跟随 TMPDIR。
+stage_parent() {
+  local parent=${STATE_DIR%/*}
+  if [[ -n $parent && -d $parent && ! -L $parent && -w $parent ]]; then
+    printf '%s' "$parent"
+    return 0
+  fi
+  if [[ -d /var/tmp && ! -L /var/tmp && -w /var/tmp ]]; then
+    printf '%s' /var/tmp
+    return 0
+  fi
+  return 1
+}
+
 stage_release() {
   local -n _dest=$1
-  local version=$2 _stage_dir
-  _stage_dir=$(mktemp -d) || { err "无法创建下载目录。"; pause; return 1; }
+  local version=$2 _stage_dir parent
+  parent=$(stage_parent) || { err "无法创建下载目录。"; pause; return 1; }
+  _stage_dir=$(mktemp -d -p "$parent" .sing-box-stage.XXXXXX) || {
+    err "无法创建下载目录。"
+    pause
+    return 1
+  }
   TMP_PATHS+=("$_stage_dir")
   if ! download_release "$version" "$_stage_dir"; then
     rm -rf -- "$_stage_dir"
@@ -1396,16 +1478,31 @@ upgrade_kernel() {
   if [[ $cmp -le 0 ]]; then
     if [[ $cmp -eq 0 ]]; then
       plainln "  已是最新版本。"
+      confirm "是否重新安装 ${version}？" || return 0
     else
-      warn "当前版本高于最新正式版。"
+      warn "当前版本高于最新正式版 ${version}。"
+      confirm "是否降级到 ${version}？" || return 0
     fi
-    confirm "是否仍要重新安装此版本？" || return 0
   fi
   stage_release work "$version" || return 0
   if [[ -f $CONF ]]; then
     plainln "  正在校验现有配置..."
+    # 用户或权限不齐时先补齐，再判断是不是新内核读不了配置。
+    if ! id -u sing-box >/dev/null 2>&1; then
+      create_box_user || { rm -rf -- "$work"; pause; return 0; }
+    elif ! box_account_ok; then
+      rm -rf -- "$work"
+      pause
+      return 0
+    fi
+    if ! fix_tree_perms; then
+      err "无法准备配置校验。"
+      rm -rf -- "$work"
+      pause
+      return 0
+    fi
     # 只开放目录执行位，不允许列出内容。
-    chmod 711 "$work" "$work/pack" || { pause; return 0; }
+    chmod 711 "$work" "$work/pack" || { rm -rf -- "$work"; pause; return 0; }
     if ! box_as_user "$work/pack/sing-box" "$work/test.err" "$CONF"; then
       err "新版本无法加载当前配置，已取消升级。"
       cat "$work/test.err" >&4 || true
