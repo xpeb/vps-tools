@@ -83,6 +83,7 @@ TX_OWNS_LOCK=0
 LOCK_HELD=0
 STORE_REV=""
 WORK_DIR=""
+BOX_USER_CREATED=0
 CONFLICT_TAG=""
 PICKED=""
 RULE=""
@@ -206,16 +207,20 @@ trim_line() {
 
 tty_read() {
   local -n _out=$1
-  local _prompt=$2 _ans
+  local _prompt=$2 _mode=${3:-} _ans
   if ! IFS= read -r -e -p "$_prompt" _ans </dev/tty 2>&4; then
     ui $'\n'
     return 2
   fi
-  _out=$(trim_line "$_ans")
+  if [[ $_mode == raw ]]; then
+    _out=${_ans//$'\r'/}
+  else
+    _out=$(trim_line "$_ans")
+  fi
 }
 
 prompt() {
-  local msg=$1 default=${2:-} hint=${3:-} ans p=""
+  local msg=$1 default=${2:-} hint=${3:-} mode=${4:-} ans p=""
   p=$(printf '\001%s\002  %s' "$GRN" "$msg")
   if [[ -n $default ]]; then
     p+=$(printf ' \001%s\002%s\001%s\002' "$DIM" "$default" "$GRN")
@@ -224,8 +229,8 @@ prompt() {
     p+=$(printf ' \001%s\002%s\001%s\002' "$DIM" "$hint" "$GRN")
   fi
   p+=$(printf ': ')
-  tty_read ans "$p" || return 2
-  if [[ -z $ans ]]; then
+  tty_read ans "$p" "$mode" || return 2
+  if [[ -z $ans && $mode != raw ]]; then
     printf '%s' "$default"
   else
     printf '%s' "$ans"
@@ -391,6 +396,7 @@ EOF
     err "无法创建 mihomo 用户。"
     return 1
   fi
+  BOX_USER_CREATED=1
   if [[ $(id -u mihomo) -eq 0 || $(id -g mihomo) -eq 0 ]]; then
     err "mihomo 账户不能是 root。"
     return 1
@@ -642,8 +648,8 @@ restore_tree() {
 
 store_revision() {
   local f
-  for f in "$CONF" "$META_DIR"/*.json; do
-    [[ -f $f ]] || continue
+  for f in "$CONF" "$META_DIR"/*.json "$CERT_DIR"/*; do
+    [[ -f $f && ! -L $f ]] || continue
     sha256sum "$f" || return 1
   done | sha256sum
 }
@@ -687,6 +693,7 @@ end_tx() {
   TX_WAS_RUNNING=0
   TX_FILES=()
   TX_OWNS_LOCK=0
+  BOX_USER_CREATED=0
   [[ -z $snap ]] || rm -rf -- "$snap"
   STORE_REV=$(store_revision) || STORE_REV=""
   if ((owns)); then release_lock; fi
@@ -755,6 +762,7 @@ begin_tx() {
   is_running && TX_WAS_RUNNING=1
   if ! snapshot_tx "${1:-config}"; then
     end_tx
+    err "无法创建配置快照。"
     return 1
   fi
   TX_READY=1
@@ -814,6 +822,10 @@ rollback_tx() {
   fi
   if ((rc == 0 && TX_RESTART && TX_WAS_RUNNING)); then
     kernel_stays_up restart || rc=1
+  fi
+  # 新建的账户只在本次没有旧数据时一并删掉，避免把已恢复文件的属主丢掉。
+  if ((rc == 0 && BOX_USER_CREATED)) && [[ ! -f $snap/had-state ]]; then
+    remove_box_user || rc=1
   fi
   if ((rc)); then
     # 恢复失败时留下快照，不能当成已经回滚。
@@ -1343,13 +1355,11 @@ github_asset_sha() {
   '
 }
 
-download_release() {
-  local version=$1 dest=$2 machine url name sum actual sha_pid
-  machine=$(asset_arch) || return 1
-  name="mihomo-linux-${machine}-${version}.gz"
+fetch_asset() {
+  local version=$1 dest=$2 name=$3 url sum actual sha_pid
   url="https://github.com/${REPO}/releases/download/${version}/${name}"
   plainln "  下载 ${url}"
-  # 校验值与压缩包同时取，避免校验提示后再等一次 GitHub。
+  rm -f -- "$dest/mihomo.gz" "$dest/sha256" "$dest/pack/mihomo"
   github_asset_sha "$version" "$name" >"$dest/sha256" &
   sha_pid=$!
   if ! curl -fsSL --connect-timeout 10 --max-time 300 --retry 3 --retry-delay 2 -o "$dest/mihomo.gz" "$url"; then
@@ -1370,15 +1380,45 @@ download_release() {
     return 1
   fi
   plainln "  解压"
-  if ! gzip -dc "$dest/mihomo.gz" >"$dest/pack/mihomo"; then
-    err "解压失败。"
-    return 1
+  gzip -dc "$dest/mihomo.gz" >"$dest/pack/mihomo" || { err "解压失败。"; return 1; }
+  chmod 755 "$dest/pack/mihomo" || return 1
+}
+
+# 临时目录是 0700，nobody 需要沿路径穿越后才能执行。探测结束后收回工作目录权限。
+probe_bin() {
+  local bin=$1 p rc=0
+  [[ -n $WORK_DIR && -d $WORK_DIR ]] || return 1
+  if ! id -u nobody >/dev/null 2>&1 || ! command -v su >/dev/null 2>&1; then
+    "$bin" -v >/dev/null 2>&1
+    return
   fi
-  chmod 755 "$dest/pack/mihomo"
-  if ! "$dest/pack/mihomo" -v >/dev/null 2>&1; then
+  p=${bin%/*}
+  while [[ -n $p && $p != / ]]; do
+    chmod o+x "$p" || return 1
+    [[ $p == "$WORK_DIR" ]] && break
+    p=${p%/*}
+  done
+  su -s /bin/sh -c 'exec "$1" -v >/dev/null 2>&1' nobody sh "$bin" || rc=$?
+  chmod 700 "$WORK_DIR" || true
+  return "$rc"
+}
+
+download_release() {
+  local version=$1 dest=$2 machine name
+  machine=$(asset_arch) || return 1
+  name="mihomo-linux-${machine}-${version}.gz"
+  fetch_asset "$version" "$dest" "$name" || return 1
+  if probe_bin "$dest/pack/mihomo"; then
+    return 0
+  fi
+  if [[ $machine != amd64 ]]; then
     err "程序无法执行，请确认架构。"
     return 1
   fi
+  warn "当前 CPU 无法运行标准构建，改下 compatible。"
+  name="mihomo-linux-${machine}-compatible-${version}.gz"
+  fetch_asset "$version" "$dest" "$name" || return 1
+  probe_bin "$dest/pack/mihomo" || { err "程序无法执行，请确认架构或 CPU。"; return 1; }
 }
 
 stage_release() {
@@ -1509,11 +1549,10 @@ install_kernel() {
     pause
     return 0
   }
-  if ! begin_tx deploy; then
-    err "无法创建安装快照。"
+  begin_tx deploy || {
     pause
     return 0
-  fi
+  }
   if [[ -x $BIN ]]; then
     err "内核已被其他进程安装，请重新进入菜单。"
     end_tx
@@ -1567,11 +1606,10 @@ upgrade_kernel() {
     pause
     return 0
   }
-  if ! begin_tx deploy; then
-    err "无法创建升级快照。"
+  begin_tx deploy || {
     pause
     return 0
-  fi
+  }
   if [[ -f $CONF ]]; then
     plainln "  正在校验现有配置..."
     # 目录保持 root:mihomo 750，避免 /var/lib 下的临时内核被其他用户读到。
@@ -2148,11 +2186,15 @@ gen_ss_password() {
 }
 
 gen_uuid() {
+  local h v
   if [[ -r /proc/sys/kernel/random/uuid ]]; then
     tr -d '[:space:]' </proc/sys/kernel/random/uuid
-  else
-    openssl rand -hex 16 | awk '{printf "%s-%s-%s-%s-%s\n", substr($0,1,8), substr($0,9,4), substr($0,13,4), substr($0,17,4), substr($0,21,12)}'
+    return
   fi
+  h=$(openssl rand -hex 16 | tr -d '[:space:]') || return 1
+  [[ ${#h} -eq 32 ]] || return 1
+  v=$(printf '%x' $(( (16#${h:16:1} & 3) | 8 )))
+  printf '%s-%s-4%s-%s%s-%s' "${h:0:8}" "${h:8:4}" "${h:13:3}" "$v" "${h:17:3}" "${h:20:12}"
 }
 
 gen_shortid() {
@@ -2245,43 +2287,53 @@ ask_uuid() {
 }
 
 ask_password() {
-  local label=$1 current=$2 method=$3 ans
+  local label=$1 current=$2 method=$3 ans rc literal hint
+  if [[ -n $current ]]; then
+    hint="回车保留，g 重新生成，q 取消，\\ 后按字面"
+  else
+    hint="回车生成，q 取消，\\ 后按字面"
+  fi
   while true; do
-    ans=$(regen_prompt "$label" "$current") || return 2
-    if [[ -z $ans ]]; then
-      if [[ -n $current ]]; then
-        if [[ -n $method ]]; then
-          ss_key_canon "$method" "$current" || { err "密码长度不符，请输入 g 重新生成。"; continue; }
+    ans=$(prompt "$label" "" "$hint" raw) || return 2
+    literal=0
+    if [[ $ans == \\* ]]; then
+      ans=${ans:1}
+      literal=1
+    fi
+    if ((literal == 0)); then
+      if [[ -z $ans ]]; then
+        if [[ -n $current ]]; then
+          if [[ -n $method ]]; then
+            ans=$(ss_key_canon "$method" "$current") || { err "密码长度不符，请输入 g 重新生成。"; continue; }
+            printf '%s' "$ans"
+          else
+            printf '%s' "$current"
+          fi
+        elif [[ -n $method ]]; then
+          gen_ss_password "$method" || return 1
         else
-          printf '%s' "$current"
+          gen_auth || return 1
         fi
-      elif [[ -n $method ]]; then
-        gen_ss_password "$method" || return 1
-      else
-        gen_auth || return 1
+        return 0
       fi
-      return 0
-    fi
-    if is_regen "$ans"; then
-      if [[ -n $method ]]; then
-        gen_ss_password "$method" || return 1
-      else
-        gen_auth || return 1
+      if is_regen "$ans"; then
+        if [[ -n $method ]]; then gen_ss_password "$method" || return 1
+        else gen_auth || return 1; fi
+        return 0
       fi
-      return 0
-    fi
-    if cancelled "$ans"; then
-      return 2
+      cancelled "$ans" && return 2
     fi
     if ! secret_text_ok "$ans"; then
       err "密码须为 1-256 个字符，且不能包含控制字符。"
       continue
     fi
     if [[ -n $method ]]; then
-      ans=$(ss_key_canon "$method" "$ans") || {
-        err "密码长度与加密方式不匹配。"
+      if ! ans=$(ss_key_canon "$method" "$ans"); then
+        rc=$?
+        if [[ $rc -eq 2 ]]; then err "2022 密钥须为标准或 URL-safe Base64。"
+        else err "密码长度与加密方式不匹配。"; fi
         continue
-      }
+      fi
     fi
     printf '%s' "$ans"
     return 0
@@ -2326,9 +2378,12 @@ make_self_signed() {
   else
     san="DNS:${cn}"
   fi
+  local subject=$cn
+  # CN 最长 64 字节。超长名称只放进 SAN，校验以 SAN 为准。
+  ((${#subject} <= 64)) || subject=mihomo
   if ! openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
     -keyout "$key" -out "$crt" -days 3650 \
-    -subj "/CN=${cn}" \
+    -subj "/CN=${subject}" \
     -addext "subjectAltName=${san}" >/dev/null 2>&1; then
     rm -rf -- "$dir"
     err "生成证书失败。"
@@ -2347,6 +2402,7 @@ copy_cert_pair() {
     return 1
   fi
   local cert_pub key_pub
+  openssl x509 -in "$src_crt" -checkend 0 -noout >/dev/null 2>&1 || { err "证书已过期。"; return 1; }
   cert_pub=$(openssl x509 -in "$src_crt" -pubkey -noout 2>/dev/null) || return 1
   key_pub=$(openssl pkey -in "$src_key" -passin pass: -pubout 2>/dev/null) || return 1
   [[ $cert_pub == "$key_pub" ]] || { err "证书与私钥不匹配。"; return 1; }
@@ -2386,6 +2442,55 @@ ask_sni() {
   local pack
   pack=$(ask_name "证书域名或 IP" "$1" name) || return 1
   read_fields "$pack" sni
+}
+
+cert_covers() {
+  local file=$1 name=$2
+  [[ -f $file && ! -L $file ]] || return 1
+  if is_ipv4 "$name" || is_ipv6 "$name"; then
+    openssl x509 -in "$file" -noout -checkip "$name" >/dev/null 2>&1
+  else
+    openssl x509 -in "$file" -noout -checkhost "$name" >/dev/null 2>&1
+  fi
+}
+
+# 证书盖不住 SNI 时，客户端不能开校验，否则分享链接一定握手失败。
+note_cert_gap() {
+  cert_covers "$cert" "$sni" && return 0
+  [[ $insecure == 1 ]] && return 0
+  warn "证书不包含 ${sni}，分享链接改为跳过校验。"
+  insecure=1
+}
+
+set_share_insecure() {
+  if [[ $1 == 0 ]]; then
+    if ! cert_covers "$cert" "$sni"; then
+      warn "证书不包含 ${sni}，不能改为校验证书。"
+      return 1
+    fi
+    insecure=0
+    return 0
+  fi
+  note "客户端将跳过证书校验。"
+  insecure=1
+}
+
+align_sni_cert() {
+  local old=$1
+  if [[ $sni == "$old" ]] || cert_covers "$cert" "$sni"; then
+    return 0
+  fi
+  warn "当前证书不包含 ${sni}。"
+  if confirm "现在更换证书？"; then
+    apply_field_cert "$sni" "$cert" "$key" "$insecure" || { sni=$old; return 1; }
+    return 0
+  fi
+  if confirm "分享链接改为跳过证书校验？"; then
+    insecure=1
+    return 0
+  fi
+  sni=$old
+  return 1
 }
 
 ask_cert() {
@@ -2602,6 +2707,7 @@ render_listener() {
       listen_line
       + "\n    users:"
       + "\n      " + (.tag | q) + ": " + (.auth | q)
+      + "\n    ignore-client-bandwidth: true"
       + "\n    certificate: " + (.certFile | q)
       + "\n    private-key: " + (.keyFile | q)
       + "\n    alpn:"
@@ -2754,11 +2860,7 @@ firewall_hint() {
 }
 
 need_tx() {
-  if ! begin_tx; then
-    err "无法创建配置快照。"
-    pause
-    return 1
-  fi
+  begin_tx || { pause; return 1; }
 }
 
 finish_inbound() {
@@ -2922,12 +3024,14 @@ hy_wizard() {
   tag=$(new_tag hy2 "$port")
   remark=$(ask_remark "hy2-${port}") || return 0
   ask_new_cert || { [[ $? -eq 1 ]] && pause; return 0; }
+  note_cert_gap
   auth=$(ask_password "认证密码" "" "") || return 0
   blank
   kv "协议" "Hysteria2"
   kv "监听" "$(uri_host "$listen"):${port}/udp"
   kv "SNI" "$sni"
   kv "证书" "$cert_show"
+  kv "校验" "$([[ $insecure == 1 ]] && printf '跳过' || printf '启用')"
   kv "ALPN" "h3"
   kv "认证" "$auth"
   kv "备注" "$remark"
@@ -2961,6 +3065,7 @@ tuic_wizard() {
   remark=$(ask_remark "tuic-${port}") || return 0
   congestion=$(ask_congestion) || return 0
   ask_new_cert || { [[ $? -eq 1 ]] && pause; return 0; }
+  note_cert_gap
   uuid=$(ask_uuid "" strict) || return 0
   password=$(ask_password "密码" "" "") || return 0
   blank
@@ -2968,6 +3073,7 @@ tuic_wizard() {
   kv "监听" "$(uri_host "$listen"):${port}/udp"
   kv "SNI" "$sni"
   kv "证书" "$cert_show"
+  kv "校验" "$([[ $insecure == 1 ]] && printf '跳过' || printf '启用')"
   kv "ALPN" "h3"
   kv "拥塞" "$congestion"
   kv "UUID" "$uuid"
@@ -3031,23 +3137,27 @@ edit_loop() {
 }
 
 ss_key_canon() {
-  local method=$1 password=$2 need padded got
+  local method=$1 password=$2 need padded got canonical
   case $method in
     2022-blake3-aes-128-gcm) need=16 ;;
     2022-blake3-aes-256-gcm | 2022-blake3-chacha20-poly1305) need=32 ;;
     *) printf '%s' "$password"; return 0 ;;
   esac
-  [[ $password =~ ^[A-Za-z0-9+/]+={0,2}$ ]] || return 1
-  padded=${password%%=*}
+  [[ $password =~ ^[A-Za-z0-9+/_-]+={0,2}$ ]] || return 2
+  padded=${password//-/+}
+  padded=${padded//_//}
+  padded=${padded%%=*}
   case $((${#padded} % 4)) in
     0) ;;
     2) padded+='==' ;;
     3) padded+='=' ;;
-    *) return 1 ;;
+    *) return 2 ;;
   esac
-  got=$(printf '%s' "$padded" | openssl base64 -d -A 2>/dev/null | wc -c) || return 1
+  got=$(printf '%s' "$padded" | openssl base64 -d -A 2>/dev/null | wc -c | tr -d '[:space:]') || return 1
   [[ ${got:-0} -eq $need ]] || return 1
-  printf '%s' "$padded" | openssl base64 -d -A | openssl base64 -A
+  canonical=$(printf '%s' "$padded" | openssl base64 -d -A 2>/dev/null | openssl base64 -A | tr -d '\n') || return 1
+  [[ -n $canonical ]] || return 1
+  printf '%s' "$canonical"
 }
 
 ss_key_ok() { ss_key_canon "$1" "$2" >/dev/null; }
@@ -3060,6 +3170,7 @@ apply_field_cert() {
     return "$rc"
   }
   load_cert_fields "$cert_pack"
+  note_cert_gap
 }
 
 set_value() {
@@ -3083,7 +3194,7 @@ edit_ss() {
   while true; do
     choice=$(edit_loop "修改 Shadowsocks" "$remark" \
       "监听=$listen" "端口=$port" "传输=$network" \
-      "备注=$remark" "加密=$method" "密码=$password") || break
+      "备注=$remark" "加密=$method" "密码=已设置 · 选择修改") || break
     case $choice in
       1) set_value listen ask_listen "$listen" || continue ;;
       2) set_value port ask_port "$port" "$tag" shadowsocks "$network" "$listen" || continue ;;
@@ -3166,7 +3277,7 @@ edit_vless() {
 
 edit_quic() {
   local meta=$1 choice doc proto title tag listen port remark auth uuid password sni cert key insecure congestion
-  local cert_mode=keep cert_show='' orig cur
+  local cert_mode=keep cert_show='' orig cur old_sni check_choice check_label
   local -a rows
   validate_meta "$meta" || return 1
   load_plain "$meta" proto=protocol tag listen port remark auth uuid password sni cert=certFile key=keyFile congestion || return 1
@@ -3182,17 +3293,26 @@ edit_quic() {
       title="TUIC v5"
       rows+=("拥塞=$congestion" "UUID=$uuid" "密码=已设置 · 选择修改")
     fi
+    check_label=启用
+    [[ $insecure == 1 ]] && check_label=跳过
+    rows+=("校验=$check_label")
+    check_choice=${#rows[@]}
     choice=$(edit_loop "修改 $title" "$remark" "${rows[@]}") || break
     case $choice in
       1) set_value listen ask_listen "$listen" || continue ;;
       2) set_value port ask_port "$port" "$tag" "$proto" udp "$listen" || continue ;;
       3) set_value remark ask_remark "$remark" || continue ;;
-      4) ask_sni "$sni" || continue ;;
+      4)
+        old_sni=$sni
+        ask_sni "$sni" || continue
+        align_sni_cert "$old_sni" || continue
+        ;;
       5) apply_field_cert "$sni" "$cert" "$key" "$insecure" || continue ;;
       6)
         if [[ $proto == hysteria2 ]]; then set_value auth ask_password "认证密码" "$auth" "" || continue
         else set_value congestion ask_congestion || continue; fi
         ;;
+      "$check_choice") set_share_insecure $((1 - insecure)) || continue ;;
       7) set_value uuid ask_uuid "$uuid" strict || continue ;;
       8) set_value password ask_password "密码" "$password" "" || continue ;;
       *) continue ;;
@@ -3372,12 +3492,7 @@ build_share() {
     shadowsocks)
       method=$(jq -r '.method' "$meta")
       password=$(jq -r '.password' "$meta")
-      local userinfo
-      case $method in
-        2022-*) userinfo="$(urlenc "$method"):$(urlenc "$password")" ;;
-        *) userinfo=$(b64url "${method}:${password}") ;;
-      esac
-      printf 'ss://%s@%s:%s#%s\n' "$userinfo" "$host" "$port" "$enc"
+      printf 'ss://%s@%s:%s#%s\n' "$(b64url "${method}:${password}")" "$host" "$port" "$enc"
       ;;
     vless)
       uuid=$(jq -r '.uuid' "$meta")
