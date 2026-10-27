@@ -2,7 +2,7 @@
 # xray 管理面板
 # 文档: https://xtls.github.io/
 # 系统: Debian / Ubuntu（systemd）、Alpine（OpenRC）
-# 入站: Shadowsocks、VLESS REALITY、Hysteria2
+# 入站: Shadowsocks、VLESS（TCP / XHTTP / WebSocket）、Hysteria2
 # 内核以 xray 用户运行
 #
 # 用法: sudo ./xray.sh
@@ -492,13 +492,16 @@ repair_conf_access() {
 }
 
 gc_certs() {
-  local f base
-  for f in "$CERT_DIR"/hy2-*.crt "$CERT_DIR"/hy2-*.key; do
+  local f base meta
+  for f in "$CERT_DIR"/hy2-*.crt "$CERT_DIR"/hy2-*.key "$CERT_DIR"/vless-*.crt "$CERT_DIR"/vless-*.key; do
     [[ -f $f ]] || continue
     base=${f##*/}
     base=${base%.*}
-    if [[ ! -f $META_DIR/${base}.json ]] \
-      && ! jq -e --arg f "$f" '.. | objects | select(.certificateFile? == $f or .keyFile? == $f)' "$CONF" >/dev/null 2>&1; then
+    meta=$META_DIR/${base}.json
+    if [[ -f $meta ]] && jq -e --arg f "$f" '(.certFile == $f) or (.keyFile == $f)' "$meta" >/dev/null 2>&1; then
+      continue
+    fi
+    if ! jq -e --arg f "$f" '.. | objects | select(.certificateFile? == $f or .keyFile? == $f)' "$CONF" >/dev/null 2>&1; then
       rm -f -- "$f" || return 1
     fi
   done
@@ -1866,6 +1869,78 @@ ask_ss_network() {
   esac
 }
 
+ask_vless_transport() {
+  local choice
+  choice=$(choose "传输" "取消" "TCP REALITY" "XHTTP REALITY" "WebSocket") || return $?
+  case $choice in
+    2) printf 'xhttp' ;;
+    3) printf 'ws' ;;
+    *) printf 'tcp' ;;
+  esac
+}
+
+ask_path() {
+  local default=$1 ans
+  [[ -z $default || $default == null ]] && default="/$(openssl rand -hex 8)"
+  while true; do
+    ans=$(prompt "路径" "$default" "q 取消") || return 2
+    cancelled "$ans" && return 2
+    if [[ $ans != /* || $ans == *[[:space:]]* || $ans == *'?'* || $ans == *'#'* ]]; then
+      err "路径要以 / 开头，且不能有空格、问号或 #。"
+      continue
+    fi
+    printf '%s' "$ans"
+    return 0
+  done
+}
+
+ask_http_host() {
+  local default=$1 ans hint="回车留空，q 取消"
+  [[ -z $default || $default == null ]] && default=""
+  [[ -n $default ]] && hint="回车保留，- 留空，q 取消"
+  while true; do
+    ans=$(prompt "Host" "$default" "$hint") || return 2
+    cancelled "$ans" && return 2
+    if [[ -z $ans || $ans == - ]]; then
+      printf ''
+      return 0
+    fi
+    ans=$(unbracket "$ans")
+    if is_domain "$ans" || is_ipv4 "$ans" || is_ipv6 "$ans"; then
+      printf '%s' "$ans"
+      return 0
+    fi
+    err "请输入域名或 IP。"
+  done
+}
+
+ask_xhttp_mode() {
+  local choice
+  choice=$(choose "模式" "取消" "auto" "packet-up" "stream-up" "stream-one") || return $?
+  case $choice in
+    2) printf 'packet-up' ;;
+    3) printf 'stream-up' ;;
+    4) printf 'stream-one' ;;
+    *) printf 'auto' ;;
+  esac
+}
+
+vless_net_label() {
+  case $1 in
+    ws) printf 'WebSocket' ;;
+    xhttp) printf 'XHTTP' ;;
+    *) printf 'TCP' ;;
+  esac
+}
+
+vless_sec_label() {
+  case $1 in
+    tls) printf 'TLS' ;;
+    none) printf '无' ;;
+    *) printf 'REALITY' ;;
+  esac
+}
+
 gen_ss_password() {
   local n=24
   n=$(ss2022_bytes "$1") || n=24
@@ -2134,14 +2209,27 @@ meta_ss() {
 }
 
 meta_vless() {
+  local tag=$1 remark=$2 listen=$3 port=$4 uuid=$5 flow=$6 sni=$7
+  local target=$8 tport=$9 priv=${10} pub=${11} sid=${12}
+  local network=${13} security=${14} path=${15} mode=${16} http_host=${17}
+  local cert=${18} key=${19} insecure=${20} insecure_json=false
+  [[ $insecure == 1 ]] && insecure_json=true
+  [[ -z $network ]] && network=tcp
+  [[ -z $security ]] && security=reality
+  [[ -z $tport || $tport == null ]] && tport=443
   jq -n \
-    --arg tag "$1" --arg remark "$2" --arg listen "$3" --argjson port "$4" \
-    --arg flow "$6" --arg sni "$7" \
-    --arg target "$8" --argjson targetPort "$9" --arg pub "${11}" --arg sid "${12}" \
-    --rawfile uuid <(printf '%s' "$5") --rawfile priv <(printf '%s' "${10}") \
+    --arg tag "$tag" --arg remark "$remark" --arg listen "$listen" \
+    --argjson port "$port" --arg flow "$flow" --arg sni "$sni" \
+    --arg target "$target" --argjson targetPort "$tport" \
+    --arg pub "$pub" --arg sid "$sid" \
+    --arg network "$network" --arg security "$security" \
+    --arg path "$path" --arg mode "$mode" --arg host "$http_host" \
+    --arg cert "$cert" --arg key "$key" --argjson insecure "$insecure_json" \
+    --rawfile uuid <(printf '%s' "$uuid") --rawfile priv <(printf '%s' "$priv") \
     '{tag:$tag,remark:$remark,protocol:"vless",listen:$listen,port:$port,
-      network:"tcp",uuid:$uuid,flow:$flow,security:"reality",sni:$sni,
-      target:$target,targetPort:$targetPort,privateKey:$priv,publicKey:$pub,shortId:$sid}'
+      network:$network,uuid:$uuid,flow:$flow,security:$security,sni:$sni,
+      target:$target,targetPort:$targetPort,privateKey:$priv,publicKey:$pub,shortId:$sid,
+      path:$path,mode:$mode,host:$host,certFile:$cert,keyFile:$key,insecure:$insecure}'
 }
 
 meta_hy() {
@@ -2167,12 +2255,33 @@ render_inbound() {
         settings:{method:.method, password:.password, network:.network}}
     elif .protocol == "vless" then
       . as $m
+      | ($m.network // "tcp") as $net
+      | ($m.security // "reality") as $sec
+      | ($m.flow // "") as $flow
       | {tag:$m.tag, listen:$m.listen, port:$m.port, protocol:"vless",
           settings:{decryption:"none",
-            clients:[{id:$m.uuid, flow:$m.flow, email:$m.tag}]},
-          streamSettings:{network:"tcp", security:"reality",
-            realitySettings:{target:($m.target + ":" + ($m.targetPort | tostring)),
-              serverNames:[$m.sni], privateKey:$m.privateKey, shortIds:[$m.shortId]}}}
+            clients:[{id:$m.uuid, email:$m.tag}
+              + (if $flow != "" and $flow != "null" then {flow:$flow} else {} end)]},
+          streamSettings:(
+            {network:(if $net == "ws" then "ws" elif $net == "xhttp" then "xhttp" else "tcp" end),
+             security:(if $sec == "tls" or $sec == "none" then $sec else "reality" end)}
+            + (if $sec == "tls" then
+                {tlsSettings:({alpn:["http/1.1"],
+                  certificates:[{certificateFile:$m.certFile, keyFile:$m.keyFile}]} + ($m | hy_sni))}
+              elif $sec != "none" then
+                {realitySettings:{target:($m.target + ":" + (($m.targetPort // 443) | tostring)),
+                  serverNames:[$m.sni], privateKey:$m.privateKey, shortIds:[$m.shortId]}}
+              else {} end)
+            + (if $net == "ws" or $net == "xhttp" then
+                {path:((($m.path // "") | if . == "" or . == "null" then "/" else . end)),
+                 host:(($m.host // "") | if . == "null" then "" else . end)}
+              else {} end | if $net == "ws" then {wsSettings:.}
+                elif $net == "xhttp" then
+                  {xhttpSettings:(. + {mode:(
+                    ($m.mode // "auto") as $mode
+                    | if $mode == "auto" or $mode == "packet-up" or $mode == "stream-up" or $mode == "stream-one"
+                      then $mode else "auto" end)})}
+                else {} end))}
     elif .protocol == "hysteria2" then
       . as $m
       | {tag:$m.tag, listen:$m.listen, port:$m.port, protocol:"hysteria",
@@ -2242,12 +2351,21 @@ proto_label() {
     shadowsocks) printf 'Shadowsocks' ;;
     hysteria2) printf 'Hysteria2' ;;
     vless)
-      security=$(jq -r '.security' "$meta")
-      if [[ $security == reality ]]; then
-        printf 'VLESS/REALITY'
-      else
-        printf 'VLESS/TLS'
-      fi
+      security=$(jq -r '.network // "tcp"' "$meta")
+      case $security in
+        ws) printf 'VLESS/WS' ;;
+        xhttp) printf 'VLESS/XHTTP' ;;
+        *)
+          security=$(jq -r '.security // "reality"' "$meta")
+          if [[ $security == reality ]]; then
+            printf 'VLESS/REALITY'
+          elif [[ $security == tls ]]; then
+            printf 'VLESS/TLS'
+          else
+            printf 'VLESS'
+          fi
+          ;;
+      esac
       ;;
     *) printf '未知' ;;
   esac
@@ -2321,6 +2439,7 @@ commit_inbound() {
     return 1
   fi
   save_meta_and_inbound "$tag" <<<"$doc" || { rollback_tx; err "写入失败。"; pause; return 1; }
+  gc_certs || { rollback_tx; err "写入失败。"; pause; return 1; }
   commit_tx || { pause; return 1; }
   firewall_hint "$proto" "$port" "$network"
   pause
@@ -2405,41 +2524,134 @@ ss_wizard() {
   commit_inbound "$tag" shadowsocks "$port" "$doc" || return 0
 }
 
+# 写入调用方的传输字段。REALITY 不能配 WebSocket，XHTTP 和 TCP 不用流控以外的字段。
+ask_vless_extra() {
+  local which=$1 rc name_pack dest keys cert_pack sec_choice host_default
+  case $which in
+    tcp|xhttp)
+      network=$which
+      security=reality
+      cert="" key="" insecure=0 cert_mode=""
+      if [[ $which == tcp ]]; then
+        flow=xtls-rprx-vision
+        path="" mode="" http_host=""
+      else
+        flow=""
+      fi
+      dest=$target
+      [[ -z $dest || $dest == null ]] && dest=$sni
+      if [[ -n $dest && $dest != null && -n $tport && $tport != null && $tport != 443 ]]; then
+        dest="$(uri_host "$dest"):${tport}"
+      elif [[ -z $dest || $dest == null ]]; then
+        dest=""
+      fi
+      while true; do
+        note "伪装站点需要 TLS 1.3，不要用 CDN。"
+        name_pack=$(ask_name "伪装域名" "$dest" domain) || return $?
+        read_fields "$name_pack" sni tport
+        reality_dest_ok "$sni" "$tport" && break
+      done
+      target=$sni
+      keys=$(ask_reality_keys "$priv" "$pub" "$sid") || return $?
+      read_fields "$keys" priv pub sid
+      if [[ $network == xhttp ]]; then
+        path=$(ask_path "$path") || return $?
+        mode=$(ask_xhttp_mode) || return $?
+        http_host=$(ask_http_host "$http_host") || return $?
+      fi
+      ;;
+    ws)
+      network=ws
+      flow=""
+      priv="" pub="" sid="" target="" tport=443
+      sec_choice=$(choose "加密" "取消" "TLS" "无") || return $?
+      if [[ $sec_choice == 2 ]]; then
+        security=none
+        sni=""
+        cert="" key="" insecure=0 cert_mode=""
+        path=$(ask_path "$path") || return $?
+        http_host=$(ask_http_host "$http_host") || return $?
+      else
+        security=tls
+        name_pack=$(ask_name "证书域名或 IP" "$sni" name) || return $?
+        read_fields "$name_pack" sni
+        cert_pack=$(ask_cert "$sni" "$cert" "$key" "$insecure") || return $?
+        load_cert_fields "$cert_pack"
+        path=$(ask_path "$path") || { rc=$?; drop_temp_cert "$cert_mode" "$cert"; return "$rc"; }
+        host_default=$http_host
+        [[ -z $host_default || $host_default == null ]] && host_default=$sni
+        http_host=$(ask_http_host "$host_default") || { rc=$?; drop_temp_cert "$cert_mode" "$cert"; return "$rc"; }
+      fi
+      ;;
+    *) return 2 ;;
+  esac
+}
+
+show_vless() {
+  kv "协议" "VLESS"
+  kv "传输" "$(vless_net_label "$network")"
+  kv "加密" "$(vless_sec_label "$security")"
+  kv "监听" "$(uri_host "$listen"):${port}"
+  [[ $network == tcp ]] && kv "流控" "$flow"
+  [[ $security == reality ]] && kv "伪装" "${target}:${tport}"
+  [[ $security == reality ]] && kv "公钥" "$pub"
+  [[ $security == reality ]] && kv "ShortId" "$sid"
+  [[ $security != none && -n $sni ]] && kv "SNI" "$sni"
+  if [[ $network == ws || $network == xhttp ]]; then
+    kv "路径" "$path"
+    kv "Host" "${http_host:-无}"
+  fi
+  [[ $network == xhttp ]] && kv "模式" "$mode"
+  [[ $security == tls ]] && kv "证书" "$cert_show"
+  kv "UUID" "$uuid"
+  kv "备注" "$remark"
+}
+
+vless_doc() {
+  meta_vless "$tag" "$remark" "$listen" "$port" "$uuid" "$flow" \
+    "$sni" "$target" "$tport" "$priv" "$pub" "$sid" \
+    "$network" "$security" "$path" "$mode" "$http_host" \
+    "$cert" "$key" "$insecure"
+}
+
+stage_vless_cert() {
+  if [[ $security == tls && ( $cert_mode == temp || $cert_mode == src ) ]]; then
+    confirm_write || return 1
+    need_tx || { drop_temp_cert "$cert_mode" "$cert"; return 1; }
+    stage_chosen_cert "$tag" || return 1
+    return 0
+  fi
+  confirm_write
+}
+
 vless_wizard() {
-  local tag="" listen port remark uuid flow sni target tport priv pub sid
-  local name_pack host keys doc
-  header "VLESS / REALITY"
-  flow=xtls-rprx-vision
-  note "VLESS REALITY 仅 TCP，流控 xtls-rprx-vision。"
+  local tag="" listen port remark uuid flow="" sni="" target="" tport=443
+  local priv="" pub="" sid="" network="" security="" path="" mode="" http_host=""
+  local which doc rc cert="" key="" insecure=0 cert_mode="" cert_show=""
+  header "VLESS"
+  which=$(ask_vless_transport) || return 0
+  case $which in
+    xhttp) note "XHTTP 使用 REALITY，不要加流控。" ;;
+    ws) note "WebSocket 不能用 REALITY。" ;;
+    *) note "TCP 使用 REALITY，流控 xtls-rprx-vision。" ;;
+  esac
   blank
   listen=$(ask_listen "0.0.0.0") || return 0
   port=$(ask_port 443 "" vless tcp "$listen") || return 0
   tag=$(new_tag vless "$port")
   remark=$(ask_remark "vless-${port}") || return 0
-  while true; do
-    note "伪装站点需要 TLS 1.3，不要用 CDN。"
-    name_pack=$(ask_name "伪装域名" "" domain) || return 0
-    read_fields "$name_pack" host tport
-    reality_dest_ok "$host" "$tport" && break
-  done
-  sni=$host
-  target=$host
-  keys=$(ask_reality_keys "" "" "") || { [[ $? -eq 1 ]] && pause; return 0; }
-  read_fields "$keys" priv pub sid
   uuid=$(ask_uuid "") || return 0
+  ask_vless_extra "$which" || {
+    rc=$?
+    drop_temp_cert "$cert_mode" "$cert"
+    [[ $rc -eq 1 ]] && pause
+    return 0
+  }
   blank
-  kv "协议" "VLESS / REALITY"
-  kv "伪装" "${target}:${tport}"
-  kv "ShortId" "$sid"
-  kv "公钥" "$pub"
-  kv "监听" "$(uri_host "$listen"):${port}"
-  kv "流控" "$flow"
-  kv "UUID" "$uuid"
-  kv "备注" "$remark"
+  show_vless
   blank
-  confirm_write || return 0
-  doc=$(meta_vless "$tag" "$remark" "$listen" "$port" "$uuid" "$flow" \
-    "$sni" "$target" "$tport" "$priv" "$pub" "$sid") || doc=""
+  stage_vless_cert || return 0
+  doc=$(vless_doc) || doc=""
   commit_inbound "$tag" vless "$port" "$doc" || return 0
 }
 
@@ -2489,7 +2701,7 @@ add_inbound() {
   require_kernel || return 0
   prepare_store || return 0
   while true; do
-    choice=$(choose "添加入站" "返回" "Shadowsocks" "VLESS REALITY" "Hysteria2") || return 0
+    choice=$(choose "添加入站" "返回" "Shadowsocks" "VLESS" "Hysteria2") || return 0
     case $choice in
       1) ss_wizard ;;
       2) vless_wizard ;;
@@ -2565,25 +2777,76 @@ edit_ss() {
 }
 
 edit_vless() {
-  local meta=$1 choice doc
+  local meta=$1 choice doc action rc staged which
   local tag listen port remark uuid flow sni target tport priv pub sid
-  local name_pack host keys dest
+  local network security path mode http_host name_pack dest keys
+  local cert="" key="" insecure=0 cert_mode="" cert_show=""
+  local -a rows=() actions=()
   while [[ -z $TX ]]; do
     load_plain "$meta" tag listen port remark uuid sni target
+    network=$(jq -r '.network // "tcp"' "$meta")
+    security=$(jq -r '.security // "reality"' "$meta")
+    [[ -z $network || $network == null ]] && network=tcp
+    [[ -z $security || $security == null ]] && security=reality
     priv=$(jq -r '.privateKey // empty' "$meta")
     pub=$(jq -r '.publicKey // empty' "$meta")
     sid=$(jq -r '.shortId // empty' "$meta")
-    flow=$(jq -r '.flow // "xtls-rprx-vision"' "$meta")
-    [[ -z $flow || $flow == null ]] && flow=xtls-rprx-vision
+    flow=$(jq -r '.flow // empty' "$meta")
+    if [[ $network == tcp && $security == reality ]]; then
+      [[ -z $flow || $flow == null ]] && flow=xtls-rprx-vision
+    else
+      flow=""
+    fi
     tport=$(jq -r '.targetPort // 443' "$meta")
-    choice=$(edit_loop "修改 VLESS REALITY" "$remark" \
-      "监听=$listen" "端口=$port" "备注=$remark" \
-      "伪装=${target}:${tport}" "公钥=$pub" "UUID=$uuid") || return 0
-    case $choice in
-      1) listen=$(ask_listen "$listen") || continue ;;
-      2) port=$(ask_port "$port" "$tag" vless tcp "$listen") || continue ;;
-      3) remark=$(ask_remark "$remark") || continue ;;
-      4)
+    [[ -z $tport || $tport == null ]] && tport=443
+    path=$(jq -r '.path // empty' "$meta")
+    [[ $path == null ]] && path=""
+    mode=$(jq -r '.mode // "auto"' "$meta")
+    [[ -z $mode || $mode == null ]] && mode=auto
+    http_host=$(jq -r '.host // empty' "$meta")
+    [[ $http_host == null ]] && http_host=""
+    cert=$(jq -r '.certFile // empty' "$meta")
+    key=$(jq -r '.keyFile // empty' "$meta")
+    insecure=$(jq -r 'if .insecure then 1 else 0 end' "$meta")
+    cert_mode=""
+    cert_show=$cert
+    staged=0
+    rows=()
+    actions=()
+    rows+=("监听=$listen"); actions+=(listen)
+    rows+=("端口=$port"); actions+=(port)
+    rows+=("备注=$remark"); actions+=(remark)
+    rows+=("传输=$(vless_net_label "$network") / $(vless_sec_label "$security")"); actions+=(transport)
+    if [[ $security == reality ]]; then
+      rows+=("伪装=${target}:${tport}"); actions+=(dest)
+      rows+=("公钥=$pub"); actions+=(keys)
+    fi
+    if [[ $security == tls ]]; then
+      rows+=("域名=$sni"); actions+=(sni)
+      rows+=("证书=${cert:-无}"); actions+=(cert)
+    fi
+    if [[ $network == ws || $network == xhttp ]]; then
+      rows+=("路径=${path:-/}"); actions+=(path)
+      rows+=("Host=${http_host:-无}"); actions+=(host)
+    fi
+    [[ $network == xhttp ]] && { rows+=("模式=$mode"); actions+=(mode); }
+    rows+=("UUID=$uuid"); actions+=(uuid)
+    choice=$(edit_loop "修改 VLESS" "$remark" "${rows[@]}") || return 0
+    action=${actions[$((choice - 1))]}
+    case $action in
+      listen) listen=$(ask_listen "$listen") || continue ;;
+      port) port=$(ask_port "$port" "$tag" vless tcp "$listen") || continue ;;
+      remark) remark=$(ask_remark "$remark") || continue ;;
+      transport)
+        which=$(ask_vless_transport) || continue
+        ask_vless_extra "$which" || {
+          rc=$?
+          drop_temp_cert "$cert_mode" "$cert"
+          [[ $rc -eq 1 ]] && pause
+          continue
+        }
+        ;;
+      dest)
         dest=$target
         [[ -z $dest || $dest == null ]] && dest=$sni
         if [[ -n $tport && $tport != null && $tport != 443 ]]; then
@@ -2591,24 +2854,37 @@ edit_vless() {
         fi
         plainln "  伪装站点需要 TLS 1.3，不要用 CDN。"
         name_pack=$(ask_name "伪装域名" "$dest" domain) || continue
-        read_fields "$name_pack" host tport
-        reality_dest_ok "$host" "$tport" || continue
-        sni=$host
-        target=$host
+        read_fields "$name_pack" sni tport
+        reality_dest_ok "$sni" "$tport" || continue
+        target=$sni
         ;;
-      5)
+      keys)
         keys=$(ask_reality_keys "$priv" "$pub" "$sid") || {
           [[ $? -eq 1 ]] && pause
           continue
         }
         read_fields "$keys" priv pub sid
         ;;
-      6) uuid=$(ask_uuid "$uuid") || continue ;;
+      sni)
+        name_pack=$(ask_name "证书域名或 IP" "$sni" name) || continue
+        read_fields "$name_pack" sni
+        ;;
+      cert)
+        apply_field_cert "$sni" "$cert" "$key" "$insecure" || continue
+        need_tx || { drop_temp_cert "$cert_mode" "$cert"; continue; }
+        stage_chosen_cert "$tag" || continue
+        staged=1
+        ;;
+      path) path=$(ask_path "$path") || continue ;;
+      host) http_host=$(ask_http_host "$http_host") || continue ;;
+      mode) mode=$(ask_xhttp_mode) || continue ;;
+      uuid) uuid=$(ask_uuid "$uuid") || continue ;;
       *) continue ;;
     esac
-    confirm_write || continue
-    doc=$(meta_vless "$tag" "$remark" "$listen" "$port" "$uuid" "$flow" \
-      "$sni" "$target" "$tport" "$priv" "$pub" "$sid") || doc=""
+    if ((staged == 0)) && ! stage_vless_cert; then
+      continue
+    fi
+    doc=$(vless_doc) || doc=""
     commit_inbound "$tag" vless "$port" "$doc" || continue
   done
 }
@@ -2869,14 +3145,48 @@ build_share() {
       ;;
     vless)
       uuid=$(normalize_uuid "$(jq -r '.uuid' "$meta")") || return 1
-      flow=$(jq -r '.flow' "$meta")
-      sni=$(urlenc "$(jq -r '.sni' "$meta")")
-      fp=$(urlenc chrome)
-      pub=$(urlenc "$(jq -r '.publicKey' "$meta")")
-      sid=$(urlenc "$(jq -r '.shortId' "$meta")")
-      local query="encryption=none&security=reality&sni=${sni}&fp=${fp}&type=tcp&pbk=${pub}&sid=${sid}"
-      if [[ -n $flow && $flow != null ]]; then
+      local network security flow sni path mode http_host query typ
+      network=$(jq -r '.network // "tcp"' "$meta")
+      security=$(jq -r '.security // "reality"' "$meta")
+      [[ -z $network || $network == null ]] && network=tcp
+      [[ -z $security || $security == null ]] && security=reality
+      case $network in
+        ws) typ=ws ;;
+        xhttp) typ=xhttp ;;
+        *) typ=tcp ;;
+      esac
+      query="encryption=none&security=${security}&type=${typ}"
+      sni=$(jq -r '.sni // empty' "$meta")
+      flow=$(jq -r '.flow // empty' "$meta")
+      path=$(jq -r '.path // empty' "$meta")
+      mode=$(jq -r '.mode // empty' "$meta")
+      http_host=$(jq -r '.host // empty' "$meta")
+      if [[ $security == reality || $security == tls ]]; then
+        [[ -n $sni && $sni != null ]] && query+="&sni=$(urlenc "$sni")"
+        query+="&fp=chrome"
+      fi
+      if [[ $security == reality ]]; then
+        query+="&pbk=$(urlenc "$(jq -r '.publicKey' "$meta")")&sid=$(urlenc "$(jq -r '.shortId' "$meta")")"
+      fi
+      if [[ $security == tls ]] && jq -e '.insecure == true' "$meta" >/dev/null; then
+        query+="&insecure=1"
+      fi
+      if [[ $network == ws && $security == tls ]]; then
+        query+="&alpn=$(urlenc 'http/1.1')"
+      fi
+      if [[ $network == tcp && -n $flow && $flow != null ]]; then
         query+="&flow=$(urlenc "$flow")"
+      fi
+      if [[ $network == ws || $network == xhttp ]]; then
+        [[ -z $path || $path == null ]] && path=/
+        query+="&path=$(urlenc "$path")"
+      fi
+      if [[ $network == xhttp ]]; then
+        [[ -z $mode || $mode == null ]] && mode=auto
+        query+="&mode=$(urlenc "$mode")"
+      fi
+      if [[ -n $http_host && $http_host != null ]]; then
+        query+="&host=$(urlenc "$http_host")"
       fi
       printf 'vless://%s@%s:%s?%s#%s\n' "$uuid" "$host" "$port" "$query" "$enc"
       ;;
@@ -2910,12 +3220,28 @@ share_details() {
       kv "密码" "$(jq -r '.password' "$meta")"
       ;;
     vless)
+      local network security flow
+      network=$(jq -r '.network // "tcp"' "$meta")
+      security=$(jq -r '.security // "reality"' "$meta")
       kv "UUID" "$(jq -r '.uuid' "$meta")"
-      kv "流控" "$(jq -r '.flow // "无"' "$meta")"
-      kv "SNI" "$(jq -r '.sni' "$meta")"
-      kv "公钥" "$(jq -r '.publicKey' "$meta")"
-      kv "ShortId" "$(jq -r '.shortId' "$meta")"
-      kv "指纹" "chrome"
+      kv "传输" "$(vless_net_label "$network")"
+      kv "加密" "$(vless_sec_label "$security")"
+      flow=$(jq -r '.flow // empty' "$meta")
+      [[ $network == tcp && -n $flow && $flow != null ]] && kv "流控" "$flow"
+      if [[ $security == reality || $security == tls ]]; then
+        kv "SNI" "$(jq -r '.sni // empty' "$meta")"
+      fi
+      if [[ $network == ws || $network == xhttp ]]; then
+        kv "路径" "$(jq -r '.path // "/"' "$meta")"
+        kv "Host" "$(jq -r 'if (.host // "") == "" then "无" else .host end' "$meta")"
+      fi
+      [[ $network == xhttp ]] && kv "模式" "$(jq -r '.mode // "auto"' "$meta")"
+      if [[ $security == reality ]]; then
+        kv "公钥" "$(jq -r '.publicKey' "$meta")"
+        kv "ShortId" "$(jq -r '.shortId' "$meta")"
+        kv "指纹" "chrome"
+      fi
+      [[ $security == tls ]] && kv "证书" "$(jq -r '.certFile // empty' "$meta")"
       ;;
     hysteria2)
       kv "认证" "$(jq -r '.auth' "$meta")"
@@ -3052,7 +3378,7 @@ xray 管理面板
 
 文档: https://xtls.github.io/
 系统: Debian / Ubuntu（systemd）、Alpine（OpenRC）
-入站: Shadowsocks、VLESS REALITY、Hysteria2
+入站: Shadowsocks、VLESS（TCP / XHTTP / WebSocket）、Hysteria2
 内核以 xray 用户运行。
 EOF
 }
