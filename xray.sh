@@ -471,17 +471,24 @@ open_parent_dirs() {
   done
 }
 
+xray_reads_conf() {
+  id -u xray >/dev/null 2>&1 || return 1
+  command -v su >/dev/null 2>&1 || return 1
+  su -s /bin/bash -c "test -x $(printf '%q' "$CONF_DIR") && test -r $(printf '%q' "$CONF_DIR")" xray
+}
+
 repair_conf_access() {
   [[ -d $CONF_DIR ]] || return 0
+  # 已经能进配置目录时不要改 /var 这类父目录权限。
+  if xray_reads_conf; then
+    return 0
+  fi
   open_parent_dirs "$CONF_DIR" && open_parent_dirs "$LOG_DIR" || return 1
   if ! id -u xray >/dev/null 2>&1 || ! command -v su >/dev/null 2>&1; then
     return 0
   fi
-  if su -s /bin/bash -c "test -x $(printf '%q' "$CONF_DIR") && test -r $(printf '%q' "$CONF_DIR")" xray; then
-    return 0
-  fi
   chown root:xray "$CONF_DIR" && chmod 750 "$CONF_DIR" || return 1
-  su -s /bin/bash -c "test -x $(printf '%q' "$CONF_DIR") && test -r $(printf '%q' "$CONF_DIR")" xray
+  xray_reads_conf
 }
 
 gc_certs() {
@@ -1460,7 +1467,8 @@ uses_udp() {
   if [[ $proto == hysteria2 || $proto == hysteria || $net == hysteria || $net == quic || $net == kcp || $net == mkcp ]]; then
     return 0
   fi
-  if [[ ( $proto == shadowsocks && ( -z $net || $net == *udp* ) ) \
+  # Shadowsocks 省略 network 时 Xray 只监听 TCP。
+  if [[ ( $proto == shadowsocks && $net == *udp* ) \
     || ( $proto == socks && $net == *udp* ) ]]; then
     return 0
   fi
@@ -1474,36 +1482,81 @@ listen_ip() {
   printf '%s' "$ip"
 }
 
-# 0.0.0.0 只绑 IPv4。:: 由 Go 显式关掉 IPV6_V6ONLY，同时收 IPv4。
-v4_wild() { [[ $(listen_ip "$1") == 0.0.0.0 ]]; }
-v6_wild() {
-  local ip
-  ip=$(listen_ip "$1")
-  is_ipv6 "$ip" && [[ ${ip//[0:]/} == "" ]]
+V6_ANY=0000:0000:0000:0000:0000:0000:0000:0000
+
+# 比较用的规范形式。0.0.0.0 只绑 IPv4；:: 由 Go 关掉 IPV6_V6ONLY，同时收 IPv4。
+norm_ip() {
+  local ip=$1 a b c d left right i
+  local -a lg=() rg=() parts=()
+  ip=$(unbracket "$ip")
+  [[ -z $ip || $ip == null ]] && ip=0.0.0.0
+  if is_ipv4 "$ip"; then
+    IFS=. read -r a b c d <<<"$ip"
+    printf '%d.%d.%d.%d' "$((10#$a))" "$((10#$b))" "$((10#$c))" "$((10#$d))"
+    return 0
+  fi
+  if ! is_ipv6 "$ip"; then
+    printf '%s' "$ip"
+    return 0
+  fi
+  if [[ $ip == *::* ]]; then
+    left=${ip%%::*}
+    right=${ip#*::}
+    [[ -n $left ]] && IFS=: read -r -a lg <<<"$left"
+    [[ -n $right ]] && IFS=: read -r -a rg <<<"$right"
+    for ((i = 0; i < ${#lg[@]}; i++)); do parts+=("${lg[i]}"); done
+    for ((i = ${#lg[@]} + ${#rg[@]}; i < 8; i++)); do parts+=(0); done
+    for ((i = 0; i < ${#rg[@]}; i++)); do parts+=("${rg[i]}"); done
+  else
+    IFS=: read -r -a parts <<<"$ip"
+  fi
+  for i in "${!parts[@]}"; do
+    printf -v 'parts[i]' '%04x' "$((16#${parts[i]}))"
+  done
+  (IFS=:; printf '%s' "${parts[*]}")
 }
+
+v4_wild() { [[ $(norm_ip "$1") == 0.0.0.0 ]]; }
+v6_wild() { [[ $(norm_ip "$1") == "$V6_ANY" ]]; }
 
 listen_clash() {
   local a b
-  a=$(listen_ip "$1")
-  b=$(listen_ip "$2")
+  a=$(norm_ip "$1")
+  b=$(norm_ip "$2")
   [[ $a == "$b" ]] && return 0
   if v6_wild "$a" || v6_wild "$b"; then
     return 0
   fi
   if v4_wild "$a"; then
-    is_ipv4 "$b"
+    [[ $b != *:* ]]
     return
   fi
   if v4_wild "$b"; then
-    is_ipv4 "$a"
+    [[ $a != *:* ]]
     return
   fi
   return 1
 }
 
-# 外部进程只要占用该端口就算冲突，避免保存后启动失败。xray 用户自己的套接字交给配置对比。
+# /proc/net 里的地址是小端。IPv6 全零按双栈通配处理。
+proc_addr() {
+  local h=${1%%:*} i w out=""
+  if ((${#h} == 8)); then
+    printf '%d.%d.%d.%d' "$((16#${h:6:2}))" "$((16#${h:4:2}))" "$((16#${h:2:2}))" "$((16#${h:0:2}))"
+    return 0
+  fi
+  ((${#h} == 32)) || return 1
+  for ((i = 0; i < 32; i += 8)); do
+    w=${h:i:8}
+    w=${w:6:2}${w:4:2}${w:2:2}${w:0:2}
+    out+=${w:0:4}:${w:4:4}:
+  done
+  printf '%s' "${out%:}"
+}
+
+# xray 用户自己的套接字交给配置对比。全零 IPv6 无法区分 v6only。
 foreign_port() {
-  local port=$1 tcp=$2 udp=$3 hex uid_x files=() f local_addr rem state uid
+  local port=$1 listen=$2 tcp=$3 udp=$4 hex uid_x files=() f local_addr rem state uid addr
   printf -v hex '%04X' "$port"
   uid_x=$(id -u xray 2>/dev/null || true)
   ((tcp)) && files+=(/proc/net/tcp /proc/net/tcp6)
@@ -1518,7 +1571,8 @@ foreign_port() {
         [[ $state == 0A ]] || continue
       fi
       [[ -n $uid_x && $uid == "$uid_x" ]] && continue
-      return 0
+      addr=$(proc_addr "${local_addr%%:*}") || continue
+      listen_clash "$listen" "$addr" && return 0
     done <"$f"
   done
   return 1
@@ -1583,7 +1637,7 @@ port_conflict() {
       fi
     done < <(jq -rj '.inbounds[]? | ["x", "." + (if (.tag // "") == "" then "config.json" else .tag end), .protocol // "", (if .settings.udp == true then "tcp,udp" else (.streamSettings.method // .streamSettings.network // .settings.network // "") end), (.port | tostring), (.listen // "0.0.0.0")] | join("\u001f") + "\n"' "$CONF" 2>/dev/null || true)
   fi
-  if foreign_port "$port" "$nt" "$nu"; then
+  if foreign_port "$port" "$listen" "$nt" "$nu"; then
     CONFLICT_TAG=-
     return 0
   fi
@@ -1686,18 +1740,23 @@ ask_name() {
   while true; do
     ans=$(prompt "$label" "$default" "q 取消") || return 2
     cancelled "$ans" && return 2
-    ans=$(unbracket "$ans")
     host=$ans
     tport=443
-    if ! is_ipv6 "$ans" && [[ $ans =~ ^([A-Za-z0-9.-]+):([0-9]{1,5})$ ]]; then
+    if [[ $ans =~ ^\[([^]]+)\]:([0-9]{1,5})$ ]]; then
       host=${BASH_REMATCH[1]}
       tport=${BASH_REMATCH[2]}
-      if ((10#$tport < 1 || 10#$tport > 65535)); then
-        err "端口不合法。"
-        continue
-      fi
-      tport=$((10#$tport))
+    elif ! is_ipv6 "$ans" && [[ $ans =~ ^([A-Za-z0-9.-]+):([0-9]{1,5})$ ]]; then
+      host=${BASH_REMATCH[1]}
+      tport=${BASH_REMATCH[2]}
+    else
+      host=$(unbracket "$ans")
     fi
+    if ((10#$tport < 1 || 10#$tport > 65535)); then
+      err "端口不合法。"
+      continue
+    fi
+    tport=$((10#$tport))
+    host=$(unbracket "$host")
     if [[ $mode == domain ]]; then
       if [[ $host =~ [A-Za-z] ]] && is_domain "$host"; then
         printf '%s\n%s' "$host" "$tport"
@@ -2527,7 +2586,9 @@ edit_vless() {
       4)
         dest=$target
         [[ -z $dest || $dest == null ]] && dest=$sni
-        [[ -n $tport && $tport != null && $tport != 443 ]] && dest="${dest}:${tport}"
+        if [[ -n $tport && $tport != null && $tport != 443 ]]; then
+          dest="$(uri_host "$dest"):${tport}"
+        fi
         plainln "  伪装站点需要 TLS 1.3，不要用 CDN。"
         name_pack=$(ask_name "伪装域名" "$dest" domain) || continue
         read_fields "$name_pack" host tport
@@ -2676,7 +2737,7 @@ is_public_ipv4() {
 is_public_ipv6() {
   local ip=${1,,} head
   is_ipv6 "$ip" || return 1
-  [[ ${ip//[0:]/} == "" || $ip == ::1 || $ip == ::ffff:* || $ip == ff* ]] && return 1
+  [[ ${ip//[0:]/} == "" || $ip == ::1 || $ip == ::ffff:* || $ip == ff* || $ip == 2001:db8 || $ip == 2001:db8:* ]] && return 1
   head=${ip%%:*}
   [[ $head =~ ^f[cd][0-9a-f]{2}$ || $head =~ ^fe[89ab][0-9a-f]$ ]] && return 1
   return 0
@@ -2766,7 +2827,11 @@ reality_dest_ok() {
     err "缺少 timeout 或 openssl，无法检查伪装站点。"
     return 1
   fi
-  out=$(timeout 8 openssl s_client -connect "${host}:${port}" -servername "$host" -tls1_3 -showcerts </dev/null 2>&1) || true
+  local connect="$(uri_host "$host"):${port}" sni=()
+  if is_domain "$host"; then
+    sni=(-servername "$host")
+  fi
+  out=$(timeout 8 openssl s_client -connect "$connect" "${sni[@]}" -tls1_3 -showcerts </dev/null 2>&1) || true
   if ! grep -q 'TLSv1.3' <<<"$out"; then
     err "${host}:${port} 未完成 TLS 1.3 握手。请换一个本机能直连、且不在 CDN 后的站点。"
     return 1
