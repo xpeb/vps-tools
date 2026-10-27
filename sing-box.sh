@@ -37,6 +37,7 @@ shopt -s nullglob
 
 # 程序、配置、证书、运行目录和日志都在 STATE_DIR。服务单元仍由 systemd / OpenRC 从 /etc 加载。
 STATE_DIR=/var/lib/sing-box
+BOX_HOME=$STATE_DIR/empty
 BIN=$STATE_DIR/bin/sing-box
 CMD_LINK=/usr/local/bin/sing-box
 CONF_DIR=$STATE_DIR/etc
@@ -361,13 +362,41 @@ box_group_ok() {
   [[ $(id -gn sing-box 2>/dev/null) == sing-box ]]
 }
 
+# 只把 /var/empty 这类共享家目录换掉，自定义家目录不动。
+pin_box_home() {
+  local home tmp
+  [[ $(id -u sing-box) -eq 0 || $(id -g sing-box) -eq 0 ]] && { err "已有的 sing-box 账户不能是 root。"; return 1; }
+  home=$( { getent passwd sing-box 2>/dev/null || awk -F: '$1=="sing-box"' /etc/passwd; } | awk -F: '{print $6; exit}' )
+  case $home in
+    "$BOX_HOME") return 0 ;;
+    /var/empty | /nonexistent | "") ;;
+    *) return 0 ;;
+  esac
+  if command -v usermod >/dev/null 2>&1; then
+    usermod -d "$BOX_HOME" sing-box
+    return
+  fi
+  tmp=$(mktemp) || return 1
+  if awk -F: -v OFS=: -v home="$BOX_HOME" '$1=="sing-box" {$6=home} {print}' /etc/passwd >"$tmp" \
+    && awk -F: -v home="$BOX_HOME" '$1=="sing-box" && $6==home {ok=1} END{exit !ok}' "$tmp" \
+    && cat "$tmp" >/etc/passwd; then
+    rm -f -- "$tmp"
+    return 0
+  fi
+  rm -f -- "$tmp"
+  err "无法把 sing-box 的家目录改到 ${BOX_HOME}。"
+  return 1
+}
+
+ensure_box_home() {
+  [[ ! -L $BOX_HOME && ( ! -e $BOX_HOME || -d $BOX_HOME ) ]] || { err "家目录路径不安全: ${BOX_HOME}"; return 1; }
+  install -d -m 755 -o root -g root "$BOX_HOME" || return 1
+  id -u sing-box >/dev/null 2>&1 && pin_box_home
+}
+
 create_box_user() {
-  install -d -m 755 -o root -g root /var/empty || return 1
+  ensure_box_home || return 1
   if id -u sing-box >/dev/null 2>&1; then
-    if [[ $(id -u sing-box) -eq 0 || $(id -g sing-box) -eq 0 ]]; then
-      err "已有的 sing-box 账户不能是 root。"
-      return 1
-    fi
     if ! box_group_ok; then
       err "已有的 sing-box 账户必须以 sing-box 为主组。"
       return 1
@@ -377,19 +406,19 @@ create_box_user() {
   fi
   if [[ $OS == debian ]] && command -v systemd-sysusers >/dev/null 2>&1; then
     plainln "  创建 sing-box 用户"
-    systemd-sysusers - >/dev/null 2>&1 <<'EOF' || true
-u sing-box - "sing-box" /var/empty
+    systemd-sysusers - >/dev/null 2>&1 <<EOF || true
+u sing-box - "sing-box" $BOX_HOME
 EOF
   elif [[ $OS == alpine ]]; then
     if ! grep -q '^sing-box:' /etc/group 2>/dev/null; then
       addgroup -S sing-box || return 1
     fi
-    adduser -S -D -H -h /var/empty -s /sbin/nologin -G sing-box -g "sing-box" sing-box || true
+    adduser -S -D -H -h "$BOX_HOME" -s /sbin/nologin -G sing-box -g "sing-box" sing-box || true
   else
     if ! getent group sing-box >/dev/null 2>&1; then
       groupadd --system sing-box || return 1
     fi
-    useradd --system --gid sing-box --home-dir /var/empty --shell /usr/sbin/nologin --comment "sing-box" sing-box || true
+    useradd --system --gid sing-box --home-dir "$BOX_HOME" --shell /usr/sbin/nologin --comment "sing-box" sing-box || true
   fi
   if ! id -u sing-box >/dev/null 2>&1; then
     err "无法创建 sing-box 用户。"
@@ -399,6 +428,7 @@ EOF
     err "sing-box 账户身份或主组不安全。"
     return 1
   fi
+  ensure_box_home
 }
 
 remove_box_user() {
@@ -429,6 +459,7 @@ make_dir() {
 ensure_dirs() {
   local f
   # 只设置本程序创建的目录，不放宽 /var 或 /var/lib。
+  ensure_box_home || return 1
   make_dir 750 root sing-box "$STATE_DIR" || return 1
   make_dir 755 root root "${BIN%/*}" || return 1
   make_dir 700 root root "$META_DIR" || return 1
@@ -487,6 +518,9 @@ fix_tree_perms() {
   if [[ -d $META_DIR ]]; then
     [[ ! -L $META_DIR ]] || return 1
     chown root:root "$META_DIR" && chmod 700 "$META_DIR" || return 1
+  fi
+  if [[ -d $BOX_HOME && ! -L $BOX_HOME ]]; then
+    chown root:root "$BOX_HOME" && chmod 755 "$BOX_HOME" || return 1
   fi
   for f in "$META_DIR"/*.json "$CERT_DIR"/* "$CONF"; do
     [[ ! -L $f ]] || { err "拒绝使用符号链接: ${f}"; return 1; }
@@ -600,7 +634,7 @@ snapshot_tx() {
 }
 
 acquire_lock() {
-  [[ -z $TX ]] || { err "存在未恢复的事务: ${TX}"; return 1; }
+  [[ -z $TX ]] || { err "已有未结束的事务，请返回主菜单处理。"; return 1; }
   if ((LOCK_HELD)); then
     return 0
   fi
@@ -647,7 +681,7 @@ end_tx() {
 
 begin_tx() {
   local owns=0
-  [[ -z $TX ]] || { err "已有未结束的事务。"; return 1; }
+  [[ -z $TX ]] || { err "已有未结束的事务，请返回主菜单处理。"; return 1; }
   if ! ((LOCK_HELD)); then
     acquire_lock || return 1
     owns=1
@@ -737,15 +771,28 @@ rollback_tx() {
   end_tx
 }
 
+can_setpriv() {
+  setpriv --reuid=0 --regid=0 --init-groups -- /bin/true >/dev/null 2>&1
+}
+
 box_as_user() {
-  local bin=$1 log=$2 conf=$3
-  if ! id -u sing-box >/dev/null 2>&1 || ! command -v su >/dev/null 2>&1; then
-    printf '%s\n' '缺少 sing-box 用户或 su，拒绝以 root 代替校验。' >"$log"
+  local bin=$1 log=$2 conf=$3 uid gid
+  if ! id -u sing-box >/dev/null 2>&1; then
+    printf '%s\n' '缺少 sing-box 用户，拒绝以 root 代替校验。' >"$log"
     return 1
   fi
-  # 参数交给目标 shell 展开，不在当前 shell 拼接。
-  # shellcheck disable=SC2016
-  su -s /bin/sh -c 'exec "$1" check -c "$2"' sing-box sh "$bin" "$conf" >"$log" 2>&1
+  uid=$(id -u sing-box) || return 1
+  gid=$(id -g sing-box) || return 1
+  # setpriv 不开 PAM 会话。没有 --reuid 时退回 su。
+  (
+    cd / || exit 1
+    if can_setpriv; then
+      exec setpriv --reuid="$uid" --regid="$gid" --init-groups -- "$bin" check -c "$conf"
+    fi
+    command -v su >/dev/null 2>&1 || { printf '%s\n' '缺少可用的 setpriv 或 su，拒绝以 root 代替校验。'; exit 1; }
+    # shellcheck disable=SC2016
+    exec su -s /bin/sh -c 'exec "$1" check -c "$2"' sing-box sh "$bin" "$conf"
+  ) >"$log" 2>&1
 }
 
 box_test() {
@@ -1242,6 +1289,7 @@ install_logrotate() {
   if [[ ! -d $dir ]]; then
     install -d -m 755 "$dir" || return 1
   fi
+  # 目录 750 且组不可写，root 可直接轮转 sing-box 属主的日志。
   cat >"$LOGROTATE_FILE" <<EOF || return 1
 $LOG_DIR/*.log {
     daily
@@ -1251,7 +1299,6 @@ $LOG_DIR/*.log {
     delaycompress
     notifempty
     copytruncate
-    su root root
 }
 EOF
   chmod 644 "$LOGROTATE_FILE"
@@ -1660,6 +1707,9 @@ endpoint_hits() {
   [[ -n $ep && $ep != null && $ep == "$port" ]] || return 1
   [[ -n $etag && $etag != null && $etag == "$except" ]] && return 1
   [[ -z $elisten || $elisten == null ]] && elisten=0.0.0.0
+  # 无法解析的地址不能当成与所有监听冲突。
+  canon_listen "$listen" >/dev/null || return 1
+  canon_listen "$elisten" >/dev/null || return 1
   listen_clash "$listen" "$elisten" || return 1
   uses_tcp "$eproto" "$enet" && ct=1
   uses_udp "$eproto" "$enet" && cu=1
@@ -2093,8 +2143,18 @@ ask_reality_keys() {
   printf '%s\n%s\n%s\n' "$priv" "$pub" "$sid"
 }
 
+cert_covers() {
+  local cert=$1 name=$2
+  [[ -f $cert && ! -L $cert ]] || return 1
+  if is_ipv4 "$name" || is_ipv6 "$name"; then
+    openssl x509 -in "$cert" -noout -checkip "$name" >/dev/null 2>&1
+  else
+    openssl x509 -in "$cert" -noout -checkhost "$name" >/dev/null 2>&1
+  fi
+}
+
 make_self_signed() {
-  local cn=$1 dir san crt key
+  local cn=$1 dir san crt key subject
   dir=$(mktemp -d) || return 1
   crt=$dir/cert.crt
   key=$dir/cert.key
@@ -2103,9 +2163,14 @@ make_self_signed() {
   else
     san="DNS:${cn}"
   fi
+  # CN 最长 64 字节。超长名称只放进 SAN，校验以 SAN 为准。
+  subject=$cn
+  if ((${#subject} > 64)); then
+    subject=sing-box
+  fi
   if ! openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
     -keyout "$key" -out "$crt" -days 3650 \
-    -subj "/CN=${cn}" \
+    -subj "/CN=${subject}" \
     -addext "subjectAltName=${san}" >/dev/null 2>&1; then
     rm -rf -- "$dir"
     err "生成证书失败。"
@@ -2407,20 +2472,41 @@ rebuild_config() {
   rm -rf -- "$staged"
 }
 
+meta_tag() {
+  local t=${1##*/}
+  printf '%s' "${t%.json}"
+}
+
+keep_broken_inbound() {
+  local line
+  [[ -f $CONF ]] || return 1
+  line=$(jq -c --arg t "$1" '[.inbounds[]? | select(.tag == $t)][0] // empty' "$CONF") || return 1
+  [[ -n $line ]] || return 1
+  printf '%s\n' "$line" >>"$2"
+}
+
 build_config_parts() {
   local staged=$1 f tag
   : >"$staged/inbounds"
   : >"$staged/owned"
   for f in "$META_DIR"/*.json; do
-    validate_meta "$f" || { err "元数据不合法: ${f}"; return 1; }
-    render_inbound <"$f" >>"$staged/inbounds" || return 1
-    jq '.tag' "$f" >>"$staged/owned" || return 1
+    [[ -f $f && ! -L $f ]] || continue
+    tag=$(meta_tag "$f")
+    valid_tag "$tag" || { warn "跳过文件名不合法的元数据: ${f}"; continue; }
+    if validate_meta "$f"; then
+      render_inbound <"$f" >>"$staged/inbounds" || return 1
+    elif keep_broken_inbound "$tag" "$staged/inbounds"; then
+      warn "元数据损坏，已保留配置中的同名入站: ${tag}"
+    else
+      warn "元数据损坏，且配置中没有可保留的入站: ${tag}"
+    fi
+    jq -n --arg tag "$tag" '$tag' >>"$staged/owned" || return 1
   done
   # 删除时也要清掉事务开始前属于面板的 tag。
   if [[ -n $TX ]]; then
     for f in "$TX/meta"/*.json; do
       # 旧元数据仅用于移除原 tag，不依赖已被替换的证书。
-      tag=${f##*/}; tag=${tag%.json}
+      tag=$(meta_tag "$f")
       valid_tag "$tag" || return 1
       jq -n --arg tag "$tag" '$tag' >>"$staged/owned" || return 1
     done
@@ -2445,13 +2531,19 @@ save_meta_and_inbound() {
 }
 
 list_meta_files() {
-  local f
+  local f tag port
   for f in "$META_DIR"/*.json; do
-    [[ -f $f ]] || continue
-    validate_meta "$f" || { err "跳过损坏的元数据: ${f}"; continue; }
-    jq -r '[.port, .tag] | @tsv' "$f"
-  done | sort -n -k1,1 | while IFS=$'\t' read -r _port tag; do
-    printf '%s\n' "$META_DIR/${tag}.json"
+    [[ -f $f && ! -L $f ]] || continue
+    tag=$(meta_tag "$f")
+    valid_tag "$tag" || { warn "跳过文件名不合法的元数据: ${f}"; continue; }
+    if validate_meta "$f"; then
+      port=$(jq -r '.port' "$f")
+    else
+      port=0
+    fi
+    printf '%s\t%s\n' "$port" "$f"
+  done | sort -n -k1,1 | while IFS=$'\t' read -r _port path; do
+    printf '%s\n' "$path"
   done
 }
 
@@ -2487,12 +2579,19 @@ pick_inbound() {
     pause
     return 1
   fi
-  local f label port remark choice
+  local f label port remark choice tag
   local -a rows=()
   for f in "${files[@]}"; do
-    label=$(proto_label "$f")
-    port=$(jq -r '.port' "$f")
-    remark=$(jq -r '.remark' "$f")
+    tag=$(meta_tag "$f")
+    if validate_meta "$f"; then
+      label=$(proto_label "$f")
+      port=$(jq -r '.port' "$f")
+      remark=$(jq -r '.remark' "$f")
+    else
+      label="损坏"
+      port="-"
+      remark="${tag}（元数据不可用）"
+    fi
     rows+=("$(pad "$label" 16)$(pad "$port" 7)$remark")
   done
   choice=$(choose "$title" "返回" "${rows[@]}") || return 1
@@ -2936,8 +3035,43 @@ edit_vless() {
   done
 }
 
+set_share_insecure() {
+  if [[ $1 == 0 ]]; then
+    if ! cert_covers "$cert" "$sni"; then
+      warn "证书不包含 ${sni}，不能改为校验证书。"
+      return 1
+    fi
+    insecure=0
+  else
+    note "客户端将跳过证书校验。"
+    insecure=1
+  fi
+}
+
+# 域名变更后，证书必须覆盖新名称，否则要求换证或明确跳过校验。
+align_sni_cert() {
+  local old=$1
+  if [[ $sni == "$old" ]] || cert_covers "$cert" "$sni"; then
+    return 0
+  fi
+  warn "当前证书不包含 ${sni}。"
+  if confirm "现在更换证书？"; then
+    if stage_field_cert staged "$tag" "$sni" "$cert" "$key" "$insecure"; then
+      return 0
+    fi
+    sni=$old
+    return 1
+  fi
+  if confirm "分享链接改为跳过证书校验？"; then
+    insecure=1
+    return 0
+  fi
+  sni=$old
+  return 1
+}
+
 edit_quic() {
-  local meta=$1 choice doc staged proto title
+  local meta=$1 choice doc staged proto title old_sni="" check_choice check_label
   local tag listen port remark auth uuid password sni cert key insecure congestion name_pack
   local cert_mode="" cert_show=""
   local -a rows
@@ -2947,6 +3081,7 @@ edit_quic() {
     load_plain "$meta" proto=protocol tag listen port remark auth uuid password sni cert=certFile key=keyFile congestion
     insecure=$(jq -r 'if .insecure then 1 else 0 end' "$meta")
     staged=0
+    check_label=启用
     rows=("监听=$listen" "端口=$port" "备注=$remark" "域名=$sni" "证书=$cert")
     if [[ $proto == hysteria2 ]]; then
       title=Hysteria2
@@ -2955,14 +3090,19 @@ edit_quic() {
       title="TUIC v5"
       rows+=("拥塞=$congestion" "UUID=$uuid" "密码=已设置 · 选择修改")
     fi
+    [[ $insecure == 1 ]] && check_label=跳过
+    rows+=("校验=$check_label")
+    check_choice=${#rows[@]}
     choice=$(edit_loop "修改 $title" "$remark" "${rows[@]}") || return 0
     case $choice in
       1) listen=$(ask_listen "$listen") || continue ;;
       2) port=$(ask_port "$port" "$tag" "$proto" udp "$listen") || continue ;;
       3) remark=$(ask_remark "$remark") || continue ;;
       4)
+        old_sni=$sni
         name_pack=$(ask_name "证书域名或 IP" "$sni" name) || continue
         read_fields "$name_pack" sni
+        align_sni_cert "$old_sni" || continue
         ;;
       5) stage_field_cert staged "$tag" "$sni" "$cert" "$key" "$insecure" || continue ;;
       6)
@@ -2972,6 +3112,7 @@ edit_quic() {
           congestion=$(ask_congestion) || continue
         fi
         ;;
+      "$check_choice") set_share_insecure $((1 - insecure)) || continue ;;
       7) uuid=$(ask_uuid "$uuid") || continue ;;
       8) password=$(ask_password "密码" "$password" "") || continue ;;
       *) continue ;;
@@ -2994,6 +3135,11 @@ edit_inbound() {
   while true; do
     pick_inbound "修改入站" || return 0
     picked=$PICKED
+    if ! validate_meta "$picked"; then
+      err "该入站元数据已损坏，请先删除再重建。"
+      pause
+      continue
+    fi
     case $(jq -r '.protocol' "$picked") in
       shadowsocks) edit_ss "$picked" ;;
       vless) edit_vless "$picked" ;;
@@ -3018,9 +3164,15 @@ delete_inbound() {
   fi
   pick_inbound "删除入站" || return 0
   picked=$PICKED
-  tag=$(jq -r '.tag' "$picked")
+  tag=$(meta_tag "$picked")
+  valid_tag "$tag" || { err "元数据文件名不合法。"; pause; return 0; }
   blank
-  kv "删除" "$(proto_label "$picked")  $(jq -r '.port' "$picked")  $(jq -r '.remark' "$picked")"
+  if validate_meta "$picked"; then
+    kv "删除" "$(proto_label "$picked")  $(jq -r '.port' "$picked")  $(jq -r '.remark' "$picked")"
+  else
+    kv "删除" "损坏的元数据 ${tag}"
+    note "配置里的同名入站会一并移除。"
+  fi
   confirm "确认删除？" || return 0
   need_tx || return 0
   rm -f -- "$META_DIR/${tag}.json" || { rollback_tx; return 0; }
@@ -3150,18 +3302,10 @@ build_share() {
     shadowsocks)
       method=$(jq -r '.method' "$meta")
       password=$(jq -r '.password' "$meta")
+      # SIP002：method:password 的无填充 base64url，不附加 network。
       local userinfo
-      local network query=""
-      network=$(jq -r '.network // "tcp,udp"' "$meta")
-      if [[ $method == 2022-* ]]; then
-        userinfo="$(urlenc "$method"):$(urlenc "$password")"
-      else
-        userinfo=$(b64url "${method}:${password}")
-      fi
-      case $network in
-        tcp | udp) query="?network=${network}" ;;
-      esac
-      printf 'ss://%s@%s:%s%s#%s\n' "$userinfo" "$host" "$port" "$query" "$enc"
+      userinfo=$(b64url "${method}:${password}")
+      printf 'ss://%s@%s:%s#%s\n' "$userinfo" "$host" "$port" "$enc"
       ;;
     vless)
       uuid=$(urlenc "$(jq -r '.uuid' "$meta")")
@@ -3241,8 +3385,31 @@ share_details() {
   esac
 }
 
+share_hosts_for_listen() {
+  local listen=$1 v4=$2 v6=$3 canon
+  canon=$(canon_listen "$listen") || return 0
+  if [[ $canon == 0.0.0.0 ]]; then
+    [[ -n $v4 ]] && printf '%s\n' "$v4"
+  elif [[ $canon == :: ]]; then
+    [[ -n $v4 ]] && printf '%s\n' "$v4"
+    [[ -n $v6 ]] && printf '%s\n' "$v6"
+  elif is_public_ipv4 "$canon" || is_public_ipv6 "$canon"; then
+    printf '%s\n' "$canon"
+  fi
+}
+
+save_server_addr() {
+  make_dir 750 root sing-box "$STATE_DIR" || return 1
+  if [[ -L $STATE_DIR/server_addr ]]; then
+    err "服务器地址文件不能是符号链接。"
+    return 1
+  fi
+  printf '%s\n' "$1" >"$STATE_DIR/server_addr" || return 1
+  chmod 600 "$STATE_DIR/server_addr"
+}
+
 share_inbound() {
-  local picked host default link listen v4="" v6=""
+  local picked host default link listen v4="" v6="" canon="" network
   local -a found=() hosts=()
   if ! command -v jq >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1; then
     ensure_deps || {
@@ -3254,16 +3421,36 @@ share_inbound() {
   fi
   pick_inbound "分享入站" || return 0
   picked=$PICKED
-  plainln "  正在检测公网地址..."
-  mapfile -t found < <(detect_public_ips || true)
-  v4=${found[0]:-}
-  v6=${found[1]:-}
-  listen=$(jq -r '.listen' "$picked")
-  if [[ $listen != *:* || $listen == :: ]]; then
-    [[ -z $v4 ]] || hosts+=("$v4")
+  if ! validate_meta "$picked"; then
+    err "元数据已损坏，无法分享。请先删除该入站。"
+    pause
+    return 0
   fi
-  if [[ $listen == *:* ]]; then
-    [[ -z $v6 ]] || hosts+=("$v6")
+  listen=$(jq -r '.listen' "$picked")
+  canon=$(canon_listen "$listen" || true)
+  if [[ $canon == 0.0.0.0 || $canon == :: ]]; then
+    plainln "  正在检测公网地址..."
+    mapfile -t found < <(detect_public_ips || true)
+    v4=${found[0]:-}
+    v6=${found[1]:-}
+  fi
+  mapfile -t hosts < <(share_hosts_for_listen "$listen" "$v4" "$v6")
+  if ((${#hosts[@]})); then
+    blank
+    if [[ $canon == 0.0.0.0 || $canon == :: ]]; then
+      note "监听是通配地址，以下为探测到的公网地址："
+    else
+      note "分享地址使用实际监听地址，而不是出口探测结果："
+    fi
+    for host in "${hosts[@]}"; do
+      share_addr "地址" "$host"
+    done
+    if ! confirm "用这些地址生成分享链接？"; then
+      hosts=()
+      note "可改为域名，或填写客户端真正要连接的地址。"
+    fi
+  elif [[ -n $canon && $canon != 0.0.0.0 && $canon != :: ]]; then
+    note "监听地址不是公网地址，请填写客户端要连接的域名或公网 IP。"
   fi
   if ((${#hosts[@]} == 0)); then
     default=$(saved_host)
@@ -3279,16 +3466,11 @@ share_inbound() {
       pause
       return 0
     fi
-    make_dir 750 root sing-box "$STATE_DIR" || { pause; return 0; }
-    if [[ -L $STATE_DIR/server_addr ]]; then
-      err "服务器地址文件不能是符号链接。"; pause; return 0
-    fi
-    printf '%s\n' "$host" >"$STATE_DIR/server_addr" || {
+    save_server_addr "$host" || {
       err "无法保存服务器地址。"
       pause
       return 0
     }
-    chmod 600 "$STATE_DIR/server_addr"
     hosts=("$host")
   fi
   header "分享入站"
@@ -3300,13 +3482,46 @@ share_inbound() {
     note "分享链接"
     printf '  %s\n' "$link" >&4
   done
+  if [[ $(jq -r '.protocol' "$picked") == shadowsocks ]]; then
+    network=$(jq -r '.network // "tcp,udp"' "$picked")
+    case $network in
+      tcp | udp) note "入站仅接受 ${network}。链接是标准 SIP002，没有 network 参数。" ;;
+    esac
+  fi
   pause
+}
+
+recover_tx() {
+  local ans saved
+  while [[ -n $TX ]]; do
+    err "存在未恢复的事务: ${TX}"
+    note "重试会还原文件和服务。放弃只解除锁定，快照留在磁盘，当前文件可能不完整。"
+    ans=$(prompt "恢复事务" "y" "y 重试，n 放弃，q 退出") || return 1
+    case $ans in
+      y | Y)
+        rollback_tx && { plainln "  已恢复修改前的文件与服务状态。"; return 0; }
+        ;;
+      n | N)
+        saved=$TX
+        TX=""
+        TX_MODE=""
+        TX_WAS_RUNNING=0
+        TX_OWNS_LOCK=0
+        release_lock
+        warn "已放弃自动恢复。快照保留在 ${saved}。"
+        return 0
+        ;;
+      q | Q) return 1 ;;
+      *) err "请输入 y、n 或 q。" ;;
+    esac
+  done
 }
 
 main_menu() {
   local choice msg="" p
   p=$(printf '\001%s\002  选择 \001%s\002q 退出\001%s\002: ' "$GRN" "$DIM" "$GRN")
   while true; do
+    recover_tx || return 1
     draw_panel
     if [[ -n $msg ]]; then
       err "$msg"
