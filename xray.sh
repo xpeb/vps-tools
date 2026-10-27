@@ -1179,12 +1179,13 @@ fetch_latest_pack() {
 
 install_kernel() {
   local work version
-  header "安装内核"
   if [[ -x $BIN ]]; then
+    header "安装内核"
     plainln "  已安装 $(current_version)，更新请选「升级内核」。"
     pause
     return 0
   fi
+  # 标题已在安装依赖之前画好，下载和部署接在同一页。
   fetch_latest_pack || { pause; return 0; }
   deploy_or_rollback "$work/pack" "安装失败，已尝试恢复原有文件。" || { pause; return 0; }
   end_tx || { pause; return 0; }
@@ -3326,8 +3327,13 @@ share_inbound() {
 }
 
 # 填表期间持锁，避免另一个面板同时写入。
+# --open 先画出目标页，再装依赖，避免安装过程停在主菜单。
 mutate() {
   local rc
+  if [[ ${1:-} == --open ]]; then
+    header "$2"
+    shift 2
+  fi
   ensure_deps || { err "依赖安装失败。"; pause; return 1; }
   acquire_lock || { pause; return 1; }
   ACTION_LOCK=1
@@ -3353,7 +3359,13 @@ main_menu() {
     tty_read choice "$p" || return 0
     case $choice in
       q | Q) ui $'\n'; return 0 ;;
-      1) mutate install_kernel ;;
+      1)
+        if [[ -x $BIN ]]; then
+          mutate install_kernel
+        else
+          mutate --open "安装内核" install_kernel
+        fi
+        ;;
       2) mutate upgrade_kernel ;;
       3) mutate start_kernel ;;
       4) mutate stop_kernel ;;
