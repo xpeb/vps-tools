@@ -1467,16 +1467,69 @@ uses_udp() {
   return 1
 }
 
-wildcard_listen() {
-  local listen
-  listen=$(unbracket "$1")
-  [[ -z $listen || $listen == null || $listen == 0.0.0.0 ]] && return 0
-  is_ipv6 "$listen" && [[ ${listen//[0:]/} == "" ]]
+listen_ip() {
+  local ip
+  ip=$(unbracket "$1")
+  [[ -z $ip || $ip == null ]] && ip=0.0.0.0
+  printf '%s' "$ip"
+}
+
+# 0.0.0.0 只绑 IPv4。:: 由 Go 显式关掉 IPV6_V6ONLY，同时收 IPv4。
+v4_wild() { [[ $(listen_ip "$1") == 0.0.0.0 ]]; }
+v6_wild() {
+  local ip
+  ip=$(listen_ip "$1")
+  is_ipv6 "$ip" && [[ ${ip//[0:]/} == "" ]]
 }
 
 listen_clash() {
-  local a=$1 b=$2
-  [[ $a == "$b" ]] || wildcard_listen "$a" || wildcard_listen "$b"
+  local a b
+  a=$(listen_ip "$1")
+  b=$(listen_ip "$2")
+  [[ $a == "$b" ]] && return 0
+  if v6_wild "$a" || v6_wild "$b"; then
+    return 0
+  fi
+  if v4_wild "$a"; then
+    is_ipv4 "$b"
+    return
+  fi
+  if v4_wild "$b"; then
+    is_ipv4 "$a"
+    return
+  fi
+  return 1
+}
+
+# 外部进程只要占用该端口就算冲突，避免保存后启动失败。xray 用户自己的套接字交给配置对比。
+foreign_port() {
+  local port=$1 tcp=$2 udp=$3 hex uid_x files=() f local_addr rem state uid
+  printf -v hex '%04X' "$port"
+  uid_x=$(id -u xray 2>/dev/null || true)
+  ((tcp)) && files+=(/proc/net/tcp /proc/net/tcp6)
+  ((udp)) && files+=(/proc/net/udp /proc/net/udp6)
+  for f in "${files[@]}"; do
+    [[ -r $f ]] || continue
+    while read -r _ local_addr rem state _ _ _ uid _; do
+      [[ ${local_addr##*:} == "$hex" ]] || continue
+      if [[ $f == *udp* ]]; then
+        [[ ${rem##*:} == 0000 ]] || continue
+      else
+        [[ $state == 0A ]] || continue
+      fi
+      [[ -n $uid_x && $uid == "$uid_x" ]] && continue
+      return 0
+    done <"$f"
+  done
+  return 1
+}
+
+port_denied() {
+  if [[ $CONFLICT_TAG == - ]]; then
+    err "端口 $1 已被其他进程占用。"
+  else
+    err "端口 $1 与入站 ${CONFLICT_TAG} 冲突。"
+  fi
 }
 
 endpoint_hits() {
@@ -1529,6 +1582,10 @@ port_conflict() {
         return 0
       fi
     done < <(jq -rj '.inbounds[]? | ["x", "." + (if (.tag // "") == "" then "config.json" else .tag end), .protocol // "", (if .settings.udp == true then "tcp,udp" else (.streamSettings.method // .streamSettings.network // .settings.network // "") end), (.port | tostring), (.listen // "0.0.0.0")] | join("\u001f") + "\n"' "$CONF" 2>/dev/null || true)
+  fi
+  if foreign_port "$port" "$nt" "$nu"; then
+    CONFLICT_TAG=-
+    return 0
   fi
   return 1
 }
@@ -1602,7 +1659,7 @@ ask_port() {
     fi
     p=$((10#$ans))
     if port_conflict "$p" "$except" "$proto" "$network" "$listen"; then
-      err "端口 ${p} 与入站 ${CONFLICT_TAG} 冲突。"
+      port_denied "$p"
       continue
     fi
     printf '%s' "$p"
@@ -1646,7 +1703,7 @@ ask_name() {
         printf '%s\n%s' "$host" "$tport"
         return 0
       fi
-      err "请输入域名，例如 www.microsoft.com，不要用 CDN。"
+      err "请输入可直连的域名，不要用 CDN。"
       continue
     fi
     if is_ipv4 "$host" || is_ipv6 "$host" || is_domain "$host"; then
@@ -1843,26 +1900,31 @@ ask_uuid() {
 }
 
 ask_password() {
-  local label=$1 current=$2 method=$3 ans
+  local label=$1 current=$2 method=$3 ans hint
+  if [[ -n $current ]]; then
+    hint='回车保留，g 重来，q 取消，\原文'
+  else
+    hint='回车生成，q 取消，\原文'
+  fi
   while true; do
-    ans=$(regen_prompt "$label" "$current") || return 2
-    if [[ -z $ans && -n $current ]]; then
+    ans=$(prompt "$label" "" "$hint") || return 2
+    if [[ $ans == \\* ]]; then
+      ans=${ans:1}
+      if [[ -z $ans ]]; then
+        err "密码不能为空。"
+        continue
+      fi
+    elif [[ -z $ans && -n $current ]]; then
       if [[ -n $method ]] && ! ss_key_ok "$method" "$current"; then
         err "密码长度不符，请输入 g 重新生成。"
         continue
       fi
       printf '%s' "$current"
       return 0
-    fi
-    if [[ -z $ans ]] || is_regen "$ans"; then
-      if [[ -n $method ]]; then
-        gen_ss_password "$method"
-      else
-        gen_auth
-      fi
+    elif [[ -z $ans ]] || is_regen "$ans"; then
+      if [[ -n $method ]]; then gen_ss_password "$method"; else gen_auth; fi
       return 0
-    fi
-    if cancelled "$ans"; then
+    elif cancelled "$ans"; then
       return 2
     fi
     if [[ -n $method ]] && ! ss_key_ok "$method" "$ans"; then
@@ -2058,7 +2120,7 @@ render_inbound() {
           settings:{version:2, users:[{auth:$m.auth, email:$m.tag}]},
           streamSettings:{security:"tls",
             tlsSettings:({alpn:["h3"], certificates:[{certificateFile:$m.certFile, keyFile:$m.keyFile}]} + ($m | hy_sni)),
-            method:"hysteria",
+            network:"hysteria", method:"hysteria",
             hysteriaSettings:{version:2, masquerade:{type:"string", content:"404 not found", statusCode:404}}}}
     else
       error("unknown protocol")
@@ -2194,7 +2256,7 @@ commit_inbound() {
   network=$(jq -r '.network // ""' <<<"$doc") || { rollback_tx; return 1; }
   listen=$(jq -r '.listen' <<<"$doc") || { rollback_tx; return 1; }
   if port_conflict "$port" "$tag" "$proto" "$network" "$listen"; then
-    err "端口 ${port} 与入站 ${CONFLICT_TAG} 冲突。"
+    port_denied "$port"
     rollback_tx
     pause
     return 1
@@ -2297,7 +2359,7 @@ vless_wizard() {
   remark=$(ask_remark "vless-${port}") || return 0
   while true; do
     note "伪装站点需要 TLS 1.3，不要用 CDN。"
-    name_pack=$(ask_name "伪装域名" "www.microsoft.com:443" domain) || return 0
+    name_pack=$(ask_name "伪装域名" "" domain) || return 0
     read_fields "$name_pack" host tport
     reality_dest_ok "$host" "$tport" && break
   done
@@ -2348,7 +2410,7 @@ hy_wizard() {
   kv "备注" "$remark"
   blank
   confirm_write || return 0
-  need_tx || return 0
+  need_tx || { drop_temp_cert "$cert_mode" "$cert"; return 0; }
   stage_chosen_cert "$tag" || return 0
   doc=$(meta_hy "$tag" "$remark" "$listen" "$port" "$auth" "$sni" "$cert" "$key" "$insecure") || doc=""
   commit_inbound "$tag" hysteria2 "$port" "$doc" || return 0
@@ -2419,7 +2481,7 @@ edit_ss() {
       3)
         network=$(ask_ss_network) || continue
         if port_conflict "$port" "$tag" shadowsocks "$network" "$listen"; then
-          err "端口 ${port} 与入站 ${CONFLICT_TAG} 冲突。"
+          port_denied "$port"
           pause
           continue
         fi
@@ -2513,7 +2575,7 @@ edit_hy() {
         ;;
       5)
         apply_field_cert "$sni" "$cert" "$key" "$insecure" || continue
-        need_tx || continue
+        need_tx || { drop_temp_cert "$cert_mode" "$cert"; continue; }
         stage_chosen_cert "$tag" || continue
         staged=1
         ;;
@@ -2614,9 +2676,9 @@ is_public_ipv4() {
 is_public_ipv6() {
   local ip=${1,,} head
   is_ipv6 "$ip" || return 1
-  [[ $ip == :: || $ip == ::1 || $ip == ::ffff:* || $ip == fc* || $ip == fd* || $ip == ff* ]] && return 1
+  [[ ${ip//[0:]/} == "" || $ip == ::1 || $ip == ::ffff:* || $ip == ff* ]] && return 1
   head=${ip%%:*}
-  [[ $head =~ ^fe[89ab][0-9a-f]$ ]] && return 1
+  [[ $head =~ ^f[cd][0-9a-f]{2}$ || $head =~ ^fe[89ab][0-9a-f]$ ]] && return 1
   return 0
 }
 
@@ -2661,34 +2723,44 @@ share_host_ok() {
   is_ipv4 "$host" || is_ipv6 "$host" || is_domain "$host"
 }
 
-# Xray 在支持双栈的 Linux 上使用双栈通配监听，不按字符串限定地址族。
 share_host_fits() {
-  local host listen
+  local host ip
   host=$(unbracket "$1")
-  listen=$(unbracket "$2")
   share_host_ok "$host" || return 1
-  wildcard_listen "$listen" && return 0
-  if is_ipv6 "$listen"; then
-    ! is_ipv4 "$host"
-  else
-    ! is_ipv6 "$host"
+  ip=$(listen_ip "$2")
+  if is_ipv6 "$host"; then
+    is_ipv6 "$ip" || v6_wild "$ip"
+    return
+  fi
+  if is_ipv4 "$host"; then
+    v6_wild "$ip" || ! is_ipv6 "$ip"
+    return
   fi
 }
 
 share_listen_hosts() {
-  local listen=$1 v4=$2 v6=$3
-  listen=$(unbracket "$listen")
-  if ! wildcard_listen "$listen"; then
-    printf '%s\n' "$listen"
+  local ip
+  ip=$(listen_ip "$1")
+  if v4_wild "$ip" || v6_wild "$ip"; then
+    [[ -n $2 ]] && printf '%s\n' "$2"
+    v6_wild "$ip" && [[ -n $3 ]] && printf '%s\n' "$3"
     return 0
   fi
-  [[ -z $v4 ]] || printf '%s\n' "$v4"
-  [[ -z $v6 ]] || printf '%s\n' "$v6"
-  return 0
+  printf '%s\n' "$ip"
+}
+
+# 与 Xray 的警告名单一致，apple 按子串匹配。
+reality_blocked() {
+  local h=${1,,}
+  [[ $h == *.ru || $h == *.ir || $h == *.cn || $h == *microsoft* || $h == *apple* || $h == *icloud* ]]
 }
 
 reality_dest_ok() {
   local host=$1 port=$2 out
+  if reality_blocked "$host"; then
+    err "不要用 ${host}。microsoft、apple、icloud 以及 .ru/.ir/.cn 容易被针对。"
+    return 1
+  fi
   plainln "  正在检查 ${host}:${port} 的 TLS 1.3..."
   if ! command -v timeout >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1; then
     err "缺少 timeout 或 openssl，无法检查伪装站点。"
