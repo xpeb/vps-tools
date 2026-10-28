@@ -21,9 +21,3 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xpeb/vps-tools/main/xray.sh)
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/xpeb/vps-tools/main/sing-box.sh)
 ```
-
-# mihomo.sh
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/xpeb/vps-tools/main/mihomo.sh)
-```
