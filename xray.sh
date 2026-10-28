@@ -22,7 +22,8 @@ RELEASE_API="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
 
 INIT_KIND=""
 MACHINE=""
-ACC="" GRN="" RED="" YEL="" DIM="" RST=""
+BOLD=""
+ACC="" CYN="" GRN="" RED="" YEL="" DIM="" BORD="" RST=""
 CHOOSE=""
 LISTEN="" PORT="" TAGPART=""
 NOTICE=""
@@ -30,14 +31,14 @@ NOTICE=""
 # 面板输出走 fd 4。
 ui() { printf '%b\n' "$*" >&4; }
 uin() { printf '%b' "$*" >&4; }
-plainln() { printf '%s\n' "$*" >&4; }
 notice() { NOTICE="$*"; }
 hold() { ui "$1"; notice "$1"; }
-err() { hold "${RED}错误${RST}  $*"; }
-warn() { hold "${YEL}警告${RST}  $*"; }
-note() { ui "${DIM}$*${RST}"; }
-okmsg() { hold "${GRN}完成${RST}  $*"; }
-cancelled() { note "已取消"; notice "${DIM}已取消${RST}"; }
+err() { hold "${RED}✖ 错误${RST}  $*"; }
+warn() { hold "${YEL}▲ 警告${RST}  $*"; }
+note() { ui "${DIM}ℹ $*${RST}"; }
+sticky() { note "$1"; notice "${DIM}ℹ $1${RST}"; }
+okmsg() { hold "${GRN}✔ 完成${RST}  $*"; }
+cancelled() { sticky "已取消"; }
 
 readin() {
   local _v=""
@@ -74,26 +75,31 @@ pad() {
   if (( w >= width )); then printf '%s' "$s"; else printf '%s%*s' "$s" $((width - w)) ''; fi
 }
 
+ui_tty() { [[ -t 4 && "${TERM:-}" != "dumb" && "${NO_COLOR:-}" != "1" ]]; }
 init_ui() {
-  ACC="" GRN="" RED="" YEL="" DIM="" RST=""
-  [[ -t 4 && "${NO_COLOR:-}" != "1" && "${TERM:-}" != "dumb" ]] || return 0
-  ACC=$'\e[38;2;116;180;255m'
-  GRN=$'\e[38;2;126;217;167m'
-  RED=$'\e[38;2;255;107;107m'
-  YEL=$'\e[38;2;240;200;120m'
-  DIM=$'\e[38;2;145;155;170m'
+  BOLD="" ACC="" CYN="" GRN="" RED="" YEL="" DIM="" BORD="" RST=""
+  ui_tty || return 0
+  BOLD=$'\e[1m'
+  ACC=$'\e[38;2;100;181;246m'   # 科技蓝
+  CYN=$'\e[38;2;77;208;225m'    # 极光青
+  GRN=$'\e[38;2;129;199;132m'   # 翡翠绿
+  RED=$'\e[38;2;239;83;80m'     # 珊瑚红
+  YEL=$'\e[38;2;255;202;40m'    # 琥珀黄
+  DIM=$'\e[38;2;144;164;174m'   # 柔和灰蓝
+  BORD=$'\e[38;2;90;110;130m'   # 边框色
   RST=$'\e[0m'
 }
 
-ui_tty() { [[ -t 4 && "${TERM:-}" != "dumb" && "${NO_COLOR:-}" != "1" ]]; }
 cls() {
   ui_tty || return 0
   printf '\e[H\e[2J' >&4 2>/dev/null || true
 }
 
-section() { ui "${DIM}$1${RST}"; }
-
-header() { cls; ui "${ACC}$1${RST}"; }
+header() {
+  cls
+  ui " ${ACC}┌──${RST} ${BOLD}$1${RST} ${BORD}──────────────────────────────────────────${RST}"
+  ui ""
+}
 
 # 窄终端单列，宽终端两列。编号按显示宽度对齐，不用字符串长度。
 menu_wide() {
@@ -105,25 +111,31 @@ menu_wide() {
 
 menu_row() {
   local n1="$1" l1="$2" n2="${3:-}" l2="${4:-}"
+  local k1 k2
+  printf -v k1 '%2d.' "$n1"
   if menu_wide && [[ -n "$n2" ]]; then
-    ui "${ACC}$(pad "$n1" 2)${RST}  $(pad "$l1" 10)${ACC}$(pad "$n2" 2)${RST}  ${l2}"
+    printf -v k2 '%2d.' "$n2"
+    ui " ${BORD}│${RST}  ${ACC}${BOLD}${k1}${RST} $(pad "$l1" 12)  ${ACC}${BOLD}${k2}${RST} ${l2}"
   else
-    ui "${ACC}$(pad "$n1" 2)${RST}  ${l1}"
+    ui " ${BORD}│${RST}  ${ACC}${BOLD}${k1}${RST} ${l1}"
     if [[ -n "$n2" ]]; then
-      ui "${ACC}$(pad "$n2" 2)${RST}  ${l2}"
+      printf -v k2 '%2d.' "$n2"
+      ui " ${BORD}│${RST}  ${ACC}${BOLD}${k2}${RST} ${l2}"
     fi
   fi
 }
 
-pause() { uin "${DIM}回车返回${RST} "; readin >/dev/null || true; }
+pause() { uin "  ${DIM}按回车返回${RST} "; readin >/dev/null || true; }
 
 choose() {
-  local opt key ans
+  local opt key ans k
   for opt in "$@"; do
-    ui "${ACC}$(pad "${opt%%:*}" 2)${RST}  ${opt#*:}"
+    key="${opt%%:*}"
+    printf -v k '%2s.' "$key"
+    ui "    ${ACC}${BOLD}${k}${RST}  ${opt#*:}"
   done
   while true; do
-    uin "${DIM}q 返回${RST} ${GRN}>${RST} "
+    uin "  ${CYN}➜${RST} 请选择 ${DIM}(q 返回)${RST} ${ACC}›${RST} "
     ans=$(readin)
     is_q "$ans" && { CHOOSE=""; return 1; }
     for opt in "$@"; do
@@ -136,8 +148,11 @@ choose() {
 
 prompt() {
   local __var="$1" label="$2" def="${3:-}" ans
-  if [[ -n "$def" ]]; then uin "${GRN}${label}${RST} ${DIM}[${def}] q 返回${RST} ${GRN}>${RST} "
-  else uin "${GRN}${label}${RST} ${DIM}q 返回${RST} ${GRN}>${RST} "; fi
+  if [[ -n "$def" ]]; then
+    uin "  ${CYN}➜${RST} ${label} ${DIM}[${def}] (q 返回)${RST} ${ACC}›${RST} "
+  else
+    uin "  ${CYN}➜${RST} ${label} ${DIM}(q 返回)${RST} ${ACC}›${RST} "
+  fi
   ans=$(readin)
   is_q "$ans" && return 1
   [[ -z "$ans" ]] && ans="$def"
@@ -147,7 +162,7 @@ prompt() {
 
 confirm() {
   local ans
-  uin "${YEL}$1${RST} ${DIM}[y/N] q 返回${RST} ${GRN}>${RST} "
+  uin "  ${YEL}？${RST} $1 ${DIM}[y/N] (q 返回)${RST} ${ACC}›${RST} "
   ans=$(readin)
   [[ "$ans" == "y" || "$ans" == "Y" || "$ans" == "yes" ]]
 }
@@ -155,12 +170,20 @@ confirm() {
 # 0 写入；1 取消或非法（已提示）
 confirm_write() {
   local ans
-  uin "${DIM}回车写入，q 返回${RST} ${GRN}>${RST} "
-  ans=$(readin)
-  if is_q "$ans"; then cancelled; return 1; fi
-  [[ -z "$ans" || "$ans" == "y" || "$ans" == "Y" ]] && return 0
-  err "回车写入，或 q 返回"
-  return 1
+  while true; do
+    uin "  ${ACC}➜${RST} ${BOLD}回车写入，q 返回${RST} ${ACC}›${RST} "
+    ans=$(readin)
+    if is_q "$ans"; then cancelled; return 1; fi
+    [[ -z "$ans" || "$ans" == "y" || "$ans" == "Y" ]] && return 0
+    err "回车写入，或 q 返回"
+  done
+}
+
+pick_one() {
+  local i=1 item args=()
+  for item in "$@"; do args+=("$i:$item"); i=$((i + 1)); done
+  choose "${args[@]}" || return 1
+  printf '%s' "${@:CHOOSE:1}"
 }
 
 kv() {
@@ -168,10 +191,10 @@ kv() {
   left=$(pad "$1" 10)
   vw=$(dw "$v")
   if (( vw > 64 )); then
-    ui "${left}"
-    ui "${ACC}${v}${RST}"
+    ui "  ${DIM}${left}${RST}"
+    ui "    ${ACC}${v}${RST}"
   else
-    ui "${left}${ACC}${v}${RST}"
+    ui "  ${DIM}${left}${RST} :  ${ACC}${BOLD}${v}${RST}"
   fi
 }
 
@@ -180,7 +203,7 @@ ask_gen() {
   local __var="$1" label="$2" value="$3" ans
   shift 3
   while true; do
-    uin "${GRN}${label}${RST} ${DIM}[回车/g] q 返回${RST} ${GRN}>${RST} "
+    uin "  ${CYN}➜${RST} ${label} ${DIM}[回车接受 / g 重新生成 / q 返回]${RST} ${ACC}›${RST} "
     ans=$(readin)
     is_q "$ans" && return 1
     if is_g "$ans"; then
@@ -198,7 +221,7 @@ ask_gen() {
 
 need_root() {
   [[ "${XRAY_SH_SKIP_ROOT:-}" == "1" || "$(id -u)" -eq 0 ]] && return 0
-  plainln "必须以 root 运行。"
+  printf '%s\n' "必须以 root 运行。"
   exit 1
 }
 
@@ -268,7 +291,7 @@ ensure_user() {
     return 0
   fi
   if [[ "$INIT_KIND" == "systemd" ]] && command -v systemd-sysusers >/dev/null 2>&1; then
-    systemd-sysusers - <<'EOF'
+    systemd-sysusers - >/dev/null <<'EOF'
 u xray - "Xray" /var/empty
 EOF
   elif [[ -f /etc/alpine-release ]]; then
@@ -396,8 +419,12 @@ svc() {
 
 svc_wait() {
   svc "$1" || return 1
-  sleep 0.4
-  svc running
+  local i
+  for i in 1 2 3 4 5; do
+    sleep 0.5
+    svc running && return 0
+  done
+  return 1
 }
 
 assert_runtime_user() {
@@ -419,12 +446,19 @@ current_version() {
 }
 
 latest_version() {
-  local tmp tag
+  local tmp tag=""
   tmp=$(mktemp)
-  curl -fsSL -H "Accept: application/vnd.github+json" -o "$tmp" "$RELEASE_API" || { rm -f "$tmp"; return 1; }
-  tag=$(jq -r '.tag_name // empty' "$tmp")
+  if curl -fsSL -H "Accept: application/vnd.github+json" -o "$tmp" "$RELEASE_API" 2>/dev/null; then
+    tag=$(jq -r '.tag_name // empty' "$tmp" 2>/dev/null || true)
+  fi
   rm -f "$tmp"
-  [[ -n "$tag" ]] || return 1
+  if [[ -z "$tag" ]]; then
+    local redir
+    redir=$(curl -fsSLI -o /dev/null -w '%{url_effective}' --max-time 10 "https://github.com/XTLS/Xray-core/releases/latest" 2>/dev/null || true)
+    tag="${redir##*/tag/}"
+    tag="${tag##*/}"
+  fi
+  [[ "$tag" =~ ^v?[0-9] ]] || return 1
   printf '%s\n' "${tag#v}"
 }
 
@@ -449,7 +483,7 @@ human_size() {
 }
 
 dl_meter() {
-  local got=${1:-0} total=${2:-0} width=24 fill=0 pct=0 bar="" i
+  local got=${1:-0} total=${2:-0} width=24 fill=0 pct=0 bar rest
   [[ "$got" =~ ^[0-9]+$ ]] || got=0
   [[ "$total" =~ ^[0-9]+$ ]] || total=0
   if (( total > 0 )); then
@@ -457,17 +491,16 @@ dl_meter() {
     if (( fill > width )); then fill=$width; fi
     pct=$((got * 100 / total))
     if (( pct > 100 )); then pct=100; fi
-    for ((i = 0; i < width; i++)); do
-      if (( i < fill )); then bar+='#'; else bar+='-'; fi
-    done
-    printf '[%s] %3d%%  %s/%s' "$bar" "$pct" "$(human_size "$got")" "$(human_size "$total")"
+    printf -v bar '%*s' "$fill" ''
+    printf -v rest '%*s' $((width - fill)) ''
+    printf '[%s] %3d%%  %s/%s' "${bar// /#}${rest// /-}" "$pct" "$(human_size "$got")" "$(human_size "$total")"
   else
     human_size "$got"
   fi
 }
 
 dl_draw() {
-  printf '\r\e[K%b' "$(pad "下载" 10)${ACC}$(dl_meter "$1" "$2")${RST}" >&4
+  printf '\r\e[K  %b' "${CYN}➜${RST} $(pad "下载进度" 10) ${ACC}$(dl_meter "$1" "$2")${RST}" >&4
 }
 
 download_install() {
@@ -500,11 +533,17 @@ download_install() {
     size=$(wc -c <"$zip" 2>/dev/null || true)
     kv "大小" "$(human_size "${size// /}")"
   fi
-  if curl -fsSL -o "${zip}.dgst" "${url}.dgst"; then
+  if curl -fsSL -o "${zip}.dgst" "${url}.dgst" 2>/dev/null; then
     expect=$(awk -F'=' '/256=/ {gsub(/ /,"",$2); print tolower($2)}' "${zip}.dgst")
     got=$(sha256sum "$zip" | awk '{print $1}')
-    if [[ -n "$expect" && "$expect" != "$got" ]]; then err "校验失败"; return 1; fi
-    kv "校验" "通过"
+    if [[ -z "$expect" ]]; then
+      warn "无校验值"
+    elif [[ "$expect" != "$got" ]]; then
+      err "校验失败"
+      return 1
+    else
+      kv "校验" "通过"
+    fi
   else
     warn "无校验文件"
   fi
@@ -512,8 +551,10 @@ download_install() {
   ensure_user || return 1
   install_dirs || { err "建目录失败"; return 1; }
   install -m 755 -o 0 -g 0 "${tmp}/out/xray" "$BIN" || { err "安装失败"; return 1; }
-  [[ -f "${tmp}/out/geoip.dat" ]] && install -m 644 -o xray -g xray "${tmp}/out/geoip.dat" "${DAT_PATH}/geoip.dat"
-  [[ -f "${tmp}/out/geosite.dat" ]] && install -m 644 -o xray -g xray "${tmp}/out/geosite.dat" "${DAT_PATH}/geosite.dat"
+  local dat
+  for dat in geoip.dat geosite.dat; do
+    [[ -f "${tmp}/out/$dat" ]] && install -m 644 -o xray -g xray "${tmp}/out/$dat" "${DAT_PATH}/$dat"
+  done
   write_services || { err "写服务失败"; return 1; }
   assert_runtime_user || return 1
 }
@@ -563,7 +604,7 @@ port_taken() {
     tcp) flags="-lntH" ;;
     udp) flags="-lnuH" ;;
   esac
-  ss $flags 2>/dev/null | awk '{print $5}' | grep -Eq "(^|:|\])${port}$"
+  ss $flags "sport = :${port}" 2>/dev/null | grep -q .
 }
 
 gen_uuid() {
@@ -573,13 +614,12 @@ gen_uuid() {
 
 x25519_field() { awk -F': ' -v k="$1" 'tolower($1) ~ k {print $2; exit}'; }
 
-gen_reality_keys() {
-  local out p u
+gen_reality_key() {
+  local out p
   [[ -x "$BIN" ]] || return 1
   out=$("$BIN" x25519 2>/dev/null) || return 1
   p=$(x25519_field private <<<"$out")
-  u=$(x25519_field 'password|public' <<<"$out")
-  [[ -n "$p" && -n "$u" ]] || return 1
+  [[ -n "$p" ]] || return 1
   printf '%s\n' "$p"
 }
 
@@ -711,9 +751,9 @@ share_load() {
 
 share_egress() {
   local addr before=${#SHARE_LINES[@]}
-  addr=$(curl "$1"fsS --connect-timeout 2 --max-time 3 "$2" 2>/dev/null || true)
+  addr=$(curl "$1" -fsS --connect-timeout 2 --max-time 3 "$2" 2>/dev/null || true)
   addr=$(printf '%s\n' "$addr" | sed -n 's/^ip=//p' | head -n1)
-  [[ -z "$addr" ]] && addr=$(curl "$1"fsS --connect-timeout 2 --max-time 3 "$3" 2>/dev/null || true)
+  [[ -z "$addr" ]] && addr=$(curl "$1" -fsS --connect-timeout 2 --max-time 3 "$3" 2>/dev/null || true)
   [[ -n "$addr" ]] && share_take "$addr"
   if (( ${#SHARE_LINES[@]} > before )); then SHARE_VIA="egress"; fi
   return 0
@@ -851,7 +891,7 @@ ask_cert() {
   else
     prompt crt "证书" || return 1
     prompt key "私钥" || return 1
-    [[ "$crt" == /* && "$key" == /* && -f "$crt" && -f "$key" && ! -L "$crt" && ! -L "$key" ]] \
+    [[ "$crt" == /* && "$key" == /* && -f "$crt" && -f "$key" ]] \
       || { err "证书不存在"; return 1; }
     install_cert_pair "${CFG_DIR}/certs/${tag}.crt" "${CFG_DIR}/certs/${tag}.key" "$crt" "$key" \
       || { err "证书安装失败"; return 1; }
@@ -865,7 +905,7 @@ xray_test_file() {
     install -d -m 750 -o 0 -g xray "$STATE_DIR"
     install -m 640 -o 0 -g xray "$file" "${STATE_DIR}/test-config.json"
     file="${STATE_DIR}/test-config.json"
-    out=$(su -s /bin/sh xray -c "XRAY_LOCATION_ASSET='${DAT_PATH}/' '${BIN}' run -test -config '${file}'" 2>&1) || rc=$?
+    out=$(su -s /bin/sh xray -c 'exec env "XRAY_LOCATION_ASSET=$1" "$2" run -test -config "$3"' _ "${DAT_PATH}/" "$BIN" "$file" 2>&1) || rc=$?
     rm -f "$file"
   else
     out=$(XRAY_LOCATION_ASSET="${DAT_PATH}/" "$BIN" run -test -config "$file" 2>&1) || rc=$?
@@ -913,7 +953,11 @@ mutate() {
     warn "已回滚并启动"
     finish_mutate 1; return 0
   fi
-  sleep 0.4
+  local _w
+  for _w in 1 2 3 4 5; do
+    sleep 0.5
+    svc running && break
+  done
   if ! svc running; then
     restore_bak
     if ! svc restart; then err "回滚失败"; finish_mutate 2; return 0; fi
@@ -1013,6 +1057,7 @@ summary_of() {
   port=$(j '.port')
   listen=$(j '.listen')
   tag=$(j '.tag')
+  ui "  ${ACC}┌── 节点配置摘要 ──────────────────────────────${RST}"
   kv "协议" "$proto"
   kv "备注" "$tag"
   kv "监听" "${listen}:${port}"
@@ -1045,8 +1090,10 @@ summary_of() {
       kv "SNI" "$(j '.streamSettings.tlsSettings.serverName')"
       kv "混淆" "salamander"
       kv "上传" "$(j '.streamSettings.finalmask.quicParams.brutalUp')"
+      kv "下载" "$(j '.streamSettings.finalmask.quicParams.brutalDown')"
       ;;
   esac
+  ui "  ${ACC}└──────────────────────────────────────────────${RST}"
 }
 
 valid_port() { [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$1 <= 65535 )); }
@@ -1079,7 +1126,9 @@ has_path() { is_ws "$1" || [[ "$1" == xhttp ]]; }
 valid_listen() {
   local a="$1" o
   if [[ "$a" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
-    for o in ${a//./ }; do [[ "$o" == 0* && "$o" != 0 || 10#$o -gt 255 ]] && return 1; done
+    for o in ${a//./ }; do
+      if [[ "$o" == 0* && "$o" != 0 ]] || (( 10#$o > 255 )); then return 1; fi
+    done
     return 0
   fi
   valid_ipv6 "$a"
@@ -1105,16 +1154,16 @@ ask_common() {
 }
 
 save_new() {
-  local tag="$1" obj="$2" rc=0
-  header "确认"
+  local tag="$1" obj="$2"
+  header "确认配置"
   summary_of "$obj"
-  confirm_write || { drop_cert "$tag"; return 1; }
+  confirm_write || { drop_cert "$tag"; PENDING_TAG=""; return 1; }
   upsert_inbound "$obj" || true
   PENDING_TAG=""
   if [[ "${MUTATE_RC:-1}" == 0 ]]; then
     okmsg "已添加 ${tag}"
     if cert_is_self "$tag"; then
-      note "自签证书，客户端允许不安全"
+      note "自签证书，客户端允许不安全 (allowInsecure=1)"
     fi
     show_links "$tag"
     pause
@@ -1125,11 +1174,9 @@ save_new() {
 }
 
 form_shadowsocks() {
-  local methods password network="tcp,udp" tag obj
-  methods=(2022-blake3-aes-128-gcm 2022-blake3-aes-256-gcm 2022-blake3-chacha20-poly1305 aes-256-gcm chacha20-poly1305)
+  local method password network="tcp,udp" tag obj
   header "Shadowsocks"
-  choose "1:${methods[0]}" "2:${methods[1]}" "3:${methods[2]}" "4:${methods[3]}" "5:${methods[4]}" || return 1
-  local method="${methods[$((CHOOSE - 1))]}"
+  method=$(pick_one 2022-blake3-aes-128-gcm 2022-blake3-aes-256-gcm 2022-blake3-chacha20-poly1305 aes-256-gcm chacha20-poly1305) || return 1
   while true; do
     ask_gen password "密码" "$(gen_ss_password "$method")" gen_ss_password "$method" || return 1
     ss_password_ok "$method" "$password" && break
@@ -1149,12 +1196,12 @@ ask_reality() {
   prompt dest "目标" "${sni}:443" || return 1
   [[ "$dest" == *:* ]] || { err "目标缺端口"; return 1; }
   apply_keys() {
-    priv=$(gen_reality_keys) || return 1
+    priv=$(gen_reality_key) || return 1
     sid=$(gen_short_id)
   }
   apply_keys || { err "密钥失败，需已安装 xray"; return 1; }
   while true; do
-    uin "${GRN}密钥${RST} ${DIM}[回车/g] q 返回${RST} ${GRN}>${RST} "
+    uin "  ${CYN}➜${RST} REALITY 密钥 ${DIM}[回车接受 / g 重新生成 / q 返回]${RST} ${ACC}›${RST} "
     local ans
     ans=$(readin)
     is_q "$ans" && return 1
@@ -1163,11 +1210,7 @@ ask_reality() {
   done
 }
 
-xhttp_mode() {
-  local modes=(auto packet-up stream-up stream-one)
-  choose "1:${modes[0]}" "2:${modes[1]}" "3:${modes[2]}" "4:${modes[3]}" || return 1
-  printf '%s' "${modes[$((CHOOSE - 1))]}"
-}
+xhttp_mode() { pick_one auto packet-up stream-up stream-one; }
 
 ask_path() {
   prompt path "路径" "/" || return 1
@@ -1175,15 +1218,10 @@ ask_path() {
 }
 
 form_vless() {
-  local kind uuid sni dest="" priv="" sid="" path="/" host="" mode="auto" tag obj
+  local kinds=(raw-reality ws-tls xhttp-tls xhttp-reality) kind uuid sni dest="" priv="" sid="" path="/" host="" mode="auto" tag obj
   header "VLESS"
   choose "1:RAW + REALITY" "2:WebSocket + TLS" "3:XHTTP + TLS" "4:XHTTP + REALITY" || return 1
-  case "$CHOOSE" in
-    1) kind="raw-reality" ;;
-    2) kind="ws-tls" ;;
-    3) kind="xhttp-tls" ;;
-    4) kind="xhttp-reality" ;;
-  esac
+  kind="${kinds[$((CHOOSE - 1))]}"
   ask_gen uuid "UUID" "$(gen_uuid)" gen_uuid || return 1
   prompt sni "SNI" "www.amd.com" || return 1
   case "$kind" in
@@ -1211,7 +1249,7 @@ form_vless() {
     ws-tls) obj=$(build_inbound vless "$tag" "$LISTEN" "$PORT" "$uuid" "$kind" "$sni" "$path" "$host") ;;
     xhttp-tls) obj=$(build_inbound vless "$tag" "$LISTEN" "$PORT" "$uuid" "$kind" "$sni" "$path" "$mode") ;;
     xhttp-reality) obj=$(build_inbound vless "$tag" "$LISTEN" "$PORT" "$uuid" "$kind" "$sni" "$dest" "$priv" "$sid" "$path" "$mode") ;;
-  esac
+  esac || { drop_cert "$tag"; PENDING_TAG=""; return 1; }
   save_new "$tag" "$obj"
 }
 
@@ -1235,17 +1273,17 @@ form_hysteria() {
 pick_inbound() {
   local tags=() t i=1 ans
   mapfile -t tags < <(list_tags)
-  ((${#tags[@]})) || { warn "没有入站"; return 1; }
-  header "选择入站"
+  ((${#tags[@]})) || { warn "当前没有任何入站节点"; return 1; }
+  header "选择入站节点"
   for t in "${tags[@]}"; do
     local meta
     meta=$(jq -r --arg t "$t" '.inbounds[]|select(.tag==$t)|"\(.protocol)  \(.listen):\(.port)"' "$CFG")
-    ui "${ACC}$(pad "$i" 2)${RST}  $(pad "$t" 22)"
-    ui "${DIM}${meta}${RST}"
+    ui "    ${ACC}${BOLD}[$(pad "$i" 2)]${RST}  $(pad "$t" 22)  ${DIM}${meta}${RST}"
     i=$((i + 1))
   done
+  ui ""
   while true; do
-    uin "${DIM}q 返回${RST} ${GRN}>${RST} "
+    uin "  ${CYN}➜${RST} 请选择节点编号 ${DIM}(q 返回)${RST} ${ACC}›${RST} "
     ans=$(readin)
     is_q "$ans" && return 1
     if [[ "$ans" =~ ^[0-9]+$ ]] && (( ans >= 1 && ans <= ${#tags[@]} )); then
@@ -1268,6 +1306,7 @@ page_add() {
 
 commit_edit() {
   local tag="$1" new="$2" tmp=""
+  header "修改配置确认"
   summary_of "$new"
   confirm_write || return 0
   if [[ -n "${REISSUE_SNI:-}" ]]; then
@@ -1277,8 +1316,11 @@ commit_edit() {
   upsert_inbound "$new" "$tag" || true
   if [[ "${MUTATE_RC:-1}" == 0 ]]; then
     if [[ -n "$tmp" ]]; then
-      install_cert_pair "${CFG_DIR}/certs/${tag}.crt" "${CFG_DIR}/certs/${tag}.key" "$tmp/c" "$tmp/k" \
-        && mark_self_signed "$tag" || err "证书未更换"
+      if install_cert_pair "${CFG_DIR}/certs/${tag}.crt" "${CFG_DIR}/certs/${tag}.key" "$tmp/c" "$tmp/k" && mark_self_signed "$tag"; then
+        :
+      else
+        err "证书未更换"
+      fi
     fi
     okmsg "已更新 ${tag}"
     show_links "$tag"
@@ -1290,7 +1332,7 @@ commit_edit() {
 
 page_edit() {
   pick_inbound || return 0
-  local tag="$PICKED" obj proto value pkind priv sid path method sec label oldnet port opts=() menu=() name i
+  local tag="$PICKED" obj proto value pkind priv sid path method sec label oldnet port opts=()
   while true; do
     REISSUE_SNI=""
     obj=$(inbound_json "$tag")
@@ -1311,10 +1353,7 @@ page_edit() {
         ;;
       *) err "未知协议"; pause; return 0 ;;
     esac
-    menu=(); i=1
-    for name in "${opts[@]}"; do menu+=("$i:$name"); i=$((i + 1)); done
-    choose "${menu[@]}" || return 0
-    label="${opts[$((CHOOSE - 1))]}"
+    label=$(pick_one "${opts[@]}") || return 0
     case "$label" in
       监听)
         prompt value "监听" "$(j '.listen')" || continue
@@ -1366,7 +1405,7 @@ page_edit() {
           if cert_is_self "$tag"; then REISSUE_SNI="$value"; else note "已有证书未更换，SNI 须与证书一致"; fi
         fi ;;
       密钥)
-        priv=$(gen_reality_keys) || { err "生成失败"; pause; continue; }
+        priv=$(gen_reality_key) || { err "生成失败"; pause; continue; }
         sid=$(gen_short_id)
         obj=$(jq --arg priv "$priv" --arg sid "$sid" \
           'del(.streamSettings.realitySettings.publicKey) | .streamSettings.realitySettings.privateKey=$priv | .streamSettings.realitySettings.shortIds=[$sid]' <<<"$obj") ;;
@@ -1408,14 +1447,20 @@ show_links() {
     err "没有可用的公网地址"
     return 0
   fi
-  [[ "$SHARE_VIA" == "egress" ]] && note "出口地址"
+  ui "  ${CYN}┌── 节点分享链接 [${tag}] ──────────────────────────${RST}"
+  [[ "$SHARE_VIA" == "egress" ]] && note "通过出口探测获取公网 IP"
   if jq -e --arg t "$tag" 'any(.inbounds[]?; .tag==$t and .streamSettings.security=="reality")' "$CFG" >/dev/null 2>&1; then
     note "REALITY 客户端指纹需带 X25519MLKEM768，小火箭用 Chrome140"
   fi
   for host in "${SHARE_LINES[@]}"; do
     link=$(share_link_of "$tag" "$host") || { err "链接失败"; continue; }
-    plainln "$link"
+    if [[ "$host" == \[* ]]; then
+      ui "  ${BORD}│${RST} $(pad "IPv6" 8) ${link}"
+    else
+      ui "  ${BORD}│${RST} $(pad "IPv4" 8) ${link}"
+    fi
   done
+  ui "  ${CYN}└──────────────────────────────────────────────────${RST}"
 }
 
 page_share() {
@@ -1427,17 +1472,22 @@ page_share() {
 
 page_delete() {
   pick_inbound || return 0
-  header "删除 ${PICKED}"
+  header "删除入站: ${PICKED}"
   summary_of "$(inbound_json "$PICKED")"
-  confirm "删除?" || { cancelled; pause; return 0; }
+  confirm "确认删除?" || { cancelled; pause; return 0; }
   remove_inbound "$PICKED" || true
-  [[ "${MUTATE_RC:-1}" == 0 ]] && okmsg "已删除 ${PICKED}"
+  if [[ "${MUTATE_RC:-1}" == 0 ]]; then
+    okmsg "已删除 ${PICKED}"
+  else
+    pause
+  fi
 }
 
 page_logs() {
-  header "实时日志"
+  header "服务实时日志"
   [[ -f "$LOG_FILE" ]] || { warn "无日志"; pause; return 0; }
-  note "Ctrl+C 返回"
+  note "正在查看实时日志，按 Ctrl+C 返回"
+  ui ""
   local old_trap pid
   old_trap=$(trap -p INT || true)
   set +e
@@ -1450,20 +1500,24 @@ page_logs() {
   trap - INT
   [[ -n "$old_trap" ]] && eval "$old_trap"
   set -e
-  note "已停止"
+  note "日志查看已停止"
+}
+
+fetch_ver() {
+  ensure_tools || return 1
+  latest_version || { err "获取版本失败"; return 1; }
 }
 
 page_install() {
   local ver act="start" fail="已安装，未启动"
-  header "安装内核"
+  header "安装 Xray 内核"
   if svc installed; then
-    warn "已安装 $(current_version)"
-    confirm "重装?" || { cancelled; pause; return 0; }
+    warn "当前已安装 $(current_version)"
+    confirm "是否覆盖重新安装?" || { cancelled; pause; return 0; }
   else
-    confirm "安装最新版?" || { cancelled; pause; return 0; }
+    confirm "是否安装最新版本内核?" || { cancelled; pause; return 0; }
   fi
-  ensure_tools || { pause; return 0; }
-  ver=$(latest_version) || { err "获取版本失败"; pause; return 0; }
+  ver=$(fetch_ver) || { pause; return 0; }
   download_install "$ver" || { pause; return 0; }
   svc running && { act="restart"; fail="已安装，未重启"; }
   svc_wait "$act" || { warn "$fail"; return 0; }
@@ -1472,18 +1526,18 @@ page_install() {
 
 page_upgrade() {
   local cur new was=0
-  header "升级内核"
+  header "升级 Xray 内核"
   svc installed || { warn "未安装"; pause; return 0; }
-  ensure_tools || { pause; return 0; }
   cur=$(current_version)
-  new=$(latest_version) || { err "获取版本失败"; pause; return 0; }
-  kv "当前" "v${cur#v}"
-  kv "最新" "v${new#v}"
+  new=$(fetch_ver) || { pause; return 0; }
+  kv "当前版本" "v${cur#v}"
+  kv "最新版本" "v${new#v}"
+  ui ""
   if [[ "v${cur#v}" == "v${new#v}" ]]; then
-    note "已是最新"
-    confirm "重装?" || { cancelled; pause; return 0; }
+    note "当前已是最新版本"
+    confirm "是否重新安装当前版本?" || { cancelled; pause; return 0; }
   else
-    confirm "升级到 v${new}?" || { cancelled; pause; return 0; }
+    confirm "确认升级到 v${new}?" || { cancelled; pause; return 0; }
   fi
   svc running && was=1
   download_install "$new" || { pause; return 0; }
@@ -1493,18 +1547,18 @@ page_upgrade() {
 }
 
 page_start() {
-  header "启动服务"
-  svc installed || { warn "未安装"; pause; return 0; }
+  header "启动 Xray 服务"
+  svc installed || { warn "内核未安装"; pause; return 0; }
   assert_runtime_user || { pause; return 0; }
-  if svc running; then note "已在运行"; notice "${DIM}已在运行${RST}"; return 0; fi
+  if svc running; then sticky "服务已在运行中"; return 0; fi
   svc_wait start || { err "启动失败"; return 0; }
   okmsg "已启动"
 }
 
 page_stop() {
-  header "停止服务"
-  svc installed || { warn "未安装"; pause; return 0; }
-  confirm "停止?" || { cancelled; pause; return 0; }
+  header "停止 Xray 服务"
+  svc installed || { warn "内核未安装"; pause; return 0; }
+  confirm "确认停止服务?" || { cancelled; pause; return 0; }
   if svc stop; then okmsg "已停止"; else err "停止失败"; fi
 }
 
@@ -1524,15 +1578,15 @@ remove_xray_account() {
 }
 
 page_uninstall() {
-  header "卸载内核"
-  note "删除程序、配置、日志和用户。"
-  confirm "卸载?" || { cancelled; pause; return 0; }
+  header "卸载 Xray 内核"
+  note "彻底删除程序文件、配置文件、数据资源、系统日志及运行用户。"
+  confirm "确认卸载?" || { cancelled; pause; return 0; }
   svc stop >/dev/null 2>&1 || true
   svc disable >/dev/null 2>&1 || true
   pkill -x xray >/dev/null 2>&1 || true
   pkill -f 'supervise-daemon xray' >/dev/null 2>&1 || true
   local files=("$BIN" "$SYSTEMD_UNIT" "$OPENRC_INIT" "$LOGROTATE" /run/xray.pid /var/run/xray.pid)
-  local dirs=("$CFG_DIR" "$LOG_DIR" "$STATE_DIR" /run/xray /var/run/xray) f left=""
+  local dirs=("$CFG_DIR" "$LOG_DIR" "$STATE_DIR" "$DAT_PATH" /run/xray /var/run/xray) f left=""
   rm -f "${files[@]}"
   rm -rf "${dirs[@]}"
   if [[ "$INIT_KIND" == "systemd" ]]; then
@@ -1550,26 +1604,35 @@ page_uninstall() {
 }
 
 status_word() {
-  if ! svc installed; then printf '%s未安装%s' "$YEL" "$RST"; return; fi
-  if svc running; then printf '%s运行中%s' "$GRN" "$RST"; else printf '%s未运行%s' "$YEL" "$RST"; fi
+  if ! svc installed; then printf '%s○ 未安装%s' "$YEL" "$RST"; return; fi
+  if svc running; then printf '%s● 运行中%s' "$GRN" "$RST"; else printf '%s● 已停止%s' "$RED" "$RST"; fi
 }
 
 main_menu() {
-  local ver count
+  local ver count init_name
   ver=$(current_version)
-  [[ -n "$ver" ]] && ver="v${ver#v}" || ver="-"
+  [[ -n "$ver" ]] && ver="v${ver#v}" || ver="未安装"
   count=$(inbound_count)
+  init_name="systemd"
+  [[ "$INIT_KIND" == "openrc" ]] && init_name="OpenRC"
   cls
-  ui "${ACC}XRAY${RST}  ${ver}  $(status_word)  入站 ${count}"
-  if [[ -n "${NOTICE:-}" ]]; then ui "$NOTICE"; NOTICE=""; fi
-  section "内核"
+  ui " ${ACC}┌──${RST} ${BOLD}❖ XRAY 管理面板${RST} ${BORD}─────────────────────────────────────${RST}"
+  ui " ${BORD}│${RST}  内核: ${CYN}${BOLD}${ver}${RST}   服务: $(status_word) ${DIM}(${init_name})${RST}   入站: ${ACC}${BOLD}${count}${RST} ${DIM}个${RST}"
+  ui " ${BORD}└──────────────────────────────────────────────────────${RST}"
+  if [[ -n "${NOTICE:-}" ]]; then
+    ui "  ${NOTICE}"
+    NOTICE=""
+  fi
+  ui " ${ACC}╭──${RST} ${BOLD}核心与系统服务${RST} ${BORD}────────────────────────────────────${RST}"
   menu_row 1 安装内核 2 升级内核
   menu_row 3 启动服务 4 停止服务
   menu_row 5 查看日志 6 卸载内核
-  section "入站"
+  ui " ${ACC}├──${RST} ${BOLD}节点与入站管理${RST} ${BORD}────────────────────────────────────${RST}"
   menu_row 7 添加入站 8 修改入站
   menu_row 9 分享链接 10 删除入站
-  uin "${DIM}编号，q 退出${RST} ${GRN}>${RST} "
+  ui " ${ACC}╰──────────────────────────────────────────────────────${RST}"
+  ui ""
+  uin "  ${CYN}➜${RST} 请输入编号 ${DIM}(q 退出)${RST} ${ACC}›${RST} "
 }
 
 dispatch() {
@@ -1582,7 +1645,11 @@ dispatch() {
 
 main() {
   need_root
-  { true >&4; } 2>/dev/null || exec 4>&1
+  if [ -e /proc/self/fdinfo/4 ] && grep -Eq '^flags:[[:space:]]*[0-9]*[12]' /proc/self/fdinfo/4 2>/dev/null; then
+    :
+  else
+    exec 4>&1
+  fi
   init_ui
   detect_init || { err "只支持 systemd 与 OpenRC"; exit 1; }
   mkdir -p "$STATE_DIR" 2>/dev/null || true
@@ -1596,7 +1663,7 @@ main() {
       note "再见"
       exit 0
     fi
-    dispatch "$ans"
+    dispatch "$ans" || true
   done
 }
 
