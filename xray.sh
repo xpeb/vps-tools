@@ -25,13 +25,10 @@ ACC="" GRN="" RED="" YEL="" DIM="" RST=""
 CHOOSE=""
 LISTEN="" PORT="" TAGPART=""
 
-# ---------------------------------------------------------------------------
-# UI。面板输出走 fd 4。
-# ---------------------------------------------------------------------------
+# 面板输出走 fd 4。
 ui() { printf '%b\n' "$*" >&4; }
 uin() { printf '%b' "$*" >&4; }
 plainln() { printf '%s\n' "$*" >&4; }
-blank() { printf '\n' >&4; }
 err() { ui "${RED}错误${RST}  $*"; }
 warn() { ui "${YEL}警告${RST}  $*"; }
 note() { ui "${DIM}$*${RST}"; }
@@ -43,8 +40,10 @@ readin() {
   printf '%s' "${_v//$'\r'/}"
 }
 
+is_q() { [[ "$1" == "q" || "$1" == "Q" ]]; }
+
 dw() {
-  local s="$1" rest="$1" n=0 c b
+  local rest="$1" n=0 c b
   while [[ -n "$rest" ]]; do
     c="${rest:0:1}"
     rest="${rest:1}"
@@ -85,13 +84,7 @@ cls() {
 
 section() { ui "${DIM}$1${RST}"; }
 
-header() {
-  cls
-  blank
-  ui "${ACC}$1${RST}"
-  ui "${DIM}----------------------${RST}"
-  blank
-}
+header() { cls; ui "${ACC}$1${RST}"; }
 
 # 窄终端单列，宽终端两列。编号按显示宽度对齐，不用字符串长度。
 menu_wide() {
@@ -113,19 +106,17 @@ menu_row() {
   fi
 }
 
-pause() { blank; uin "${DIM}回车${RST} "; readin >/dev/null || true; }
+pause() { uin "${DIM}回车返回${RST} "; readin >/dev/null || true; }
 
 choose() {
   local opt key ans
-  blank
   for opt in "$@"; do
     ui "${ACC}$(pad "${opt%%:*}" 2)${RST}  ${opt#*:}"
   done
-  blank
   while true; do
-    uin "${GRN}>${RST} "
+    uin "${DIM}q 返回${RST} ${GRN}>${RST} "
     ans=$(readin)
-    [[ "$ans" == "q" || "$ans" == "Q" ]] && { CHOOSE=""; return 1; }
+    is_q "$ans" && { CHOOSE=""; return 1; }
     for opt in "$@"; do
       key="${opt%%:*}"
       if [[ "$ans" == "$key" ]]; then CHOOSE="$key"; return 0; fi
@@ -135,25 +126,32 @@ choose() {
 }
 
 prompt() {
-  local __var="$1" label="$2" def="${3:-}" hint="${4:-}" ans
-  while true; do
-    [[ -n "$hint" ]] && note "$hint"
-    if [[ -n "$def" ]]; then uin "${GRN}${label}${RST} ${DIM}[${def}]${RST} "
-    else uin "${GRN}${label}${RST} "; fi
-    ans=$(readin) || return 1
-    [[ "$ans" == "q" || "$ans" == "Q" ]] && return 1
-    [[ -z "$ans" ]] && ans="$def"
-    [[ -n "$ans" ]] || return 1
-    printf -v "$__var" '%s' "$ans"
-    return 0
-  done
+  local __var="$1" label="$2" def="${3:-}" ans
+  if [[ -n "$def" ]]; then uin "${GRN}${label}${RST} ${DIM}[${def}] q 返回${RST} "
+  else uin "${GRN}${label}${RST} ${DIM}q 返回${RST} "; fi
+  ans=$(readin) || return 1
+  is_q "$ans" && return 1
+  [[ -z "$ans" ]] && ans="$def"
+  [[ -n "$ans" ]] || return 1
+  printf -v "$__var" '%s' "$ans"
 }
 
 confirm() {
   local ans
-  uin "${YEL}$1${RST} ${DIM}[y/N]${RST} "
+  uin "${YEL}$1${RST} ${DIM}[y/N] q 返回${RST} "
   ans=$(readin)
   [[ "$ans" == "y" || "$ans" == "Y" || "$ans" == "yes" ]]
+}
+
+# 0 写入；1 取消或非法（已提示）；2 读失败
+confirm_write() {
+  local ans
+  uin "${DIM}回车写入，q 返回${RST} ${GRN}>${RST} "
+  ans=$(readin) || return 2
+  if is_q "$ans"; then note "已取消"; return 1; fi
+  [[ -z "$ans" || "$ans" == "y" || "$ans" == "Y" ]] && return 0
+  err "回车写入，或 q 返回"
+  return 1
 }
 
 kv() {
@@ -168,15 +166,14 @@ kv() {
   fi
 }
 
-# ask_gen VAR label value command [args...]
-# g 调用 command 重新生成，回车接受，其他输入替换。
+# g 重新生成，回车接受，其他输入替换。
 ask_gen() {
   local __var="$1" label="$2" value="$3" ans
   shift 3
   while true; do
-    uin "${GRN}${label}${RST} ${DIM}[回车/g]${RST} "
+    uin "${GRN}${label}${RST} ${DIM}[回车/g] q 返回${RST} "
     ans=$(readin)
-    [[ "$ans" == "q" || "$ans" == "Q" ]] && return 1
+    is_q "$ans" && return 1
     if [[ "$ans" == "g" || "$ans" == "G" ]]; then
       value=$("$@")
       continue
@@ -188,9 +185,6 @@ ask_gen() {
   done
 }
 
-# ---------------------------------------------------------------------------
-# 系统
-# ---------------------------------------------------------------------------
 need_root() {
   [[ "${XRAY_SH_SKIP_ROOT:-}" == "1" || "$(id -u)" -eq 0 ]] && return 0
   plainln "必须以 root 运行。"
@@ -360,18 +354,16 @@ svc() {
     case "$act" in
       installed) [[ -x "$BIN" && -f "$SYSTEMD_UNIT" ]] ;;
       running) systemctl is-active --quiet xray ;;
-      start) systemctl enable xray >/dev/null 2>&1 || true; systemctl start xray ;;
+      start|restart) systemctl enable xray >/dev/null 2>&1 || true; systemctl "$act" xray ;;
       stop) timeout 20 systemctl stop xray ;;
-      restart) systemctl enable xray >/dev/null 2>&1 || true; systemctl restart xray ;;
       disable) systemctl disable xray >/dev/null 2>&1 || true; rm -f "$SYSTEMD_UNIT"; systemctl daemon-reload || true ;;
     esac
   else
     case "$act" in
       installed) [[ -x "$BIN" && -f "$OPENRC_INIT" ]] ;;
       running) rc-service xray status >/dev/null 2>&1 ;;
-      start) rc-update add xray default >/dev/null 2>&1 || true; rc-service xray start >/dev/null 2>&1 </dev/null ;;
+      start|restart) rc-update add xray default >/dev/null 2>&1 || true; rc-service xray "$act" >/dev/null 2>&1 </dev/null ;;
       stop) timeout 20 rc-service xray stop >/dev/null 2>&1 </dev/null ;;
-      restart) rc-update add xray default >/dev/null 2>&1 || true; rc-service xray restart >/dev/null 2>&1 </dev/null ;;
       disable) rc-update del xray default >/dev/null 2>&1 || true; rm -f "$OPENRC_INIT" ;;
     esac
   fi
@@ -419,36 +411,27 @@ download_install() {
   detect_arch || { err "不支持 $(uname -m)"; return 1; }
   url="https://github.com/XTLS/Xray-core/releases/download/v${ver}/Xray-linux-${MACHINE}.zip"
   tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' RETURN
   zip="${tmp}/xray.zip"
   note "下载 v${ver}"
-  if ! curl -fL --retry 3 -o "$zip" "$url"; then
-    rm -rf "$tmp"; err "下载失败"; return 1
-  fi
+  if ! curl -fL --retry 3 -o "$zip" "$url"; then err "下载失败"; return 1; fi
   if curl -fsSL -o "${zip}.dgst" "${url}.dgst"; then
     expect=$(awk -F'=' '/256=/ {gsub(/ /,"",$2); print tolower($2)}' "${zip}.dgst")
     got=$(sha256sum "$zip" | awk '{print $1}')
-    if [[ -n "$expect" && "$expect" != "$got" ]]; then
-      rm -rf "$tmp"; err "校验失败"; return 1
-    fi
+    if [[ -n "$expect" && "$expect" != "$got" ]]; then err "校验失败"; return 1; fi
   else
     warn "无校验文件"
   fi
-  unzip -qo "$zip" -d "$tmp/out" || { rm -rf "$tmp"; err "解压失败"; return 1; }
-  ensure_user || { rm -rf "$tmp"; return 1; }
-  install_dirs || { rm -rf "$tmp"; err "建目录失败"; return 1; }
-  if ! install -m 755 -o 0 -g 0 "${tmp}/out/xray" "$BIN"; then
-    rm -rf "$tmp"; err "安装失败"; return 1
-  fi
+  unzip -qo "$zip" -d "$tmp/out" || { err "解压失败"; return 1; }
+  ensure_user || return 1
+  install_dirs || { err "建目录失败"; return 1; }
+  install -m 755 -o 0 -g 0 "${tmp}/out/xray" "$BIN" || { err "安装失败"; return 1; }
   [[ -f "${tmp}/out/geoip.dat" ]] && install -m 644 -o xray -g xray "${tmp}/out/geoip.dat" "${DAT_PATH}/geoip.dat"
   [[ -f "${tmp}/out/geosite.dat" ]] && install -m 644 -o xray -g xray "${tmp}/out/geosite.dat" "${DAT_PATH}/geosite.dat"
-  write_services || { rm -rf "$tmp"; err "写服务失败"; return 1; }
-  assert_runtime_user || { rm -rf "$tmp"; return 1; }
-  rm -rf "$tmp"
+  write_services || { err "写服务失败"; return 1; }
+  assert_runtime_user || return 1
 }
 
-# ---------------------------------------------------------------------------
-# 配置
-# ---------------------------------------------------------------------------
 write_base_config() {
   jq -n --arg err "$LOG_FILE" --arg acc "$ACCESS_LOG" \
     '{log:{access:$acc,error:$err,loglevel:"warning"},inbounds:[],outbounds:[{protocol:"freedom",tag:"direct"}]}' >"$CFG"
@@ -468,15 +451,27 @@ list_tags() {
 }
 
 inbound_json() { jq -c --arg t "$1" '.inbounds[] | select(.tag==$t)' "$CFG"; }
+j() { jq -r "$1" <<<"$obj"; }
+
+port_in_cfg() {
+  local port="$1" except="${2:-}" kind="${3:-tcpudp}"
+  cfg_ok || return 1
+  jq -e --arg p "$port" --arg ex "$except" --arg kind "$kind" '
+    def inet:
+      if .protocol == "hysteria" then "udp"
+      elif .protocol == "shadowsocks" then (.settings.network // "tcp,udp")
+      else "tcp" end;
+    def hit($n):
+      if $kind == "tcp" then ($n == "tcp" or $n == "tcp,udp")
+      elif $kind == "udp" then ($n == "udp" or $n == "tcp,udp")
+      else true end;
+    [.inbounds[]? | select(.tag != $ex) | select((.port|tostring) == $p) | select(hit(inet))] | any
+  ' "$CFG" >/dev/null
+}
 
 port_taken() {
-  local port="$1" except="${2:-}" kind="${3:-tcpudp}" flags="-lntuH" net
-  case "$kind" in tcp) net='["tcp"]' ;; udp) net='["udp"]' ;; *) net='["tcp","udp","tcp,udp"]' ;; esac
-  if cfg_ok && jq -e --arg p "$port" --arg ex "$except" --argjson nets "$net" \
-    '[.inbounds[]? | select(.tag != $ex) | select((.port|tostring) == $p)
-      | select((.settings.network // "tcp,udp") as $n | $nets | index($n))] | any' "$CFG" >/dev/null; then
-    return 0
-  fi
+  local port="$1" except="${2:-}" kind="${3:-tcpudp}" flags="-lntuH"
+  port_in_cfg "$port" "$except" "$kind" && return 0
   command -v ss >/dev/null 2>&1 || return 1
   case "$kind" in
     tcp) flags="-lntH" ;;
@@ -490,25 +485,40 @@ gen_uuid() {
   else cat /proc/sys/kernel/random/uuid; fi
 }
 
+x25519_field() { awk -F': ' -v k="$1" 'tolower($1) ~ k {print $2; exit}'; }
+
 gen_reality_keys() {
-  local out
+  local out p u
   [[ -x "$BIN" ]] || return 1
   out=$("$BIN" x25519 2>/dev/null) || return 1
-  awk -F': ' 'tolower($1) ~ /private/ {p=$2} tolower($1) ~ /password|public/ {u=$2} END {if (p=="" || u=="") exit 1; print p; print u}' <<<"$out"
+  p=$(x25519_field private <<<"$out")
+  u=$(x25519_field 'password|public' <<<"$out")
+  [[ -n "$p" && -n "$u" ]] || return 1
+  printf '%s\n' "$p"
+}
+
+# 服务端 realitySettings 不写客户端 password。分享链接的 pbk 用 xray x25519 -i 从私钥推导。
+reality_public() {
+  local out
+  [[ -n "$1" && -x "$BIN" ]] || return 1
+  out=$("$BIN" x25519 -i "$1" 2>/dev/null) || return 1
+  x25519_field 'password|public' <<<"$out"
 }
 
 gen_short_id() { openssl rand -hex 8; }
+rand_b64() { openssl rand -base64 "$1" | tr -d '\n'; printf '\n'; }
 
 gen_ss_password() {
   local n=32
   case "$1" in
     2022-blake3-aes-128-gcm) n=16 ;;
-    2022-*) n=32 ;;
+    2022-*) ;;
     *) n=24 ;;
   esac
-  openssl rand -base64 "$n" | tr -d '\n'
-  printf '\n'
+  rand_b64 "$n"
 }
+
+gen_obfs() { rand_b64 18; }
 
 urlencode() { jq -nr --arg s "$1" '$s|@uri'; }
 
@@ -541,34 +551,36 @@ share_take() {
 }
 
 share_load() {
-  local raw out trace addr
+  local raw out fam
   SHARE_SEEN="|"
   SHARE_LINES=()
   SHARE_VIA="iface"
   if command -v ip >/dev/null 2>&1; then
-    while read -r raw; do share_take "$raw"; done \
-      < <(ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}')
-    while read -r raw; do share_take "$raw"; done \
-      < <(ip -o -6 addr show scope global 2>/dev/null | awk '{print $4}')
+    for fam in -4 -6; do
+      while read -r raw; do share_take "$raw"; done \
+        < <(ip -o "$fam" addr show scope global 2>/dev/null | awk '{print $4}')
+    done
   elif out=$(hostname -I 2>/dev/null); then
     for raw in $out; do share_take "$raw"; done
   fi
   # NAT 后面的机器网卡只有内网地址，改查出口的公网地址。
   if ((${#SHARE_LINES[@]} == 0)) && command -v curl >/dev/null 2>&1; then
     SHARE_VIA="egress"
-    trace=$(curl -4fsS --connect-timeout 2 --max-time 3 https://1.1.1.1/cdn-cgi/trace 2>/dev/null || true)
-    addr=$(printf '%s\n' "$trace" | sed -n 's/^ip=//p' | head -n1)
-    [[ -z "$addr" ]] && addr=$(curl -4fsS --connect-timeout 2 --max-time 3 https://api.ipify.org 2>/dev/null || true)
-    [[ -n "$addr" ]] && share_take "$addr"
-    if [[ -z "$(ip -o -6 addr show scope global 2>/dev/null)" ]]; then
-      :
-    else
-    trace=$(curl -6fsS --connect-timeout 2 --max-time 3 'https://[2606:4700:4700::1111]/cdn-cgi/trace' 2>/dev/null || true)
-    addr=$(printf '%s\n' "$trace" | sed -n 's/^ip=//p' | head -n1)
-    [[ -z "$addr" ]] && addr=$(curl -6fsS --connect-timeout 2 --max-time 3 https://api6.ipify.org 2>/dev/null || true)
+    share_egress -4 https://1.1.1.1/cdn-cgi/trace https://api.ipify.org
+    if ip -o -6 addr show scope global 2>/dev/null | grep -q .; then
+      share_egress -6 'https://[2606:4700:4700::1111]/cdn-cgi/trace' https://api6.ipify.org
     fi
-    [[ -n "$addr" ]] && share_take "$addr"
   fi
+  return 0
+}
+
+share_egress() {
+  local addr
+  addr=$(curl "$1"fsS --connect-timeout 2 --max-time 3 "$2" 2>/dev/null || true)
+  addr=$(printf '%s\n' "$addr" | sed -n 's/^ip=//p' | head -n1)
+  [[ -z "$addr" ]] && addr=$(curl "$1"fsS --connect-timeout 2 --max-time 3 "$3" 2>/dev/null || true)
+  [[ -n "$addr" ]] && share_take "$addr"
+  return 0
 }
 
 # https://xtls.github.io/en/config/inbounds/vless.html
@@ -576,10 +588,10 @@ share_load() {
 build_vless() {
   local tag="$1" listen="$2" port="$3" uuid="$4" kind="$5"
   shift 5
-  local flow="" sni="" dest="" priv="" sid="" pub="" path="" host="" mode="" method sec
+  local flow="" sni="" dest="" priv="" sid="" path="" host="" mode="" method sec
   case "$kind" in
     raw-reality)
-      flow="$1"; sni="$2"; dest="$3"; priv="$4"; sid="$5"; pub="$6"
+      flow="$1"; sni="$2"; dest="$3"; priv="$4"; sid="$5"
       method="raw"; sec="reality" ;;
     ws-tls)
       sni="$1"; path="$2"; host="$3"
@@ -588,14 +600,14 @@ build_vless() {
       sni="$1"; path="$2"; mode="$3"
       method="xhttp"; sec="tls" ;;
     xhttp-reality)
-      sni="$1"; dest="$2"; priv="$3"; sid="$4"; pub="$5"; path="$6"; mode="$7"
+      sni="$1"; dest="$2"; priv="$3"; sid="$4"; path="$5"; mode="$6"
       method="xhttp"; sec="reality" ;;
     *) return 1 ;;
   esac
   jq -n \
     --arg tag "$tag" --arg listen "$listen" --argjson port "$port" \
     --arg uuid "$uuid" --arg flow "$flow" --arg sni "$sni" --arg dest "$dest" \
-    --arg priv "$priv" --arg pub "$pub" --arg sid "$sid" --arg path "$path" --arg host "$host" \
+    --arg priv "$priv" --arg sid "$sid" --arg path "$path" --arg host "$host" \
     --arg mode "$mode" --arg method "$method" --arg sec "$sec" \
     --arg certdir "${CFG_DIR}/certs" \
     '{
@@ -608,10 +620,9 @@ build_vless() {
         {method:$method, security:$sec}
         + (if $method=="websocket" then {wsSettings:{path:$path,host:$host}} else {} end)
         + (if $method=="xhttp" then {xhttpSettings:{path:$path,mode:$mode}} else {} end)
-        + (if $sec=="reality" then {realitySettings:(
-            {show:false, target:$dest, serverNames:[$sni], privateKey:$priv, shortIds:[$sid]}
-            + (if $pub=="" then {} else {publicKey:$pub} end)
-          )} else {} end)
+        + (if $sec=="reality" then {realitySettings:{
+            show:false, target:$dest, serverNames:[$sni], privateKey:$priv, shortIds:[$sid]
+          }} else {} end)
         + (if $sec=="tls" then {tlsSettings:{
             serverName:$sni, rejectUnknownSni:true,
             alpn:(if $method=="websocket" then ["http/1.1"] else ["h2","http/1.1"] end),
@@ -669,16 +680,18 @@ install_cert_pair() {
 mark_self_signed() { printf '%s\n' self >"${CFG_DIR}/certs/${1}.self"; chmod 644 "${CFG_DIR}/certs/${1}.self"; }
 cert_is_self() { [[ -f "${CFG_DIR}/certs/${1}.self" ]]; }
 
+make_cert_files() {
+  local dir="$1" cn="${2//\//_}"
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+    -keyout "$dir/k" -out "$dir/c" -days 3650 -nodes -subj "/CN=${cn}" >/dev/null 2>&1
+}
+
 ensure_self_signed() {
-  local tag="$1" sni="$2" dir="${CFG_DIR}/certs" crt="${CFG_DIR}/certs/${1}.crt" key="${CFG_DIR}/certs/${1}.key" tmp
+  local tag="$1" sni="$2" dir="${CFG_DIR}/certs" crt="${CFG_DIR}/certs/${1}.crt" key="${CFG_DIR}/certs/${1}.key" tmp rc=0
   install -d -m 750 -o 0 -g xray "$dir"
   [[ -f "$crt" && -f "$key" ]] && return 0
   tmp=$(mktemp -d)
-  local rc=0 cn="$sni"
-  cn=${cn//\//_}
-  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-    -keyout "$tmp/k" -out "$tmp/c" -days 3650 -nodes -subj "/CN=${cn}" >/dev/null 2>&1 \
-    && install_cert_pair "$crt" "$key" "$tmp/c" "$tmp/k" && mark_self_signed "$tag" || rc=$?
+  make_cert_files "$tmp" "$sni" && install_cert_pair "$crt" "$key" "$tmp/c" "$tmp/k" && mark_self_signed "$tag" || rc=$?
   rm -rf "$tmp"
   return "$rc"
 }
@@ -767,25 +780,25 @@ mutate() {
   return 0
 }
 
-upsert_inbound() {
-  local obj="$1" old="${2:-}" tmp
-  tmp=$(mktemp_json upsert)
-  cfg_ok || write_base_config
-  jq --argjson obj "$obj" --arg old "$old" \
-    '.inbounds |= (map(select(.tag != $old and .tag != $obj.tag)) + [$obj])' "$CFG" >"$tmp"
+mutate_jq() {
+  local name="$1" tmp
+  tmp=$(mktemp_json "$name")
+  shift
+  jq "$@" "$CFG" >"$tmp"
   mutate "$tmp" || true
   rm -f "$tmp"
-  return 0
+}
+
+upsert_inbound() {
+  local obj="$1" old="${2:-}"
+  cfg_ok || write_base_config
+  mutate_jq upsert --argjson obj "$obj" --arg old "$old" \
+    '.inbounds |= (map(select(.tag != $old and .tag != $obj.tag)) + [$obj])'
 }
 
 remove_inbound() {
-  local tag="$1" tmp
-  tmp=$(mktemp_json remove)
-  jq --arg t "$tag" '.inbounds |= map(select(.tag != $t))' "$CFG" >"$tmp"
-  mutate "$tmp" || true
-  rm -f "$tmp"
-  [[ "${MUTATE_RC:-1}" == 0 ]] && drop_cert "$tag"
-  return 0
+  mutate_jq remove --arg t "$1" '.inbounds |= map(select(.tag != $t))'
+  if [[ "${MUTATE_RC:-1}" == 0 ]]; then drop_cert "$1"; fi
 }
 
 share_link_of() {
@@ -793,19 +806,18 @@ share_link_of() {
   host="${2:-}"
   [[ -n "$host" ]] || return 1
   obj=$(inbound_json "$tag") || return 1
-  proto=$(jq -r '.protocol' <<<"$obj")
-  port=$(jq -r '.port' <<<"$obj")
+  proto=$(j '.protocol')
+  port=$(j '.port')
   case "$proto" in
     shadowsocks)
       local method password userinfo
-      method=$(jq -r '.settings.method' <<<"$obj")
-      password=$(jq -r '.settings.password' <<<"$obj")
+      method=$(j '.settings.method')
+      password=$(j '.settings.password')
       userinfo=$(printf '%s:%s' "$method" "$password" | base64 -w0 2>/dev/null || printf '%s:%s' "$method" "$password" | base64)
       printf 'ss://%s@%s:%s#%s\n' "${userinfo//$'\n'/}" "$host" "$port" "$(urlencode "$tag")"
       ;;
     vless)
-      local id flow net sec sni sid pub path hosth mode q alpn j
-      j() { jq -r "$1" <<<"$obj"; }
+      local id flow net sec sni sid pub path hosth mode q alpn
       id=$(j '.settings.users[0].id // .settings.clients[0].id')
       flow=$(j '.settings.users[0].flow // .settings.clients[0].flow // empty')
       net=$(j '.streamSettings.method // .streamSettings.network // "raw"')
@@ -817,10 +829,12 @@ share_link_of() {
       path=$(j '.streamSettings.wsSettings.path // .streamSettings.xhttpSettings.path // empty')
       hosth=$(j '.streamSettings.wsSettings.host // empty')
       mode=$(j '.streamSettings.xhttpSettings.mode // empty')
-      pub=$(j '.streamSettings.realitySettings.publicKey // empty')
       q="type=${net}&security=${sec}&encryption=none&fp=chrome"
       [[ -n "$flow" ]] && q+="&flow=$(urlencode "$flow")"
       if [[ "$sec" == "reality" ]]; then
+        pub=$(reality_public "$(j '.streamSettings.realitySettings.privateKey // empty')" || true)
+        [[ -n "$pub" ]] || pub=$(j '.streamSettings.realitySettings.publicKey // .streamSettings.realitySettings.password // empty')
+        [[ -n "$pub" && "$pub" != "null" ]] || return 1
         sni=$(j '.streamSettings.realitySettings.serverNames[0] // empty')
         sid=$(j '.streamSettings.realitySettings.shortIds[0] // empty')
         q+="&sni=$(urlencode "$sni")&pbk=$(urlencode "$pub")&sid=$(urlencode "$sid")"
@@ -837,9 +851,7 @@ share_link_of() {
       printf 'vless://%s@%s:%s?%s#%s\n' "$id" "$host" "$port" "$q" "$(urlencode "$tag")"
       ;;
     hysteria)
-      local auth sni obfs
-      local insecure="" j
-      j() { jq -r "$1" <<<"$obj"; }
+      local auth sni obfs insecure=""
       auth=$(j '.settings.users[0].auth')
       sni=$(j '.streamSettings.tlsSettings.serverName // empty')
       obfs=$(j '.streamSettings.finalmask.udp[0].settings.password // empty')
@@ -852,8 +864,6 @@ share_link_of() {
 
 summary_of() {
   local obj="$1" proto port listen tag vnet vsec vflow
-  local j
-  j() { jq -r "$1" <<<"$obj"; }
   proto=$(j '.protocol')
   port=$(j '.port')
   listen=$(j '.listen')
@@ -899,15 +909,21 @@ valid_listen() {
   local a="$1" o
   [[ "$a" == "::" ]] && return 0
   if [[ "$a" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
-    IFS=. read -r o o o o <<<"$a"
     for o in ${a//./ }; do [[ "$o" == 0* && "$o" != 0 || 10#$o -gt 255 ]] && return 1; done
     return 0
   fi
   [[ "$a" =~ ^[0-9A-Fa-f:]+$ && "$a" == *:* && "$a" != *::*::* ]]
 }
 valid_tag_part() { [[ "$1" =~ ^[A-Za-z0-9._-]{1,32}$ ]]; }
+valid_ss_net() { [[ "$1" == "tcp" || "$1" == "udp" || "$1" == "tcp,udp" ]]; }
+ss_kind() { case "$1" in tcp|udp) printf '%s' "$1" ;; *) printf '%s' tcpudp ;; esac; }
 rand_port() { printf '%s\n' "$((20000 + $(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 40000))"; }
 rand_tag() { openssl rand -hex 3 | tr -d '\n'; printf '\n'; }
+
+take_tag() {
+  tag="$1-${TAGPART}"
+  if list_tags | grep -qx "$tag"; then err "备注重复"; return 1; fi
+}
 
 ask_common() {
   prompt LISTEN "监听" "0.0.0.0" || return 1
@@ -919,18 +935,12 @@ ask_common() {
 }
 
 save_new() {
-  local tag="$1" obj="$2" ans
+  local tag="$1" obj="$2" rc=0
   header "确认"
   summary_of "$obj"
-  blank
-  uin "${DIM}回车写入，q 取消${RST} ${GRN}>${RST} "
-  ans=$(readin) || return 1
-  if [[ "$ans" == "q" || "$ans" == "Q" ]]; then note "已取消"; drop_cert "$tag"; return 1; fi
-  if [[ -n "$ans" && "$ans" != "y" && "$ans" != "Y" ]]; then
-    err "回车写入，或 q 取消"
-    drop_cert "$tag"
-    return 1
-  fi
+  confirm_write || rc=$?
+  if (( rc == 2 )); then return 1; fi
+  if (( rc != 0 )); then drop_cert "$tag"; return 1; fi
   upsert_inbound "$obj" || true
   PENDING_TAG=""
   if [[ "${MUTATE_RC:-1}" == 0 ]]; then
@@ -947,7 +957,7 @@ save_new() {
 }
 
 form_shadowsocks() {
-  local method password network="tcp,udp" tag obj pkind="tcpudp"
+  local method password network="tcp,udp" tag obj
   header "Shadowsocks"
   choose \
     "1:2022-blake3-aes-128-gcm" \
@@ -968,36 +978,39 @@ form_shadowsocks() {
     err "密码过短"
   done
   prompt network "网络" "tcp,udp" || return 1
-  [[ "$network" == "tcp" || "$network" == "udp" || "$network" == "tcp,udp" ]] || { err "网络无效"; return 1; }
+  valid_ss_net "$network" || { err "网络无效"; return 1; }
   ask_common || return 1
-  tag="ss-${TAGPART}"
-  list_tags | grep -qx "$tag" && { err "备注重复"; return 1; }
-  [[ "$network" == "tcp" ]] && pkind="tcp"
-  [[ "$network" == "udp" ]] && pkind="udp"
-  port_taken "$PORT" "" "$pkind" && { err "端口占用"; return 1; }
+  take_tag ss || return 1
+  port_taken "$PORT" "" "$(ss_kind "$network")" && { err "端口占用"; return 1; }
   obj=$(build_inbound shadowsocks "$tag" "$LISTEN" "$PORT" "$method" "$password" "$network")
   save_new "$tag" "$obj"
 }
 
 ask_reality() {
-  local sni="$1" keys
+  local sni="$1"
   prompt dest "目标" "${sni}:443" || return 1
   [[ "$dest" == *:* ]] || { err "目标缺端口"; return 1; }
   apply_keys() {
-    keys=$(gen_reality_keys) || return 1
-    priv=$(sed -n '1p' <<<"$keys")
-    pub=$(sed -n '2p' <<<"$keys")
+    priv=$(gen_reality_keys) || return 1
     sid=$(gen_short_id)
   }
   apply_keys || { err "密钥失败，需已安装 xray"; return 1; }
   while true; do
-    uin "${GRN}密钥${RST} ${DIM}[回车/g]${RST} "
+    uin "${GRN}密钥${RST} ${DIM}[回车/g] q 返回${RST} "
     local ans
     ans=$(readin)
-    [[ "$ans" == "q" || "$ans" == "Q" ]] && return 1
+    is_q "$ans" && return 1
     [[ "$ans" != "g" && "$ans" != "G" ]] && return 0
     apply_keys || { err "生成失败"; continue; }
   done
+}
+
+xhttp_mode() {
+  choose "1:auto" "2:packet-up" "3:stream-up" "4:stream-one" || return 1
+  case "$CHOOSE" in
+    1) printf '%s' auto ;; 2) printf '%s' packet-up ;;
+    3) printf '%s' stream-up ;; 4) printf '%s' stream-one ;;
+  esac
 }
 
 ask_path() {
@@ -1006,7 +1019,7 @@ ask_path() {
 }
 
 form_vless() {
-  local kind uuid sni dest="" priv="" pub="" sid="" path="/" host="" mode="auto" tag obj
+  local kind uuid sni dest="" priv="" sid="" path="/" host="" mode="auto" tag obj
   header "VLESS"
   choose "1:RAW + REALITY" "2:WebSocket + TLS" "3:XHTTP + TLS" "4:XHTTP + REALITY" || return 1
   case "$CHOOSE" in
@@ -1016,36 +1029,32 @@ form_vless() {
     4) kind="xhttp-reality" ;;
   esac
   ask_gen uuid "UUID" "$(gen_uuid)" gen_uuid || return 1
-  prompt sni "SNI" "www.microsoft.com" || return 1
+  prompt sni "SNI" "www.amd.com" || return 1
   case "$kind" in
     raw-reality) ask_reality "$sni" || return 1 ;;
     ws-tls)
-      ask_path "以 / 开头；Early Data 可写 /path?ed=2560" || return 1
+      ask_path || return 1
       prompt host "Host" "$sni" || return 1
       [[ "$host" == "-" ]] && host=""
       ;;
     xhttp-tls|xhttp-reality)
-      ask_path "以 / 开头。服务端用它关联上下行" || return 1
-      choose "1:auto" "2:packet-up" "3:stream-up" "4:stream-one" || return 1
-      case "$CHOOSE" in
-        1) mode="auto" ;; 2) mode="packet-up" ;; 3) mode="stream-up" ;; 4) mode="stream-one" ;;
-      esac
+      ask_path || return 1
+      mode=$(xhttp_mode) || return 1
       [[ "$kind" == "xhttp-reality" ]] && { ask_reality "$sni" || return 1; }
       ;;
   esac
   ask_common || return 1
-  tag="vless-${TAGPART}"
-  list_tags | grep -qx "$tag" && { err "备注重复"; return 1; }
+  take_tag vless || return 1
   port_taken "$PORT" "" tcp && { err "端口占用"; return 1; }
   if [[ "$kind" == "ws-tls" || "$kind" == "xhttp-tls" ]]; then
     PENDING_TAG="$tag"
     ask_cert "$tag" "$sni" || { PENDING_TAG=""; return 1; }
   fi
   case "$kind" in
-    raw-reality) obj=$(build_inbound vless "$tag" "$LISTEN" "$PORT" "$uuid" "$kind" "xtls-rprx-vision" "$sni" "$dest" "$priv" "$sid" "$pub") ;;
+    raw-reality) obj=$(build_inbound vless "$tag" "$LISTEN" "$PORT" "$uuid" "$kind" "xtls-rprx-vision" "$sni" "$dest" "$priv" "$sid") ;;
     ws-tls) obj=$(build_inbound vless "$tag" "$LISTEN" "$PORT" "$uuid" "$kind" "$sni" "$path" "$host") ;;
     xhttp-tls) obj=$(build_inbound vless "$tag" "$LISTEN" "$PORT" "$uuid" "$kind" "$sni" "$path" "$mode") ;;
-    xhttp-reality) obj=$(build_inbound vless "$tag" "$LISTEN" "$PORT" "$uuid" "$kind" "$sni" "$dest" "$priv" "$sid" "$pub" "$path" "$mode") ;;
+    xhttp-reality) obj=$(build_inbound vless "$tag" "$LISTEN" "$PORT" "$uuid" "$kind" "$sni" "$dest" "$priv" "$sid" "$path" "$mode") ;;
   esac
   save_new "$tag" "$obj"
 }
@@ -1054,16 +1063,15 @@ form_hysteria() {
   local auth sni obfs up down tag obj
   header "Hysteria2"
   ask_gen auth "认证" "$(gen_uuid)" gen_uuid || return 1
-  prompt sni "SNI" "www.microsoft.com" || return 1
+  prompt sni "SNI" "www.amd.com" || return 1
   prompt up "上传" "100 mbps" || return 1
   prompt down "下载" "100 mbps" || return 1
   ask_common || return 1
-  tag="hy2-${TAGPART}"
-  list_tags | grep -qx "$tag" && { err "备注重复"; return 1; }
+  take_tag hy2 || return 1
   port_taken "$PORT" "" udp && { err "端口占用"; return 1; }
   PENDING_TAG="$tag"
   ask_cert "$tag" "$sni" || { PENDING_TAG=""; return 1; }
-  obfs=$(openssl rand -base64 18 | tr -d '\n')
+  obfs=$(gen_obfs)
   obj=$(build_inbound hysteria2 "$tag" "$LISTEN" "$PORT" "$auth" "$sni" "$obfs" "$up" "$down")
   save_new "$tag" "$obj"
 }
@@ -1080,11 +1088,10 @@ pick_inbound() {
     ui "${DIM}${meta}${RST}"
     i=$((i + 1))
   done
-  blank
   while true; do
-    uin "${GRN}>${RST} "
+    uin "${DIM}q 返回${RST} ${GRN}>${RST} "
     ans=$(readin)
-    [[ "$ans" == "q" || "$ans" == "Q" ]] && return 1
+    is_q "$ans" && return 1
     if [[ "$ans" =~ ^[0-9]+$ ]] && (( ans >= 1 && ans <= ${#tags[@]} )); then
       PICKED="${tags[$((ans - 1))]}"
       return 0
@@ -1103,59 +1110,127 @@ page_add() {
   esac || pause
 }
 
+commit_edit() {
+  local tag="$1" new="$2" tmp=""
+  summary_of "$new"
+  confirm_write || return 0
+  if [[ -n "${REISSUE_SNI:-}" ]]; then
+    tmp=$(mktemp -d)
+    make_cert_files "$tmp" "$REISSUE_SNI" || { rm -rf "$tmp"; err "证书失败"; return 0; }
+  fi
+  upsert_inbound "$new" "$tag" || true
+  if [[ "${MUTATE_RC:-1}" == 0 ]]; then
+    if [[ -n "$tmp" ]]; then
+      install_cert_pair "${CFG_DIR}/certs/${tag}.crt" "${CFG_DIR}/certs/${tag}.key" "$tmp/c" "$tmp/k" \
+        && mark_self_signed "$tag" || err "证书未更换"
+    fi
+    okmsg "已更新 ${tag}"
+    show_links "$tag"
+  else
+    err "未写入"
+  fi
+  if [[ -n "$tmp" ]]; then rm -rf "$tmp"; fi
+}
+
 page_edit() {
   pick_inbound || return 0
-  local tag="$PICKED" obj proto listen port pkind="tcp" new vsec keys priv pub sid
-  obj=$(inbound_json "$tag")
-  proto=$(jq -r '.protocol' <<<"$obj")
-  header "修改 ${tag}"
-  summary_of "$obj"
-  blank
-  listen=$(jq -r '.listen' <<<"$obj")
-  port=$(jq -r '.port' <<<"$obj")
-  prompt listen "监听" "$listen" || { note "已取消"; pause; return 0; }
-  valid_listen "$listen" || { err "地址无效"; pause; return 0; }
-  prompt port "端口" "$port" || { note "已取消"; pause; return 0; }
-  valid_port "$port" || { err "端口无效"; pause; return 0; }
-  [[ "$proto" == "hysteria" ]] && pkind="udp"
-  [[ "$proto" == "shadowsocks" ]] && pkind="tcpudp"
-  if [[ "$port" != "$(jq -r '.port' <<<"$obj")" ]] && port_taken "$port" "$tag" "$pkind"; then
-    err "端口占用"; pause; return 0
-  fi
-  new=$(jq --arg l "$listen" --argjson p "$port" '.listen=$l | .port=$p' <<<"$obj")
-  case "$proto" in
-    vless)
-      vsec=$(jq -r '.streamSettings.security // "none"' <<<"$new")
-      if [[ "$vsec" == "reality" ]] && confirm "新密钥?"; then
-        keys=$(gen_reality_keys) || { err "生成失败"; pause; return 0; }
-        priv=$(sed -n '1p' <<<"$keys"); pub=$(sed -n '2p' <<<"$keys"); sid=$(gen_short_id)
-        new=$(jq --arg priv "$priv" --arg pub "$pub" --arg sid "$sid" \
-          '.streamSettings.realitySettings.privateKey=$priv | .streamSettings.realitySettings.publicKey=$pub | .streamSettings.realitySettings.shortIds=[$sid]' <<<"$new")
-      elif [[ "$vsec" != "reality" ]] && confirm "新 UUID?"; then
-        new=$(jq --arg id "$(gen_uuid)" '.settings.users[0].id=$id' <<<"$new")
-      fi
-      ;;
-    shadowsocks)
-      confirm "新密码?" && new=$(jq --arg pw "$(gen_ss_password "$(jq -r '.settings.method' <<<"$new")")" '.settings.password=$pw' <<<"$new")
-      ;;
-    hysteria)
-      if confirm "新认证?"; then
-        new=$(jq --arg a "$(gen_uuid)" --arg o "$(openssl rand -base64 18 | tr -d '\n')" \
-          '.settings.users[0].auth=$a | .streamSettings.hysteriaSettings.auth=$a | .streamSettings.finalmask.udp[0].settings.password=$o' <<<"$new")
-      fi
-      ;;
-  esac
-  blank
-  summary_of "$new"
-  blank
-  uin "${DIM}回车写入，q 取消${RST} ${GRN}>${RST} "
-  local ans
-  ans=$(readin) || return 0
-  [[ "$ans" == "q" || "$ans" == "Q" ]] && { note "已取消"; pause; return 0; }
-  [[ -z "$ans" || "$ans" == "y" || "$ans" == "Y" ]] || { err "回车写入，或 q 取消"; pause; return 0; }
-  upsert_inbound "$new" "$tag" || true
-  if [[ "${MUTATE_RC:-1}" == 0 ]]; then okmsg "已更新 ${tag}"; show_links "$tag"; else err "未写入"; fi
-  pause
+  local tag="$PICKED" obj proto value pkind priv sid path method sec label oldnet port opts=() menu=() name i
+  while true; do
+    REISSUE_SNI=""
+    obj=$(inbound_json "$tag")
+    proto=$(j '.protocol')
+    method=$(j '.streamSettings.method // .streamSettings.network // "raw"')
+    sec=$(j '.streamSettings.security // "none"')
+    header "修改 ${tag}"
+    summary_of "$obj"
+    case "$proto" in
+      shadowsocks) opts=(监听 端口 密码 网络) ;;
+      hysteria) opts=(监听 端口 认证 SNI 混淆 上传 下载) ;;
+      vless)
+        opts=(监听 端口 UUID SNI)
+        [[ "$sec" == "reality" ]] && opts+=(密钥)
+        [[ "$method" == "websocket" || "$method" == "ws" || "$method" == "xhttp" ]] && opts+=(路径)
+        [[ "$method" == "xhttp" ]] && opts+=(模式)
+        ;;
+      *) err "未知协议"; pause; return 0 ;;
+    esac
+    menu=(); i=1
+    for name in "${opts[@]}"; do menu+=("$i:$name"); i=$((i + 1)); done
+    choose "${menu[@]}" || return 0
+    label="${opts[$((CHOOSE - 1))]}"
+    case "$label" in
+      监听)
+        prompt value "监听" "$(j '.listen')" || continue
+        valid_listen "$value" || { err "地址无效"; pause; continue; }
+        obj=$(jq --arg v "$value" '.listen=$v' <<<"$obj") ;;
+      端口)
+        prompt value "端口" "$(j '.port')" || continue
+        valid_port "$value" || { err "端口无效"; pause; continue; }
+        pkind="tcp"
+        if [[ "$proto" == "hysteria" ]]; then pkind="udp"
+        elif [[ "$proto" == "shadowsocks" ]]; then pkind=$(ss_kind "$(j '.settings.network')")
+        fi
+        if [[ "$value" != "$(j '.port')" ]] && port_taken "$value" "$tag" "$pkind"; then err "端口占用"; pause; continue; fi
+        obj=$(jq --argjson v "$value" '.port=$v' <<<"$obj") ;;
+      密码)
+        ask_gen value "密码" "$(j '.settings.password')" gen_ss_password "$(j '.settings.method')" || continue
+        [[ ${#value} -ge 8 ]] || { err "密码过短"; pause; continue; }
+        obj=$(jq --arg v "$value" '.settings.password=$v' <<<"$obj") ;;
+      UUID)
+        ask_gen value "UUID" "$(j '.settings.users[0].id')" gen_uuid || continue
+        obj=$(jq --arg v "$value" '.settings.users[0].id=$v' <<<"$obj") ;;
+      认证)
+        ask_gen value "认证" "$(j '.settings.users[0].auth')" gen_uuid || continue
+        obj=$(jq --arg v "$value" '.settings.users[0].auth=$v | .streamSettings.hysteriaSettings.auth=$v' <<<"$obj") ;;
+      网络)
+        oldnet=$(j '.settings.network')
+        port=$(j '.port')
+        prompt value "网络" "$oldnet" || continue
+        valid_ss_net "$value" || { err "网络无效"; pause; continue; }
+        for side in tcp udp; do
+          [[ "$value" == *"$side"* ]] || continue
+          if port_in_cfg "$port" "$tag" "$side"; then err "端口占用"; pause; continue 2; fi
+          if [[ "$oldnet" != *"$side"* ]] && port_taken "$port" "$tag" "$side"; then err "端口占用"; pause; continue 2; fi
+        done
+        obj=$(jq --arg v "$value" '.settings.network=$v' <<<"$obj") ;;
+      SNI)
+        prompt value "SNI" "$(j '.streamSettings.realitySettings.serverNames[0] // .streamSettings.tlsSettings.serverName')" || continue
+        if [[ "$sec" == "reality" ]]; then
+          obj=$(jq --arg v "$value" '.streamSettings.realitySettings.serverNames[0]=$v' <<<"$obj")
+        else
+          obj=$(jq --arg v "$value" '.streamSettings.tlsSettings.serverName=$v' <<<"$obj")
+          if cert_is_self "$tag"; then REISSUE_SNI="$value"; else note "已有证书未更换，SNI 须与证书一致"; fi
+        fi ;;
+      密钥)
+        priv=$(gen_reality_keys) || { err "生成失败"; pause; continue; }
+        sid=$(gen_short_id)
+        obj=$(jq --arg priv "$priv" --arg sid "$sid" \
+          'del(.streamSettings.realitySettings.publicKey) | .streamSettings.realitySettings.privateKey=$priv | .streamSettings.realitySettings.shortIds=[$sid]' <<<"$obj") ;;
+      混淆)
+        ask_gen value "混淆" "$(j '.streamSettings.finalmask.udp[0].settings.password')" gen_obfs || continue
+        [[ ${#value} -ge 4 ]] || { err "混淆过短"; pause; continue; }
+        obj=$(jq --arg v "$value" '.streamSettings.finalmask.udp[0].settings.password=$v' <<<"$obj") ;;
+      路径)
+        path=$(j '.streamSettings.wsSettings.path // .streamSettings.xhttpSettings.path // "/"')
+        prompt value "路径" "$path" || continue
+        [[ "$value" == /* ]] || { err "路径必须以 / 开头"; pause; continue; }
+        if [[ "$method" == "websocket" || "$method" == "ws" ]]; then
+          obj=$(jq --arg v "$value" '.streamSettings.wsSettings.path=$v' <<<"$obj")
+        else
+          obj=$(jq --arg v "$value" '.streamSettings.xhttpSettings.path=$v' <<<"$obj")
+        fi ;;
+      上传|下载)
+        local field=brutalUp
+        [[ "$label" == "下载" ]] && field=brutalDown
+        prompt value "$label" "$(j ".streamSettings.finalmask.quicParams.$field")" || continue
+        obj=$(jq --arg v "$value" --arg f "$field" '.streamSettings.finalmask.quicParams[$f]=$v' <<<"$obj") ;;
+      模式)
+        value=$(xhttp_mode) || continue
+        obj=$(jq --arg v "$value" '.streamSettings.xhttpSettings.mode=$v' <<<"$obj") ;;
+    esac
+    commit_edit "$tag" "$obj"
+    pause
+  done
 }
 
 show_links() {
@@ -1167,7 +1242,6 @@ show_links() {
   fi
   [[ "$SHARE_VIA" == "egress" ]] && note "出口地址"
   for host in "${SHARE_LINES[@]}"; do
-    blank
     link=$(share_link_of "$tag" "$host") || { err "链接失败"; continue; }
     plainln "$link"
   done
@@ -1184,7 +1258,6 @@ page_delete() {
   pick_inbound || return 0
   header "删除 ${PICKED}"
   summary_of "$(inbound_json "$PICKED")"
-  blank
   confirm "删除?" || { note "已取消"; pause; return 0; }
   remove_inbound "$PICKED" || true
   [[ "${MUTATE_RC:-1}" == 0 ]] && okmsg "已删除 ${PICKED}"
@@ -1194,7 +1267,6 @@ page_logs() {
   header "实时日志"
   [[ -f "$LOG_FILE" ]] || { warn "无日志"; pause; return 0; }
   note "Ctrl+C 返回"
-  blank
   local old_trap pid
   old_trap=$(trap -p INT || true)
   set +e
@@ -1224,10 +1296,11 @@ page_install() {
   note "v${ver}"
   download_install "$ver" || { pause; return 0; }
   if svc running; then
-    if svc restart; then okmsg "已安装 v${ver}"
-    else warn "已安装，未重启"; fi
-  elif svc start; then okmsg "已安装 v${ver}"
-  else warn "已安装，未启动"; fi
+    svc restart || { warn "已安装，未重启"; return 0; }
+  elif ! svc start; then
+    warn "已安装，未启动"; return 0
+  fi
+  okmsg "已安装 v${ver}"
 }
 
 page_upgrade() {
@@ -1239,7 +1312,6 @@ page_upgrade() {
   new=$(latest_version) || { err "获取版本失败"; pause; return 0; }
   kv "当前" "v${cur#v}"
   kv "最新" "v${new#v}"
-  blank
   if [[ "v${cur#v}" == "v${new#v}" ]]; then
     note "已是最新"
     confirm "重装?" || { note "已取消"; pause; return 0; }
@@ -1286,7 +1358,6 @@ remove_xray_account() {
 page_uninstall() {
   header "卸载内核"
   warn "删除程序、配置、日志和用户。"
-  blank
   confirm "卸载?" || { note "已取消"; pause; return 0; }
   svc stop >/dev/null 2>&1 || true
   svc disable >/dev/null 2>&1 || true
@@ -1317,18 +1388,14 @@ main_menu() {
   [[ -n "$ver" ]] && ver="v${ver#v}" || ver="-"
   count=$(inbound_count)
   cls
-  blank
   ui "${ACC}XRAY${RST}  ${ver}  $(status_word)  入站 ${count}"
-  blank
   section "内核"
   menu_row 1 安装内核 2 升级内核
   menu_row 3 启动服务 4 停止服务
   menu_row 5 查看日志 6 卸载内核
-  blank
   section "入站"
   menu_row 7 添加入站 8 修改入站
   menu_row 9 分享链接 10 删除入站
-  blank
   uin "${DIM}编号，q 退出${RST} ${GRN}>${RST} "
 }
 
@@ -1352,8 +1419,7 @@ main() {
     local ans
     IFS= read -r ans || exit 0
     ans="${ans//$'\r'/}"
-    if [[ "$ans" == "q" || "$ans" == "Q" ]]; then
-      blank
+    if is_q "$ans"; then
       note "再见"
       exit 0
     fi
