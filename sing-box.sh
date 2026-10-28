@@ -6,23 +6,19 @@
 set -euo pipefail
 
 SINGBOX_PREFIX="${SINGBOX_PREFIX:-}"
-RUN_USER="sing-box"
 BIN="${SINGBOX_PREFIX}/usr/local/bin/sing-box"
 CFG_DIR="${SINGBOX_PREFIX}/usr/local/etc/sing-box"
 CFG="${CFG_DIR}/config.json"
 LOG_DIR="${SINGBOX_PREFIX}/var/log/sing-box"
 LOG_FILE="${LOG_DIR}/sing-box.log"
-STATE_DIR="${SINGBOX_PREFIX}/var/lib/sing-box-panel"
-# 工作目录放在状态目录里，卸载不会碰到发行版的 /var/lib/sing-box。
+STATE_DIR="${SINGBOX_PREFIX}/var/lib/sing-box"
 WORK_DIR="${STATE_DIR}/work"
-BIN_BAK="${STATE_DIR}/sing-box.prev"
 REALITY_DB="${STATE_DIR}/reality-pubs.json"
 LOCK_FILE="${STATE_DIR}/mutate.lock"
 SYSTEMD_UNIT="${SINGBOX_PREFIX}/etc/systemd/system/sing-box.service"
 OPENRC_INIT="${SINGBOX_PREFIX}/etc/init.d/sing-box"
 LOGROTATE="${SINGBOX_PREFIX}/etc/logrotate.d/sing-box"
 RELEASE_API="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
-SVC_NAME="sing-box"
 
 INIT_KIND=""
 MACHINE=""
@@ -49,11 +45,11 @@ ui() { printf '%b\n' "$*" >&4; }
 uin() { printf '%b' "$*" >&4; }
 notice() { NOTICE="$*"; }
 hold() { ui "$1"; notice "$1"; }
-err() { hold "${RED}✖ 错误${RST}  $*"; }
-warn() { hold "${YEL}▲ 警告${RST}  $*"; }
-note() { ui "${DIM}ℹ $*${RST}"; }
-sticky() { note "$1"; notice "${DIM}ℹ $1${RST}"; }
-okmsg() { hold "${GRN}✔ 完成${RST}  $*"; }
+err() { hold "${RED}[错误]${RST}  $*"; }
+warn() { hold "${YEL}[警告]${RST}  $*"; }
+note() { ui "${DIM}[提示]${RST}  $*"; }
+sticky() { note "$1"; notice "${DIM}[提示]${RST}  $1"; }
+okmsg() { hold "${GRN}[完成]${RST}  $*"; }
 cancelled() { sticky "已取消"; }
 
 readin() {
@@ -177,21 +173,11 @@ prompt() {
   printf -v "$__var" '%s' "$ans"
 }
 
-# 0 同意；1 拒绝；2 是 q。
 confirm() {
   local ans
   uin "  ${YEL}？${RST} $1 ${DIM}[y/N] (q 返回)${RST} ${ACC}›${RST} "
   ans=$(readin)
-  is_q "$ans" && return 2
   [[ "$ans" == "y" || "$ans" == "Y" || "$ans" == "yes" ]]
-}
-
-# 0 同意；1 拒绝或 q。只有 q 提示已取消。
-ask_yes() {
-  local rc=0
-  confirm "$1" || rc=$?
-  if (( rc == 2 )); then cancelled; return 1; fi
-  (( rc == 0 ))
 }
 
 # 0 写入；1 取消。输入 n 不会退出，也不会删掉已生成的证书。
@@ -319,38 +305,38 @@ ensure_tools() {
 }
 
 singbox_is_root_account() {
-  id -u "$RUN_USER" >/dev/null 2>&1 && { [[ "$(id -u "$RUN_USER")" -eq 0 || "$(id -g "$RUN_USER")" -eq 0 ]]; }
+  id -u sing-box >/dev/null 2>&1 && { [[ "$(id -u sing-box)" -eq 0 || "$(id -g sing-box)" -eq 0 ]]; }
 }
 
 ensure_user() {
-  if id -u "$RUN_USER" >/dev/null 2>&1; then
-    singbox_is_root_account && { err "${RUN_USER} 是 root"; return 1; }
+  if id -u sing-box >/dev/null 2>&1; then
+    singbox_is_root_account && { err "sing-box 是 root"; return 1; }
     return 0
   fi
   local shell="/usr/sbin/nologin"
   [[ -x /sbin/nologin ]] && shell="/sbin/nologin"
   if [[ -f /etc/alpine-release ]]; then
-    addgroup -S "$RUN_USER" 2>/dev/null || true
-    adduser -S -D -H -h /var/empty -s /sbin/nologin -G "$RUN_USER" "$RUN_USER" 2>/dev/null || true
+    addgroup -S sing-box 2>/dev/null || true
+    adduser -S -D -H -h /var/empty -s /sbin/nologin -G sing-box sing-box 2>/dev/null || true
   else
-    getent group "$RUN_USER" >/dev/null || groupadd --system "$RUN_USER"
-    useradd --system --gid "$RUN_USER" --home-dir /var/empty --shell "$shell" --comment "sing-box" "$RUN_USER"
+    getent group sing-box >/dev/null || groupadd --system sing-box
+    useradd --system --gid sing-box --home-dir /var/empty --shell "$shell" --comment "sing-box" sing-box
   fi
-  id -u "$RUN_USER" >/dev/null 2>&1 || { err "创建用户失败"; return 1; }
-  if singbox_is_root_account; then err "${RUN_USER} 必须非 root"; return 1; fi
+  id -u sing-box >/dev/null 2>&1 || { err "创建用户失败"; return 1; }
+  if singbox_is_root_account; then err "sing-box 必须非 root"; return 1; fi
 }
 
 own() { chown "$@" 2>/dev/null || true; }
 
 install_dirs() {
   install -d -m 755 -o 0 -g 0 "$(dirname "$BIN")" "$(dirname "$SYSTEMD_UNIT")" "$(dirname "$OPENRC_INIT")"
-  install -d -m 750 -o 0 -g "$RUN_USER" "$CFG_DIR"
-  install -d -m 700 -o "$RUN_USER" -g "$RUN_USER" "$LOG_DIR"
-  install -d -m 750 -o 0 -g "$RUN_USER" "$STATE_DIR"
-  install -d -m 750 -o "$RUN_USER" -g "$RUN_USER" "$WORK_DIR"
+  install -d -m 750 -o 0 -g sing-box "$CFG_DIR"
+  install -d -m 700 -o sing-box -g sing-box "$LOG_DIR"
+  install -d -m 750 -o 0 -g sing-box "$STATE_DIR"
+  install -d -m 750 -o sing-box -g sing-box "$WORK_DIR"
   [[ -f "$CFG" ]] || write_base_config
   touch "$LOG_FILE"
-  own "${RUN_USER}:${RUN_USER}" "$LOG_FILE"
+  own sing-box:sing-box "$LOG_FILE"
   chmod 600 "$LOG_FILE"
   write_logrotate
 }
@@ -359,7 +345,7 @@ write_logrotate() {
   install -d -m 755 -o 0 -g 0 "$(dirname "$LOGROTATE")"
   cat >"$LOGROTATE" <<EOF
 ${LOG_DIR}/*.log {
-    su ${RUN_USER} ${RUN_USER}
+    su sing-box sing-box
     weekly
     rotate 4
     compress
@@ -380,8 +366,8 @@ Documentation=https://sing-box.sagernet.org
 After=network.target nss-lookup.target network-online.target
 
 [Service]
-User=${RUN_USER}
-Group=${RUN_USER}
+User=sing-box
+Group=sing-box
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 NoNewPrivileges=yes
@@ -414,7 +400,7 @@ no_new_privs=yes
 umask=0077
 extra_commands="checkconfig"
 command="${BIN}"
-command_user="${RUN_USER}:${RUN_USER}"
+command_user="sing-box:sing-box"
 command_args="run --disable-color -c ${CFG} -D ${WORK_DIR}"
 required_files="${CFG}"
 depend() { need net; after firewall; }
@@ -431,18 +417,18 @@ svc() {
   if [[ "$INIT_KIND" == "systemd" ]]; then
     case "$act" in
       installed) [[ -x "$BIN" && -f "$SYSTEMD_UNIT" ]] ;;
-      running) systemctl is-active --quiet "$SVC_NAME" ;;
-      start|restart) systemctl enable "$SVC_NAME" >/dev/null 2>&1 || true; systemctl "$act" "$SVC_NAME" ;;
-      stop) timeout 20 systemctl stop "$SVC_NAME" ;;
-      disable) systemctl disable "$SVC_NAME" >/dev/null 2>&1 || true; rm -f "$SYSTEMD_UNIT"; systemctl daemon-reload || true ;;
+      running) systemctl is-active --quiet sing-box ;;
+      start|restart) systemctl enable sing-box >/dev/null 2>&1 || true; systemctl "$act" sing-box ;;
+      stop) timeout 20 systemctl stop sing-box ;;
+      disable) systemctl disable sing-box >/dev/null 2>&1 || true; rm -f "$SYSTEMD_UNIT"; systemctl daemon-reload || true ;;
     esac
   else
     case "$act" in
       installed) [[ -x "$BIN" && -f "$OPENRC_INIT" ]] ;;
-      running) rc-service "$SVC_NAME" status >/dev/null 2>&1 ;;
-      start|restart) rc-update add "$SVC_NAME" default >/dev/null 2>&1 || true; rc-service "$SVC_NAME" "$act" >/dev/null 2>&1 </dev/null ;;
-      stop) timeout 20 rc-service "$SVC_NAME" stop >/dev/null 2>&1 </dev/null ;;
-      disable) rc-update del "$SVC_NAME" default >/dev/null 2>&1 || true; rm -f "$OPENRC_INIT" ;;
+      running) rc-service sing-box status >/dev/null 2>&1 ;;
+      start|restart) rc-update add sing-box default >/dev/null 2>&1 || true; rc-service sing-box "$act" >/dev/null 2>&1 </dev/null ;;
+      stop) timeout 20 rc-service sing-box stop >/dev/null 2>&1 </dev/null ;;
+      disable) rc-update del sing-box default >/dev/null 2>&1 || true; rm -f "$OPENRC_INIT" ;;
     esac
   fi
   } </dev/null 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-
@@ -461,10 +447,10 @@ assert_runtime_user() {
   elif [[ -f "$OPENRC_INIT" ]]; then
     unit_user=$(sed -n 's/^command_user="\([^:"]*\).*/\1/p' "$OPENRC_INIT" | head -n1)
   fi
-  [[ "$unit_user" == "$RUN_USER" ]] || { err "服务用户不是 ${RUN_USER}"; return 1; }
+  [[ "$unit_user" == "sing-box" ]] || { err "服务用户不是 sing-box"; return 1; }
   local uid
-  uid=$(id -u "$RUN_USER" 2>/dev/null) || { err "没有 ${RUN_USER} 用户"; return 1; }
-  [[ "$uid" != "0" ]] || { err "${RUN_USER} uid 为 0"; return 1; }
+  uid=$(id -u sing-box 2>/dev/null) || { err "没有 sing-box 用户"; return 1; }
+  [[ "$uid" != "0" ]] || { err "sing-box uid 为 0"; return 1; }
 }
 
 current_version() {
@@ -512,8 +498,8 @@ pick_asset() {
 # 密钥在这个目录里。用户已存在时保留组可进入，供服务读工作目录。
 secure_state() {
   mkdir -p "$STATE_DIR" 2>/dev/null || return 1
-  if id -g "$RUN_USER" >/dev/null 2>&1; then
-    chown "0:${RUN_USER}" "$STATE_DIR" 2>/dev/null || true
+  if id -g sing-box >/dev/null 2>&1; then
+    chown "0:sing-box" "$STATE_DIR" 2>/dev/null || true
     chmod 750 "$STATE_DIR" 2>/dev/null || true
   else
     chmod 700 "$STATE_DIR" 2>/dev/null || true
@@ -632,7 +618,7 @@ write_base_config() {
   mkdir -p "$(dirname "$CFG")" 2>/dev/null || true
   jq -n --arg out "$LOG_FILE" \
     '{log:{level:"info",timestamp:true,output:$out},inbounds:[],outbounds:[{type:"direct",tag:"direct"}],route:{rules:[{action:"sniff"}],final:"direct"}}' >"$CFG"
-  own "0:${RUN_USER}" "$CFG"
+  own "0:sing-box" "$CFG"
   chmod 640 "$CFG"
 }
 
@@ -995,9 +981,9 @@ build_inbound() {
 install_cert_pair() {
   local crt="$1" key="$2" src_crt="$3" src_key="$4" dir
   dir=$(dirname "$crt")
-  install -d -m 750 -o 0 -g "$RUN_USER" "$dir"
-  install -m 640 -o 0 -g "$RUN_USER" "$src_crt" "$crt"
-  install -m 640 -o 0 -g "$RUN_USER" "$src_key" "$key"
+  install -d -m 750 -o 0 -g sing-box "$dir"
+  install -m 640 -o 0 -g sing-box "$src_crt" "$crt"
+  install -m 640 -o 0 -g sing-box "$src_key" "$key"
 }
 
 mark_self_signed() { printf '%s\n' self >"${CFG_DIR}/certs/${1}.self"; chmod 644 "${CFG_DIR}/certs/${1}.self"; }
@@ -1053,11 +1039,11 @@ sb_test_file() {
   local file="$1" out rc=0
   [[ -x "$BIN" ]] || { err "未安装"; return 1; }
   if [[ "${SINGBOX_AS_USER:-1}" != "0" ]]; then
-    id -u "$RUN_USER" >/dev/null 2>&1 || { err "没有 ${RUN_USER} 用户"; return 1; }
-    install -d -m 750 -o 0 -g "$RUN_USER" "$STATE_DIR"
-    install -m 640 -o 0 -g "$RUN_USER" "$file" "${STATE_DIR}/test-config.json"
+    id -u sing-box >/dev/null 2>&1 || { err "没有 sing-box 用户"; return 1; }
+    install -d -m 750 -o 0 -g sing-box "$STATE_DIR"
+    install -m 640 -o 0 -g sing-box "$file" "${STATE_DIR}/test-config.json"
     file="${STATE_DIR}/test-config.json"
-    out=$(su -s /bin/sh "$RUN_USER" -c "'${BIN}' check --disable-color -c '${file}' -D '${WORK_DIR}'" 2>&1) || rc=$?
+    out=$(su -s /bin/sh sing-box -c "'${BIN}' check --disable-color -c '${file}' -D '${WORK_DIR}'" 2>&1) || rc=$?
     rm -f "$file"
   else
     out=$("$BIN" check --disable-color -c "$file" -D "$WORK_DIR" 2>&1) || rc=$?
@@ -1085,8 +1071,8 @@ mutate() {
   chown 0:0 "$bak" 2>/dev/null || true
   chmod 600 "$bak" || true
   if ! sb_test_file "$newf"; then finish_mutate 1; return 0; fi
-  install -m 640 -o 0 -g "$RUN_USER" "$newf" "$CFG"
-  restore_bak() { cp -a "$bak" "$CFG"; own "0:${RUN_USER}" "$CFG"; chmod 640 "$CFG"; }
+  install -m 640 -o 0 -g sing-box "$newf" "$CFG"
+  restore_bak() { cp -a "$bak" "$CFG"; own "0:sing-box" "$CFG"; chmod 640 "$CFG"; }
   if ! svc installed || ! svc running; then
     if svc installed && ! svc start; then
       restore_bak
@@ -1206,6 +1192,7 @@ summary_of() {
   port=$(j '.listen_port')
   listen=$(j '.listen')
   tag=$(j '.tag')
+  ui "  ${ACC}┌── 节点配置摘要 ──────────────────────────────${RST}"
   kv "协议" "$proto"
   kv "备注" "$tag"
   kv "监听" "$(fmt_addr "$listen" "$port")"
@@ -1238,10 +1225,11 @@ summary_of() {
     hysteria2)
       kv "SNI" "$(j '.tls.server_name')"
       kv "混淆" "$(j '.obfs.type // "salamander"')"
-      kv "上传" "$(j '.up_mbps') mbps"
-      kv "下载" "$(j '.down_mbps') mbps"
+      kv "上传" "$(j '.up_mbps') Mbps"
+      kv "下载" "$(j '.down_mbps') Mbps"
       ;;
   esac
+  ui "  ${ACC}└──────────────────────────────────────────────${RST}"
   return 0
 }
 
@@ -1252,7 +1240,18 @@ fmt_addr() {
 }
 
 valid_port() { [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$1 <= 65535 )); }
-valid_mbps() { [[ "$1" =~ ^[1-9][0-9]{0,6}$ ]] && (( 10#$1 <= 1000000 )); }
+parse_mbps() {
+  local v="${1//[[:space:]]/}"
+  v="${v%[mM][bB][pP][sS]}"
+  v="${v%[mM][bB]}"
+  v="${v%[mM]}"
+  if [[ "$v" =~ ^[1-9][0-9]{0,6}$ ]] && (( 10#$v <= 1000000 )); then
+    printf '%d' "$(( 10#$v ))"
+    return 0
+  fi
+  return 1
+}
+valid_mbps() { parse_mbps "$1" >/dev/null; }
 valid_ipv6() {
   local a="${1,,}" left="" right="" n=0 g compressed=0
   [[ "$a" =~ ^[0-9a-f:]+$ && "$a" == *:* && "$a" != *::*::* && "$a" != *:::* ]] || return 1
@@ -1292,15 +1291,6 @@ ss_kind() { case "$1" in tcp|udp) printf '%s' "$1" ;; *) printf '%s' tcpudp ;; e
 rand_port() { printf '%s\n' "$((20000 + $(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 40000))"; }
 rand_tag() { openssl rand -hex 3; }
 
-need_cfg_tools() {
-  local miss=() bin want_bin="${1:-1}"
-  for bin in jq openssl; do
-    command -v "$bin" >/dev/null 2>&1 || miss+=("$bin")
-  done
-  if (("${#miss[@]}")); then err "缺少 ${miss[*]}"; return 1; fi
-  [[ "$want_bin" == "0" || -x "$BIN" ]] || { err "未安装"; return 1; }
-}
-
 take_tag() {
   tag="$1-${TAGPART}"
   if list_tags | grep -qx "$tag"; then err "备注重复"; return 1; fi
@@ -1317,16 +1307,15 @@ ask_common() {
 
 save_new() {
   local tag="$1" obj="$2"
-  header "确认"
+  header "确认配置"
   summary_of "$obj"
-  ui ""
-  confirm_write || { drop_cert "$tag"; return 1; }
+  confirm_write || { drop_cert "$tag"; PENDING_TAG=""; return 1; }
   upsert_inbound "$obj" || true
   PENDING_TAG=""
   if [[ "${MUTATE_RC:-1}" == 0 ]]; then
     okmsg "已添加 ${tag}"
     if cert_is_self "$tag"; then
-      note "自签证书，客户端允许不安全"
+      note "自签证书，客户端允许不安全 (allowInsecure=1)"
     fi
     show_links "$tag"
     pause
@@ -1429,10 +1418,10 @@ form_hysteria() {
   header "Hysteria2"
   ask_gen auth "认证" "$(gen_uuid)" gen_uuid || return 1
   prompt sni "SNI" "www.amd.com" || return 1
-  prompt up "上传" "100" || return 1
-  valid_mbps "$up" || { err "带宽无效"; return 1; }
-  prompt down "下载" "100" || return 1
-  valid_mbps "$down" || { err "带宽无效"; return 1; }
+  prompt up "上传 (Mbps)" "100" || return 1
+  up=$(parse_mbps "$up") || { err "带宽无效"; return 1; }
+  prompt down "下载 (Mbps)" "100" || return 1
+  down=$(parse_mbps "$down") || { err "带宽无效"; return 1; }
   ask_common || return 1
   take_tag hy2 || return 1
   port_taken "$PORT" "" udp && { err "端口占用"; return 1; }
@@ -1446,17 +1435,17 @@ form_hysteria() {
 pick_inbound() {
   local tags=() t i=1 ans
   mapfile -t tags < <(list_tags)
-  ((${#tags[@]})) || { warn "没有入站"; return 1; }
-  header "选择入站"
+  ((${#tags[@]})) || { warn "当前没有任何入站节点"; return 1; }
+  header "选择入站节点"
   for t in "${tags[@]}"; do
-    local kind listen port k
-    IFS=$'\t' read -r kind listen port < <(jq -r --arg t "$t" '.inbounds[]|select(.tag==$t)|[.type,.listen,(.listen_port|tostring)]|@tsv' "$CFG")
-    printf -v k '%2d.' "$i"
-    ui "    ${ACC}${BOLD}${k}${RST}  ${BOLD}$(pad "$t" 20)${RST}  ${CYN}${kind}${RST} ${DIM}➜${RST} ${ACC}$(fmt_addr "$listen" "$port")${RST}"
+    local meta
+    meta=$(jq -r --arg t "$t" '.inbounds[]|select(.tag==$t)|"\(.type)  \(.listen):\(.listen_port)"' "$CFG")
+    ui "    ${ACC}${BOLD}[$(pad "$i" 2)]${RST}  $(pad "$t" 22)  ${DIM}${meta}${RST}"
     i=$((i + 1))
   done
+  ui ""
   while true; do
-    uin "  ${CYN}➜${RST} 请选择 ${DIM}(q 返回)${RST} ${ACC}›${RST} "
+    uin "  ${CYN}➜${RST} 请选择节点编号 ${DIM}(q 返回)${RST} ${ACC}›${RST} "
     ans=$(readin)
     is_q "$ans" && return 1
     if [[ "$ans" =~ ^[0-9]+$ ]] && (( ans >= 1 && ans <= ${#tags[@]} )); then
@@ -1469,7 +1458,6 @@ pick_inbound() {
 
 page_add() {
   header "添加入站"
-  need_cfg_tools || { pause; return 0; }
   choose "1:Shadowsocks" "2:VLESS" "3:Hysteria2" || return 0
   case "$CHOOSE" in
     1) form_shadowsocks ;;
@@ -1480,8 +1468,8 @@ page_add() {
 
 commit_edit() {
   local tag="$1" new="$2" tmp="" bak_crt="" bak_key=""
+  header "修改配置确认"
   summary_of "$new"
-  ui ""
   confirm_write || return 0
   if [[ -n "${REISSUE_SNI:-}" ]]; then
     tmp=$(mktemp -d)
@@ -1507,7 +1495,6 @@ commit_edit() {
 }
 
 page_edit() {
-  need_cfg_tools || { pause; return 0; }
   pick_inbound || return 0
   local tag="$PICKED" obj proto value pkind priv sid path method sec label oldnet port opts=()
   while true; do
@@ -1608,8 +1595,8 @@ page_edit() {
       上传|下载)
         local field=up_mbps
         [[ "$label" == "下载" ]] && field=down_mbps
-        prompt value "$label" "$(j ".$field")" || continue
-        valid_mbps "$value" || { err "带宽无效"; pause; continue; }
+        prompt value "${label} (Mbps)" "$(j ".$field")" || continue
+        value=$(parse_mbps "$value") || { err "带宽无效"; pause; continue; }
         obj=$(jq --argjson v "$value" --arg f "$field" '.[$f]=$v' <<<"$obj") ;;
     esac
     commit_edit "$tag" "$obj"
@@ -1624,7 +1611,8 @@ show_links() {
     err "没有可用的公网地址"
     return 0
   fi
-  [[ "$SHARE_VIA" == "egress" ]] && note "出口地址"
+  ui "  ${CYN}┌── 节点分享链接 [${tag}] ──────────────────────────${RST}"
+  [[ "$SHARE_VIA" == "egress" ]] && note "通过出口探测获取公网 IP"
   proto=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag==$t) | .type' "$CFG" 2>/dev/null || true)
   if [[ "$proto" == "hysteria2" ]]; then
     up=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag==$t) | .up_mbps // empty' "$CFG")
@@ -1633,20 +1621,18 @@ show_links() {
       note "Brutal 上限 上传 ${up:-不限} / 下载 ${down:-不限} mbps。链接不含带宽，客户端没填时走 BBR。"
     fi
   fi
-  ui ""
   for host in "${SHARE_LINES[@]}"; do
     link=$(share_link_of "$tag" "$host") || { err "链接失败"; continue; }
     if [[ "$host" == \[* ]]; then
-      ui "  ${CYN}${BOLD}$(pad "IPv6" 6)${RST} :  ${ACC}${link}${RST}"
+      ui "  ${BORD}│${RST} $(pad "IPv6" 8) ${link}"
     else
-      ui "  ${GRN}${BOLD}$(pad "IPv4" 6)${RST} :  ${ACC}${link}${RST}"
+      ui "  ${BORD}│${RST} $(pad "IPv4" 8) ${link}"
     fi
   done
-  ui ""
+  ui "  ${CYN}└──────────────────────────────────────────────────${RST}"
 }
 
 page_share() {
-  need_cfg_tools 0 || { pause; return 0; }
   pick_inbound || return 0
   header "$PICKED"
   show_links "$PICKED"
@@ -1654,20 +1640,23 @@ page_share() {
 }
 
 page_delete() {
-  need_cfg_tools || { pause; return 0; }
   pick_inbound || return 0
-  header "删除 ${PICKED}"
+  header "删除入站: ${PICKED}"
   summary_of "$(inbound_json "$PICKED")"
-  ui ""
-  ask_yes "删除?" || { pause; return 0; }
+  confirm "确认删除?" || { cancelled; pause; return 0; }
   remove_inbound "$PICKED" || true
-  [[ "${MUTATE_RC:-1}" == 0 ]] && okmsg "已删除 ${PICKED}"
+  if [[ "${MUTATE_RC:-1}" == 0 ]]; then
+    okmsg "已删除 ${PICKED}"
+  else
+    pause
+  fi
 }
 
 page_logs() {
-  header "实时日志"
+  header "服务实时日志"
   [[ -f "$LOG_FILE" ]] || { warn "无日志"; pause; return 0; }
-  note "Ctrl+C 返回"
+  note "正在查看实时日志，按 Ctrl+C 返回"
+  ui ""
   local old_trap pid
   old_trap=$(trap -p INT || true)
   set +e
@@ -1680,147 +1669,104 @@ page_logs() {
   trap - INT
   [[ -n "$old_trap" ]] && eval "$old_trap"
   set -e
-  note "已停止"
+  note "日志查看已停止"
 }
 
 fetch_ver() {
-  ensure_tools || return 1
   latest_version || { err "获取版本失败"; return 1; }
 }
 
-stash_binary() {
-  [[ -x "$BIN" ]] || return 0
-  secure_state || return 1
-  install -m 700 -o 0 -g 0 "$BIN" "$BIN_BAK"
-}
-
-restore_binary() {
-  [[ -x "$BIN_BAK" ]] || return 1
-  install -m 755 -o 0 -g 0 "$BIN_BAK" "$BIN"
-}
-
-# 先留旧内核。下载或启动失败时装回去，成功后删掉备份。
-swap_kernel() {
-  local ver="$1" act="$2"
-  stash_binary || { err "无法备份内核"; return 1; }
-  if ! download_install "$ver" || ! svc_wait "$act"; then
-    if [[ -x "$BIN_BAK" ]] && restore_binary && svc_wait "$act"; then
-      warn "新内核未能启动，已恢复旧内核"
-    else
-      err "内核未能启动"
-    fi
-    return 1
-  fi
-  rm -f "$BIN_BAK"
-}
-
 page_install() {
-  local ver act="start"
-  header "安装内核"
+  local ver act="start" fail="已安装，未启动"
+  header "安装 Sing-box 内核"
   if svc installed; then
-    warn "已安装 $(current_version)"
-    ask_yes "重装?" || { pause; return 0; }
-    svc running && act="restart"
+    warn "当前已安装 $(current_version)"
+    confirm "是否覆盖重新安装?" || { cancelled; pause; return 0; }
   else
-    ask_yes "安装最新版?" || { pause; return 0; }
+    confirm "是否安装最新版本内核?" || { cancelled; pause; return 0; }
   fi
   ver=$(fetch_ver) || { pause; return 0; }
-  swap_kernel "$ver" "$act" || { pause; return 0; }
+  download_install "$ver" || { pause; return 0; }
+  svc running && { act="restart"; fail="已安装，未重启"; }
+  svc_wait "$act" || { warn "$fail"; return 0; }
   okmsg "已安装 v${ver}"
 }
 
 page_upgrade() {
-  local cur new act="start"
-  header "升级内核"
+  local cur new was=0
+  header "升级 Sing-box 内核"
   svc installed || { warn "未安装"; pause; return 0; }
   cur=$(current_version)
   new=$(fetch_ver) || { pause; return 0; }
-  kv "当前" "v${cur#v}"
-  kv "最新" "v${new#v}"
+  kv "当前版本" "v${cur#v}"
+  kv "最新版本" "v${new#v}"
   ui ""
   if [[ "v${cur#v}" == "v${new#v}" ]]; then
-    note "已是最新"
-    ask_yes "重装?" || { pause; return 0; }
+    note "当前已是最新版本"
+    confirm "是否重新安装当前版本?" || { cancelled; pause; return 0; }
   else
-    ask_yes "升级到 v${new}?" || { pause; return 0; }
+    confirm "确认升级到 v${new}?" || { cancelled; pause; return 0; }
   fi
-  svc running && act="restart"
-  swap_kernel "$new" "$act" || { pause; return 0; }
+  svc running && was=1
+  download_install "$new" || { pause; return 0; }
+  if (( was == 0 )); then okmsg "已升级到 v${new}"; return 0; fi
+  svc_wait restart || { err "重启失败"; return 0; }
   okmsg "已升级到 v${new}"
 }
 
 page_start() {
-  header "启动服务"
-  svc installed || { warn "未安装"; pause; return 0; }
+  header "启动 Sing-box 服务"
+  svc installed || { warn "内核未安装"; pause; return 0; }
   assert_runtime_user || { pause; return 0; }
-  if svc running; then sticky "已在运行"; return 0; fi
+  if svc running; then sticky "服务已在运行中"; return 0; fi
   svc_wait start || { err "启动失败"; return 0; }
   okmsg "已启动"
 }
 
 page_stop() {
-  header "停止服务"
-  svc installed || { warn "未安装"; pause; return 0; }
-  ask_yes "停止?" || { pause; return 0; }
+  header "停止 Sing-box 服务"
+  svc installed || { warn "内核未安装"; pause; return 0; }
+  confirm "确认停止服务?" || { cancelled; pause; return 0; }
   if svc stop; then okmsg "已停止"; else err "停止失败"; fi
 }
 
-home_is_shared() {
-  local home="$1"
-  [[ "$home" == / || "$home" == /root || "$home" == /var/empty || "$home" == /nonexistent || "$home" == /dev/null ]]
-}
-
-remove_account() {
-  local home=""
-  if id -u "$RUN_USER" >/dev/null 2>&1; then
-    if singbox_is_root_account; then warn "${RUN_USER} 是 root，未删除"; return 0; fi
-    home=$(getent passwd "$RUN_USER" | awk -F: '{print $6}')
-    if [[ -f /etc/alpine-release ]] && command -v deluser >/dev/null 2>&1; then
-      deluser "$RUN_USER" >/dev/null 2>&1 || true
-    else
-      userdel "$RUN_USER" >/dev/null 2>&1 || true
+remove_singbox_account() {
+  id -u sing-box >/dev/null 2>&1 || return 0
+  if singbox_is_root_account; then warn "sing-box 是 root，未删除"; return 0; fi
+  if [[ -f /etc/alpine-release ]] && command -v deluser >/dev/null 2>&1; then
+    deluser sing-box >/dev/null 2>&1 || true
+    delgroup sing-box >/dev/null 2>&1 || true
+  else
+    userdel sing-box >/dev/null 2>&1 || true
+    if getent group sing-box >/dev/null 2>&1; then
+      groupdel sing-box >/dev/null 2>&1 || true
     fi
   fi
-  if [[ -f /etc/alpine-release ]] && command -v delgroup >/dev/null 2>&1; then
-    delgroup "$RUN_USER" >/dev/null 2>&1 || true
-  elif getent group "$RUN_USER" >/dev/null 2>&1; then
-    groupdel "$RUN_USER" >/dev/null 2>&1 || true
-  fi
-  # 只删脚本给这个用户建的家目录，不动 /var/empty 这类共享目录。
-  if [[ -n "$home" && -d "$home" ]] && ! home_is_shared "$home"; then
-    rm -rf "$home"
-  fi
-  rm -f /etc/sysusers.d/sing-box.conf /usr/lib/sysusers.d/sing-box.conf
+  if id -u sing-box >/dev/null 2>&1; then warn "用户占用，未删除"; fi
 }
 
 page_uninstall() {
-  header "卸载内核"
-  note "删除程序、配置、日志、状态和用户。"
-  ask_yes "卸载?" || { pause; return 0; }
+  header "卸载 Sing-box 内核"
+  note "彻底删除程序文件、配置文件、数据资源、系统日志及运行用户。"
+  confirm "确认卸载?" || { cancelled; pause; return 0; }
   svc stop >/dev/null 2>&1 || true
   svc disable >/dev/null 2>&1 || true
   pkill -x sing-box >/dev/null 2>&1 || true
   pkill -f 'supervise-daemon sing-box' >/dev/null 2>&1 || true
-  local files=(
-    "$BIN" "$SYSTEMD_UNIT" "$OPENRC_INIT" "$LOGROTATE"
-    /run/sing-box.pid /var/run/sing-box.pid
-    /run/openrc/started/sing-box /run/openrc/daemons/sing-box
-    /run/supervise-daemon/sing-box.pid /run/supervise-daemon/sing-box.ctl
-  )
-  # WORK_DIR 在 STATE_DIR 里面。不删发行版的 /var/lib/sing-box。
-  local dirs=("$CFG_DIR" "$LOG_DIR" "$STATE_DIR" /run/sing-box /var/run/sing-box) f left=""
+  local files=("$BIN" "$SYSTEMD_UNIT" "$OPENRC_INIT" "$LOGROTATE" /usr/bin/sing-box /lib/systemd/system/sing-box.service /usr/lib/systemd/system/sing-box.service /run/sing-box.pid /var/run/sing-box.pid)
+  local dirs=("$CFG_DIR" "$LOG_DIR" "$STATE_DIR" /etc/sing-box /run/sing-box /var/run/sing-box /var/lib/sing-box-panel) f left=""
   rm -f "${files[@]}"
   rm -rf "${dirs[@]}"
   if [[ "$INIT_KIND" == "systemd" ]]; then
     systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl reset-failed sing-box >/dev/null 2>&1 || true
   fi
-  remove_account
+  remove_singbox_account
   for f in "${files[@]}" "${dirs[@]}"; do
-    [[ -e "$f" ]] && left="文件"
+    if [[ -e "$f" || -L "$f" ]]; then left="文件"; fi
   done
-  id -u "$RUN_USER" >/dev/null 2>&1 && left="${left:+$left、}用户"
-  getent group "$RUN_USER" >/dev/null 2>&1 && left="${left:+$left、}用户组"
+  id -u sing-box >/dev/null 2>&1 && left="${left:+$left、}用户"
+  getent group sing-box >/dev/null 2>&1 && left="${left:+$left、}用户组"
   if [[ -n "$left" ]]; then err "未删干净: ${left}"; return 0; fi
   okmsg "已卸载"
 }

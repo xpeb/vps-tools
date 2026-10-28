@@ -13,7 +13,7 @@ DAT_PATH="${XRAY_PREFIX}/usr/local/share/xray"
 LOG_DIR="${XRAY_PREFIX}/var/log/xray"
 LOG_FILE="${LOG_DIR}/error.log"
 ACCESS_LOG="${LOG_DIR}/access.log"
-STATE_DIR="${XRAY_PREFIX}/var/lib/xray-panel"
+STATE_DIR="${XRAY_PREFIX}/var/lib/xray"
 LOCK_FILE="${STATE_DIR}/mutate.lock"
 SYSTEMD_UNIT="${XRAY_PREFIX}/etc/systemd/system/xray.service"
 OPENRC_INIT="${XRAY_PREFIX}/etc/init.d/xray"
@@ -29,15 +29,20 @@ LISTEN="" PORT="" TAGPART=""
 NOTICE=""
 
 # 面板输出走 fd 4。
+if [ -e /proc/self/fdinfo/4 ] && grep -Eq '^flags:[[:space:]]*[0-9]*[12]' /proc/self/fdinfo/4 2>/dev/null; then
+  :
+else
+  exec 4>&1
+fi
 ui() { printf '%b\n' "$*" >&4; }
 uin() { printf '%b' "$*" >&4; }
 notice() { NOTICE="$*"; }
 hold() { ui "$1"; notice "$1"; }
-err() { hold "${RED}✖ 错误${RST}  $*"; }
-warn() { hold "${YEL}▲ 警告${RST}  $*"; }
-note() { ui "${DIM}ℹ $*${RST}"; }
-sticky() { note "$1"; notice "${DIM}ℹ $1${RST}"; }
-okmsg() { hold "${GRN}✔ 完成${RST}  $*"; }
+err() { hold "${RED}[错误]${RST}  $*"; }
+warn() { hold "${YEL}[警告]${RST}  $*"; }
+note() { ui "${DIM}[提示]${RST}  $*"; }
+sticky() { note "$1"; notice "${DIM}[提示]${RST}  $1"; }
+okmsg() { hold "${GRN}[完成]${RST}  $*"; }
 cancelled() { sticky "已取消"; }
 
 readin() {
@@ -258,27 +263,6 @@ detect_arch() {
     s390x) MACHINE="s390x" ;;
     *) return 1 ;;
   esac
-}
-
-ensure_tools() {
-  local missing=() bin
-  for bin in curl unzip jq openssl logrotate; do
-    command -v "$bin" >/dev/null 2>&1 || missing+=("$bin")
-  done
-  if [[ ! -f /etc/ssl/certs/ca-certificates.crt && ! -f /etc/ssl/cert.pem ]]; then
-    missing+=(ca-certificates)
-  fi
-  ((${#missing[@]})) || return 0
-  note "安装 ${missing[*]}"
-  if command -v apt-get >/dev/null 2>&1; then
-    DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}" >/dev/null
-  elif command -v apk >/dev/null 2>&1; then
-    apk add --no-cache "${missing[@]}" >/dev/null
-  else
-    err "无法安装 ${missing[*]}"
-    return 1
-  fi
 }
 
 xray_is_root_account() {
@@ -1138,6 +1122,14 @@ valid_ss_net() { [[ "$1" == "tcp" || "$1" == "udp" || "$1" == "tcp,udp" ]]; }
 ss_kind() { case "$1" in tcp|udp) printf '%s' "$1" ;; *) printf '%s' tcpudp ;; esac; }
 rand_port() { printf '%s\n' "$((20000 + $(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 40000))"; }
 rand_tag() { openssl rand -hex 3 | tr -d '\n'; printf '\n'; }
+speed_mbps() {
+  local v="${1// /}"
+  if [[ "$v" =~ ^([0-9]+)([mM][bB]?[pP]?[sS]?)?$ ]]; then
+    printf '%s mbps\n' "${BASH_REMATCH[1]}"
+  else
+    printf '%s\n' "$1"
+  fi
+}
 
 take_tag() {
   tag="$1-${TAGPART}"
@@ -1258,8 +1250,10 @@ form_hysteria() {
   header "Hysteria2"
   ask_gen auth "认证" "$(gen_uuid)" gen_uuid || return 1
   prompt sni "SNI" "www.amd.com" || return 1
-  prompt up "上传" "100 mbps" || return 1
-  prompt down "下载" "100 mbps" || return 1
+  prompt up "上传 (Mbps)" "100" || return 1
+  up=$(speed_mbps "$up")
+  prompt down "下载 (Mbps)" "100" || return 1
+  down=$(speed_mbps "$down")
   ask_common || return 1
   take_tag hy2 || return 1
   port_taken "$PORT" "" udp && { err "端口占用"; return 1; }
@@ -1427,9 +1421,12 @@ page_edit() {
         [[ "$value" == "-" ]] && value=""
         obj=$(jq --arg v "$value" '.streamSettings.wsSettings.host=$v' <<<"$obj") ;;
       上传|下载)
-        local field=brutalUp
+        local field=brutalUp cur_v
         [[ "$label" == "下载" ]] && field=brutalDown
-        prompt value "$label" "$(j ".streamSettings.finalmask.quicParams.$field")" || continue
+        cur_v=$(j ".streamSettings.finalmask.quicParams.$field")
+        [[ "$cur_v" =~ ([0-9]+) ]] && cur_v="${BASH_REMATCH[1]}"
+        prompt value "${label} (Mbps)" "${cur_v:-100}" || continue
+        value=$(speed_mbps "$value")
         obj=$(jq --arg v "$value" --arg f "$field" '.streamSettings.finalmask.quicParams[$f]=$v' <<<"$obj") ;;
       模式)
         value=$(xhttp_mode) || continue
@@ -1504,7 +1501,6 @@ page_logs() {
 }
 
 fetch_ver() {
-  ensure_tools || return 1
   latest_version || { err "获取版本失败"; return 1; }
 }
 
