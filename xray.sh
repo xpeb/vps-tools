@@ -478,7 +478,8 @@ download_install() {
   kv "架构" "linux-${MACHINE}"
   kv "文件" "Xray-linux-${MACHINE}.zip"
   tmp=$(mktemp -d)
-  trap 'rm -rf "$tmp"' RETURN
+  # RETURN 会在调用者也返回时再跑一次，第一次清掉陷阱，避免 tmp 已失效。
+  trap 'rm -rf "$tmp"; trap - RETURN' RETURN
   zip="${tmp}/xray.zip"
   total=$(curl -fsSLI --retry 2 --max-time 15 "$url" 2>/dev/null | awk 'tolower($1)=="content-length:" {n=$2} END{gsub(/\r/,"",n); print n}' || true)
   [[ "$total" =~ ^[0-9]+$ ]] || total=0
