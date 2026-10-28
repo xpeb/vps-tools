@@ -85,8 +85,9 @@ init_ui() {
   RST=$'\e[0m'
 }
 
+ui_tty() { [[ -t 4 && "${TERM:-}" != "dumb" && "${NO_COLOR:-}" != "1" ]]; }
 cls() {
-  [[ -t 4 && "${TERM:-}" != "dumb" && "${NO_COLOR:-}" != "1" ]] || return 0
+  ui_tty || return 0
   printf '\e[H\e[2J' >&4 2>/dev/null || true
 }
 
@@ -435,19 +436,74 @@ mktemp_json() {
   printf '%s\n' "${f}.json"
 }
 
+human_size() {
+  local n=${1:-0}
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  if (( n >= 1048576 )); then
+    printf '%d.%d MB' $((n / 1048576)) $(((n % 1048576) * 10 / 1048576))
+  elif (( n >= 1024 )); then
+    printf '%d KB' $((n / 1024))
+  else
+    printf '%d B' "$n"
+  fi
+}
+
+dl_meter() {
+  local got=${1:-0} total=${2:-0} width=24 fill=0 pct=0 bar="" i
+  [[ "$got" =~ ^[0-9]+$ ]] || got=0
+  [[ "$total" =~ ^[0-9]+$ ]] || total=0
+  if (( total > 0 )); then
+    fill=$((got * width / total))
+    if (( fill > width )); then fill=$width; fi
+    pct=$((got * 100 / total))
+    if (( pct > 100 )); then pct=100; fi
+    for ((i = 0; i < width; i++)); do
+      if (( i < fill )); then bar+='#'; else bar+='-'; fi
+    done
+    printf '[%s] %3d%%  %s/%s' "$bar" "$pct" "$(human_size "$got")" "$(human_size "$total")"
+  else
+    human_size "$got"
+  fi
+}
+
+dl_draw() {
+  printf '\r\e[K%b' "$(pad "下载" 10)${ACC}$(dl_meter "$1" "$2")${RST}" >&4
+}
+
 download_install() {
-  local ver="$1" url tmp zip expect got
+  local ver="$1" url tmp zip expect got total=0 pid size=""
   detect_arch || { err "不支持 $(uname -m)"; return 1; }
   url="https://github.com/XTLS/Xray-core/releases/download/v${ver}/Xray-linux-${MACHINE}.zip"
+  kv "版本" "v${ver}"
+  kv "架构" "linux-${MACHINE}"
+  kv "文件" "Xray-linux-${MACHINE}.zip"
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' RETURN
   zip="${tmp}/xray.zip"
-  note "下载 v${ver}"
-  if ! curl -fL --retry 3 -o "$zip" "$url"; then err "下载失败"; return 1; fi
+  total=$(curl -fsSLI --retry 2 --max-time 15 "$url" 2>/dev/null | awk 'tolower($1)=="content-length:" {n=$2} END{gsub(/\r/,"",n); print n}' || true)
+  [[ "$total" =~ ^[0-9]+$ ]] || total=0
+  curl -fsSL --retry 3 -o "$zip" "$url" 2>/dev/null &
+  pid=$!
+  if ui_tty; then
+    while kill -0 "$pid" 2>/dev/null; do
+      size=$(wc -c <"$zip" 2>/dev/null || true)
+      dl_draw "${size// /}" "$total"
+      sleep 0.25
+    done
+    size=$(wc -c <"$zip" 2>/dev/null || true)
+    dl_draw "${size// /}" "$total"
+    printf '\n' >&4
+  fi
+  wait "$pid" || { err "下载失败"; return 1; }
+  if ! ui_tty; then
+    size=$(wc -c <"$zip" 2>/dev/null || true)
+    kv "大小" "$(human_size "${size// /}")"
+  fi
   if curl -fsSL -o "${zip}.dgst" "${url}.dgst"; then
     expect=$(awk -F'=' '/256=/ {gsub(/ /,"",$2); print tolower($2)}' "${zip}.dgst")
     got=$(sha256sum "$zip" | awk '{print $1}')
     if [[ -n "$expect" && "$expect" != "$got" ]]; then err "校验失败"; return 1; fi
+    kv "校验" "通过"
   else
     warn "无校验文件"
   fi
@@ -1407,7 +1463,6 @@ page_install() {
   fi
   ensure_tools || { pause; return 0; }
   ver=$(latest_version) || { err "获取版本失败"; pause; return 0; }
-  note "v${ver}"
   download_install "$ver" || { pause; return 0; }
   svc running && { act="restart"; fail="已安装，未重启"; }
   svc_wait "$act" || { warn "$fail"; return 0; }
