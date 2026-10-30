@@ -12,6 +12,14 @@ if [ -z "$BASH_VERSION" ]; then
         *)
             if ! command -v bash >/dev/null 2>&1; then
                 if [ -f /etc/alpine-release ]; then
+                    if ! wget -q -T 3 -O /dev/null "https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/APKINDEX.tar.gz" 2>/dev/null; then
+                        for m in "http://mirror.yandex.ru/mirrors/alpine" "http://mirrors.edge.kernel.org/alpine"; do
+                            if wget -q -T 3 -O /dev/null "$m/v3.21/main/x86_64/APKINDEX.tar.gz" 2>/dev/null; then
+                                sed -i "s|https\?://dl-cdn.alpinelinux.org/alpine|$m|g" /etc/apk/repositories 2>/dev/null || true
+                                break
+                            fi
+                        done
+                    fi
                     apk update >/dev/null 2>&1 && apk add bash >/dev/null 2>&1
                 elif [ -f /etc/debian_version ]; then
                     apt-get update -y >/dev/null 2>&1 && apt-get install -y bash >/dev/null 2>&1
@@ -188,6 +196,14 @@ install_deps() {
     if [ -n "$missing" ]; then
         log_info "正在安装必要依赖:${missing}..."
         if [ "$OS_TYPE" = "alpine" ]; then
+            if ! wget -q -T 3 -O /dev/null "https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/APKINDEX.tar.gz" 2>/dev/null; then
+                for m in "http://mirror.yandex.ru/mirrors/alpine" "http://mirrors.edge.kernel.org/alpine" "http://mirror.leaseweb.com/alpine"; do
+                    if wget -q -T 3 -O /dev/null "$m/v3.21/main/x86_64/APKINDEX.tar.gz" 2>/dev/null; then
+                        sed -i "s|https\?://dl-cdn.alpinelinux.org/alpine|$m|g" /etc/apk/repositories 2>/dev/null || true
+                        break
+                    fi
+                done
+            fi
             apk update >/dev/null 2>&1 && apk add curl wget unzip tar openssl jq ca-certificates procps bash >/dev/null 2>&1
         elif [ "$OS_TYPE" = "debian" ]; then
             apt-get update -y >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y curl wget unzip tar openssl jq ca-certificates procps bash >/dev/null 2>&1
@@ -198,7 +214,7 @@ install_deps() {
 
 setup_shortcut() {
     rm -f /usr/local/bin/xrsy 2>/dev/null || true
-    if [ -f "$SCRIPT_LINK" ] && [ ! -L "$SCRIPT_LINK" ]; then
+    if [ -f "$SCRIPT_LINK" ] && head -c 4 "$SCRIPT_LINK" 2>/dev/null | grep -q "ELF"; then
         mkdir -p "$XRAY_SHARE_DIR"
         mv -f "$SCRIPT_LINK" "$XRAY_BIN" 2>/dev/null || true
     fi
@@ -210,8 +226,8 @@ setup_shortcut() {
         sed -i "s|command=\"/usr/local/bin/xray\"|command=\"$XRAY_BIN\"|g" "$OPENRC_SERVICE"
     fi
     local target_script="$SCRIPT_SELF"
-    if [ -f "$target_script" ] && [ "$target_script" != "$SCRIPT_LINK" ] && [ "$(basename "$target_script")" != "bash" ] && [ "$(basename "$target_script")" != "sh" ]; then
-        ln -sf "$target_script" "$SCRIPT_LINK" 2>/dev/null || true
+    if [ -f "$target_script" ] && [ "$target_script" != "$SCRIPT_LINK" ]; then
+        cp -f "$target_script" "$SCRIPT_LINK" 2>/dev/null || true
         chmod +x "$SCRIPT_LINK" 2>/dev/null || true
     fi
 }
@@ -220,11 +236,10 @@ setup_shortcut() {
 # Service Lifecycle
 # ------------------------------------------------------------------------------
 is_installed() {
-    if [ ! -x "$XRAY_BIN" ] && [ -f "/usr/local/bin/xray" ] && [ ! -L "/usr/local/bin/xray" ]; then
-        mkdir -p "$XRAY_SHARE_DIR"
-        mv -f "/usr/local/bin/xray" "$XRAY_BIN" 2>/dev/null || true
+    if [ -f "$XRAY_BIN" ] && ! head -c 4 "$XRAY_BIN" 2>/dev/null | grep -q "ELF"; then
+        rm -f "$XRAY_BIN"
     fi
-    [ -x "$XRAY_BIN" ]
+    [ -f "$XRAY_BIN" ] && [ -x "$XRAY_BIN" ] && head -c 4 "$XRAY_BIN" 2>/dev/null | grep -q "ELF"
 }
 
 is_running() {
@@ -450,26 +465,42 @@ install_xray() {
 
 uninstall_xray() {
     header
-    log_warn "确认彻底卸载 Xray？"
-    read -rp "  › 请输入 'y' 确认: " confirm
+    echo -e "  ${C_BOLD}完全卸载 Xray${C_RESET}"
+    line
+    log_warn "该操作将停止服务并彻底删除 Xray 核心、配置文件、证书、日志及快捷指令！"
+    read -rp "  › 确认彻底卸载？[y/N]: " confirm
     [[ "$confirm" =~ ^[yY]$ ]] || { log_info "已取消卸载"; pause; return; }
 
+    log_info "正在停止 Xray 服务..."
     service_stop
+    pkill -9 -x xray-core 2>/dev/null || true
+    pkill -9 -x xray 2>/dev/null || true
+
+    log_info "正在清理系统服务配置..."
     if [ "$INIT_TYPE" = "systemd" ]; then
         systemctl disable xray >/dev/null 2>&1 || true
-        rm -f "$SYSTEMD_SERVICE" && systemctl daemon-reload
+        rm -f "$SYSTEMD_SERVICE" /etc/systemd/system/xray@.service
+        rm -rf /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl reset-failed 2>/dev/null || true
     elif [ "$INIT_TYPE" = "openrc" ]; then
         rc-update del xray default >/dev/null 2>&1 || true
+        rc-update del xray >/dev/null 2>&1 || true
         rm -f "$OPENRC_SERVICE"
     fi
-    rm -f "$XRAY_BIN" "$SCRIPT_LINK" /usr/local/bin/xrsy "$DAEMON_PID_FILE"
-    rm -rf "$XRAY_SHARE_DIR"
 
-    read -rp "  › 是否同时删除配置和证书 ($XRAY_CONFIG_DIR)？[y/N]: " del_cfg
-    [[ "$del_cfg" =~ ^[yY]$ ]] && rm -rf "$XRAY_CONFIG_DIR" "$XRAY_LOG_DIR"
+    log_info "正在完全清理程序文件、配置与证书..."
+    rm -rf "$XRAY_SHARE_DIR" "$XRAY_CONFIG_DIR" "$XRAY_LOG_DIR"
+    rm -rf /etc/xray /var/log/xray /usr/local/etc/xray /usr/local/share/xray
+    rm -f /usr/local/bin/xray-core /usr/local/bin/geoip.dat /usr/local/bin/geosite.dat
+    rm -f "$DAEMON_PID_FILE" /run/xray.pid /var/run/xray.pid
 
-    log_success "Xray 已成功卸载"
-    pause
+    log_info "正在完全删除 xray 快捷指令..."
+    rm -f "$SCRIPT_LINK" /usr/local/bin/xray /usr/local/bin/xrsy /usr/bin/xray /usr/bin/xrsy
+
+    log_success "Xray 核心、所有配置数据及快捷指令已完全卸载干净！"
+    echo ""
+    exit 0
 }
 
 # ------------------------------------------------------------------------------
@@ -921,45 +952,53 @@ list_nodes() {
 }
 
 delete_node() {
-    header
-    ! is_installed && { log_warn "未安装 Xray 核心"; pause; return; }
+    while true; do
+        header
+        ! is_installed && { log_warn "未安装 Xray 核心"; pause; return; }
 
-    local count=0
-    [ -f "$XRAY_CONFIG" ] && count=$(jq '.inbounds | length' "$XRAY_CONFIG" 2>/dev/null || echo 0)
-    [ "$count" -eq 0 ] && { log_warn "暂无可删除的节点"; pause; return; }
+        local count=0
+        [ -f "$XRAY_CONFIG" ] && count=$(jq '.inbounds | length' "$XRAY_CONFIG" 2>/dev/null || echo 0)
+        if [ "$count" -eq 0 ]; then
+            log_warn "暂无已配置的入站节点"
+            pause
+            return
+        fi
 
-    echo -e "  ${C_BOLD}删除入站节点${C_RESET}"
-    line
-    for ((i=0; i<count; i++)); do
-        local node
-        node=$(jq -c ".inbounds[$i]" "$XRAY_CONFIG" 2>/dev/null)
-        local p_port p_proto p_rmk
-        p_port=$(echo "$node" | jq -r '.port')
-        p_proto=$(echo "$node" | jq -r '._meta.protocol // .protocol')
-        p_rmk=$(echo "$node" | jq -r '._meta.remark // .tag // "Node"')
-        printf "  %2d. %-10s 端口: %-5s (%s)\n" "$((i+1))" "${p_proto^^}" "$p_port" "$p_rmk"
-    done
-    line
+        echo -e "  ${C_BOLD}删除入站节点${C_RESET}"
+        line
+        for ((i=0; i<count; i++)); do
+            local node
+            node=$(jq -c ".inbounds[$i]" "$XRAY_CONFIG" 2>/dev/null)
+            local p_port p_proto p_rmk
+            p_port=$(echo "$node" | jq -r '.port')
+            p_proto=$(echo "$node" | jq -r '._meta.protocol // .protocol')
+            p_rmk=$(echo "$node" | jq -r '._meta.remark // .tag // "Node"')
+            printf "  %2d. %-10s 端口: %-5s (%s)\n" "$((i+1))" "${p_proto^^}" "$p_port" "$p_rmk"
+        done
+        line
 
-    read -rp "  › 请输入要删除的序号 [1-$count, 回车取消]: " del_idx
-    [ -z "$del_idx" ] && return
+        read -rp "  › 请输入要删除的序号 [1-$count, 回车/0返回主界面]: " del_idx
+        [ -z "$del_idx" ] || [ "$del_idx" = "0" ] && break
 
-    if [[ "$del_idx" =~ ^[0-9]+$ ]] && [ "$del_idx" -ge 1 ] && [ "$del_idx" -le "$count" ]; then
-        local real_idx=$((del_idx - 1))
-        read -rp "  › 确认删除该节点？[y/N]: " confirm_del
-        if [[ "$confirm_del" =~ ^[yY]$ ]]; then
-            local new_config
-            new_config=$(jq --argjson idx "$real_idx" 'del(.inbounds[$idx])' "$XRAY_CONFIG")
-            if validate_and_apply_config "$new_config"; then
-                log_success "节点已删除并生效"
+        if [[ "$del_idx" =~ ^[0-9]+$ ]] && [ "$del_idx" -ge 1 ] && [ "$del_idx" -le "$count" ]; then
+            local real_idx=$((del_idx - 1))
+            read -rp "  › 确认删除该节点？[y/N]: " confirm_del
+            if [[ "$confirm_del" =~ ^[yY]$ ]]; then
+                local new_config
+                new_config=$(jq --argjson idx "$real_idx" 'del(.inbounds[$idx])' "$XRAY_CONFIG")
+                if validate_and_apply_config "$new_config"; then
+                    log_success "节点已删除并生效"
+                    sleep 1
+                fi
+            else
+                log_info "已取消删除"
+                sleep 1
             fi
         else
-            log_info "已取消删除"
+            log_warn "输入无效，请输入 1 到 $count 之间的数字"
+            sleep 1
         fi
-    else
-        log_warn "输入无效"
-    fi
-    pause
+    done
 }
 
 # ------------------------------------------------------------------------------
