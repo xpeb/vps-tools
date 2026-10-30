@@ -12,9 +12,9 @@ if [ -z "$BASH_VERSION" ]; then
         *)
             if ! command -v bash >/dev/null 2>&1; then
                 if [ -f /etc/alpine-release ]; then
-                    if ! wget -q -T 3 -O /dev/null "https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/APKINDEX.tar.gz" 2>/dev/null; then
+                    if ! wget -q -T 3 -O /dev/null "https://dl-cdn.alpinelinux.org/alpine/" 2>/dev/null; then
                         for m in "http://mirror.yandex.ru/mirrors/alpine" "http://mirrors.edge.kernel.org/alpine"; do
-                            if wget -q -T 3 -O /dev/null "$m/v3.21/main/x86_64/APKINDEX.tar.gz" 2>/dev/null; then
+                            if wget -q -T 3 -O /dev/null "$m/" 2>/dev/null; then
                                 sed -i "s|https\?://dl-cdn.alpinelinux.org/alpine|$m|g" /etc/apk/repositories 2>/dev/null || true
                                 break
                             fi
@@ -72,7 +72,7 @@ log_info()    { echo -e "  ${C_CYAN}›${C_RESET} $1"; }
 log_success() { echo -e "  ${C_GREEN}✔${C_RESET} $1"; }
 log_warn()    { echo -e "  ${C_YELLOW}!${C_RESET} $1"; }
 log_error()   { echo -e "  ${C_RED}✖${C_RESET} $1"; }
-pause()       { echo ""; read -r -p "  › 按回车键继续..." || true; }
+pause()       { echo ""; read -r -p "  › 按回车继续..." || true; }
 
 header() {
     clear 2>/dev/null || true
@@ -146,7 +146,7 @@ prompt_choice() {
 # System Detection & Dependencies
 # ------------------------------------------------------------------------------
 check_root() {
-    [ "$(id -u)" -ne 0 ] && { log_error "请使用 root 权限运行此脚本"; exit 1; }
+    [ "$(id -u)" -ne 0 ] && { log_error "需 root 权限运行"; exit 1; }
 }
 
 detect_os() {
@@ -198,11 +198,11 @@ install_deps() {
         command -v "$cmd" >/dev/null 2>&1 || missing="$missing $cmd"
     done
     if [ -n "$missing" ]; then
-        log_info "正在安装必要依赖:${missing}..."
+        log_info "安装系统依赖:${missing}..."
         if [ "$OS_TYPE" = "alpine" ]; then
-            if ! wget -q -T 3 -O /dev/null "https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/APKINDEX.tar.gz" 2>/dev/null; then
+            if ! wget -q -T 3 -O /dev/null "https://dl-cdn.alpinelinux.org/alpine/" 2>/dev/null; then
                 for m in "http://mirror.yandex.ru/mirrors/alpine" "http://mirrors.edge.kernel.org/alpine" "http://mirror.leaseweb.com/alpine"; do
-                    if wget -q -T 3 -O /dev/null "$m/v3.21/main/x86_64/APKINDEX.tar.gz" 2>/dev/null; then
+                    if wget -q -T 3 -O /dev/null "$m/" 2>/dev/null; then
                         sed -i "s|https\?://dl-cdn.alpinelinux.org/alpine|$m|g" /etc/apk/repositories 2>/dev/null || true
                         break
                     fi
@@ -212,7 +212,7 @@ install_deps() {
         elif [ "$OS_TYPE" = "debian" ]; then
             apt-get update -y >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y curl wget unzip tar openssl jq ca-certificates procps bash >/dev/null 2>&1
         fi
-        log_success "依赖安装完成"
+        log_success "依赖已就绪"
     fi
 }
 
@@ -299,15 +299,15 @@ svc() {
 
 service_start() {
     if is_running; then
-        log_info "服务已在运行中"
+        log_info "服务运行中"
         return
     fi
     svc start
     sleep 1
     if is_running; then
-        log_success "服务启动成功"
+        log_success "服务已启动"
     else
-        log_error "服务启动失败，请检查配置或日志"
+        log_error "启动失败，请检查日志"
     fi
 }
 
@@ -321,7 +321,7 @@ service_stop() {
     if ! is_running; then
         log_success "服务已停止"
     else
-        log_error "服务停止失败"
+        log_error "停止失败"
     fi
 }
 
@@ -329,9 +329,9 @@ service_restart() {
     svc restart
     sleep 1
     if is_running; then
-        log_success "服务重启成功"
+        log_success "服务已重启"
     else
-        log_error "服务重启失败，请检查日志"
+        log_error "重启失败，请检查日志"
     fi
 }
 
@@ -339,24 +339,24 @@ service_toggle_autostart() {
     if is_autostart_enabled; then
         [ "$INIT_TYPE" = "systemd" ] && systemctl disable xray >/dev/null 2>&1
         [ "$INIT_TYPE" = "openrc" ] && rc-update del xray default >/dev/null 2>&1
-        log_success "已关闭开机自启"
+        log_success "自启已关闭"
     else
         [ "$INIT_TYPE" = "systemd" ] && systemctl enable xray >/dev/null 2>&1
         [ "$INIT_TYPE" = "openrc" ] && rc-update add xray default >/dev/null 2>&1
-        log_success "已开启开机自启"
+        log_success "自启已开启"
     fi
 }
 
 view_logs() {
     header
-    echo -e "  ${C_CYAN}实时查看 Xray 日志 (按 Ctrl+C 返回菜单):${C_RESET}"
+    echo -e "  ${C_CYAN}实时日志 (Ctrl+C 返回):${C_RESET}"
     line
     if [ -f "$XRAY_ERROR_LOG" ] || [ -f "$XRAY_ACCESS_LOG" ]; then
         trap ' ' INT
         tail -n 50 -f "$XRAY_ERROR_LOG" "$XRAY_ACCESS_LOG" 2>/dev/null
         trap - INT
     else
-        log_warn "暂无日志文件 ($XRAY_LOG_DIR)"
+        log_warn "暂无日志"
         pause
     fi
 }
@@ -441,18 +441,18 @@ EOF
 
 install_xray() {
     header
-    log_info "正在获取 Xray 核心最新版本..."
+    log_info "获取最新核心版本..."
     local ver
     ver=$(get_latest_xray_version)
-    log_info "目标版本: ${C_CYAN}${ver}${C_RESET}"
+    log_info "版本: ${C_CYAN}${ver}${C_RESET}"
 
     local url="https://github.com/XTLS/Xray-core/releases/download/${ver}/Xray-linux-${ARCH}.zip"
     local tmp_dir="/tmp/xray_install_$$"
     mkdir -p "$tmp_dir" "$XRAY_SHARE_DIR"
 
-    log_info "正在下载: ${url}..."
+    log_info "下载核心组件..."
     if ! curl -sL --fail "$url" -o "$tmp_dir/xray.zip"; then
-        log_error "下载核心失败，请检查网络"
+        log_error "下载失败，请检查网络"
         rm -rf "$tmp_dir"
         pause && return 1
     fi
@@ -467,25 +467,25 @@ install_xray() {
     setup_service_units
     setup_shortcut
 
-    log_success "Xray 核心安装完成"
+    log_success "核心安装完成"
     service_restart
     pause
 }
 
 uninstall_xray() {
     header
-    echo -e "  ${C_BOLD}完全卸载 Xray${C_RESET}"
+    echo -e "  ${C_BOLD}卸载 Xray${C_RESET}"
     line
-    log_warn "该操作将停止服务并彻底删除 Xray 核心、配置文件、证书、日志及快捷指令！"
-    read -rp "  › 确认彻底卸载？[y/N]: " confirm
-    [[ "$confirm" =~ ^[yY]$ ]] || { log_info "已取消卸载"; pause; return; }
+    log_warn "将彻底清除核心、配置、证书、日志及快捷指令"
+    read -rp "  › 确认卸载？[y/N]: " confirm
+    [[ "$confirm" =~ ^[yY]$ ]] || { log_info "已取消"; pause; return; }
 
-    log_info "正在停止 Xray 服务..."
+    log_info "停止服务..."
     service_stop
     pkill -9 -x xray-core 2>/dev/null || true
     pkill -9 -x xray 2>/dev/null || true
 
-    log_info "正在清理系统服务配置..."
+    log_info "注销系统服务..."
     if [ "$INIT_TYPE" = "systemd" ]; then
         systemctl disable xray >/dev/null 2>&1 || true
         rm -f "$SYSTEMD_SERVICE" /etc/systemd/system/xray@.service
@@ -498,16 +498,16 @@ uninstall_xray() {
         rm -f "$OPENRC_SERVICE"
     fi
 
-    log_info "正在完全清理程序文件、配置与证书..."
+    log_info "清理核心与配置文件..."
     rm -rf "$XRAY_SHARE_DIR" "$XRAY_CONFIG_DIR" "$XRAY_LOG_DIR"
     rm -rf /etc/xray /var/log/xray /usr/local/etc/xray /usr/local/share/xray
     rm -f /usr/local/bin/xray-core /usr/local/bin/geoip.dat /usr/local/bin/geosite.dat
     rm -f "$DAEMON_PID_FILE" /run/xray.pid /var/run/xray.pid
 
-    log_info "正在完全删除 xray 快捷指令..."
+    log_info "清理快捷指令..."
     rm -f "$SCRIPT_LINK" /usr/local/bin/xray /usr/local/bin/xrsy /usr/bin/xray /usr/bin/xrsy
 
-    log_success "Xray 核心、所有配置数据及快捷指令已完全卸载干净！"
+    log_success "Xray 已彻底卸载"
     echo ""
     exit 0
 }
@@ -560,7 +560,7 @@ validate_and_apply_config() {
         service_restart
         return 0
     else
-        log_error "配置验证失败，已自动回退旧配置"
+        log_error "配置验证失败，已回退"
         [ -n "$err_msg" ] && echo -e "${C_GRAY}${err_msg}${C_RESET}"
         mv -f "$bak" "$XRAY_CONFIG"
         return 1
@@ -572,19 +572,19 @@ validate_and_apply_config() {
 # ------------------------------------------------------------------------------
 add_node_wizard() {
     header
-    ! is_installed && { log_warn "未检测到 Xray 核心，请先安装"; pause; return; }
+    ! is_installed && { log_warn "核心未安装，请先安装"; pause; return; }
     init_config_if_needed
 
     echo -e "  ${C_BOLD}添加入站节点${C_RESET}"
     line
 
     local p_sel="" t_sel="" s_sel="" sm_sel="" c_sel=""
-    prompt_choice "请选择代理协议" "1" p_sel \
-        "VLESS        (轻量高效，推荐)" \
-        "VMess        (经典兼容)" \
-        "Trojan       (标准 HTTPS 伪装)" \
-        "Shadowsocks  (SS-2022 及 AEAD)" \
-        "Hysteria 2   (QUIC/UDP 弱网极速加速)"
+    prompt_choice "代理协议" "1" p_sel \
+        "VLESS        (主流首选: 速度最快/抗封锁强)" \
+        "VMess        (经典协议: 兼容老旧客户端)" \
+        "Trojan       (伪装协议: 模拟标准网页访问)" \
+        "Shadowsocks  (经典协议: 游戏/路由器友好)" \
+        "Hysteria 2   (极速协议: 拯救恶劣丢包弱网)"
 
     local protocol transport="raw" security="none" path="" service_name="" sni="" pbk="" priv_key="" short_id=""
     local cert_file="" key_file="" insecure="0" ss_method="" ss_pass="" client_id="" flow=""
@@ -599,32 +599,35 @@ add_node_wizard() {
 
     # Transport & Security
     if [ "$protocol" = "vless" ]; then
-        prompt_choice "请选择传输方式" "1" t_sel \
-            "xhttp     (XHTTP 流式传输，推荐)" \
-            "grpc      (gRPC 多路复用)" \
-            "websocket (WebSocket 适合 CDN)" \
-            "tcp       (原生 TCP + REALITY Vision)"
+        prompt_choice "传输方式" "1" t_sel \
+            "xhttp     (推荐: 最新流式传输，过墙更稳)" \
+            "grpc      (多路复用)" \
+            "websocket (适合配合 CDN 反代)" \
+            "tcp       (原生 TCP)"
         case "$t_sel" in 1) transport="xhttp";; 2) transport="grpc";; 3) transport="ws";; 4) transport="tcp";; esac
 
-        prompt_choice "请选择传输安全" "1" s_sel "REALITY (免证书防探测)" "TLS (标准证书)" "None (明文反代)"
+        prompt_choice "安全协议" "1" s_sel \
+            "REALITY (推荐: 免买域名，借大厂伪装防封)" \
+            "TLS     (标准证书加密，需自行准备域名)" \
+            "None    (明文传输，适合配合 CDN 反代)"
         case "$s_sel" in 1) security="reality";; 2) security="tls";; 3) security="none";; esac
 
     elif [ "$protocol" = "vmess" ]; then
-        prompt_choice "请选择传输方式" "1" t_sel "websocket (推荐 CDN)" "grpc" "xhttp" "tcp"
+        prompt_choice "传输方式" "1" t_sel "websocket (推荐 CDN)" "grpc" "xhttp" "tcp"
         case "$t_sel" in 1) transport="ws";; 2) transport="grpc";; 3) transport="xhttp";; 4) transport="tcp";; esac
-        prompt_choice "请选择传输安全" "1" s_sel "None (用于 CDN 反代)" "TLS (标准证书)"
+        prompt_choice "安全协议" "1" s_sel "None (用于 CDN)" "TLS (标准证书)"
         case "$s_sel" in 1) security="none";; 2) security="tls";; esac
 
     elif [ "$protocol" = "trojan" ]; then
-        prompt_choice "请选择传输方式" "1" t_sel "tcp (原生标准)" "websocket" "grpc" "xhttp"
+        prompt_choice "传输方式" "1" t_sel "tcp (原生标准)" "websocket" "grpc" "xhttp"
         case "$t_sel" in 1) transport="tcp";; 2) transport="ws";; 3) transport="grpc";; 4) transport="xhttp";; esac
-        prompt_choice "请选择传输安全" "1" s_sel "TLS (证书加密)" "REALITY (免证书伪装)"
+        prompt_choice "安全协议" "1" s_sel "TLS (标准证书)" "REALITY (免证书伪装)"
         case "$s_sel" in 1) security="tls";; 2) security="reality";; esac
 
     elif [ "$protocol" = "shadowsocks" ]; then
-        prompt_choice "请选择加密算法" "1" sm_sel \
-            "2022-blake3-aes-128-gcm (SS-2022 128位)" \
-            "2022-blake3-aes-256-gcm (SS-2022 256位)" \
+        prompt_choice "加密算法" "1" sm_sel \
+            "2022-blake3-aes-128-gcm (推荐)" \
+            "2022-blake3-aes-256-gcm" \
             "aes-128-gcm" "aes-256-gcm" "chacha20-ietf-poly1305"
         case "$sm_sel" in
             1) ss_method="2022-blake3-aes-128-gcm" ;;
@@ -633,7 +636,7 @@ add_node_wizard() {
             4) ss_method="aes-256-gcm" ;;
             5) ss_method="chacha20-ietf-poly1305" ;;
         esac
-        prompt_choice "请选择传输方式" "1" t_sel "raw (原生 TCP/UDP)" "websocket" "grpc" "xhttp"
+        prompt_choice "传输方式" "1" t_sel "raw (原生 TCP/UDP)" "websocket" "grpc" "xhttp"
         case "$t_sel" in 1) transport="raw";; 2) transport="ws";; 3) transport="grpc";; 4) transport="xhttp";; esac
         security="none"
 
@@ -650,25 +653,25 @@ add_node_wizard() {
 
     local port
     while true; do
-        prompt_input "请输入监听端口" "$def_port" port
+        prompt_input "监听端口" "$def_port" port
         if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
             if is_port_used "$port"; then
-                log_warn "端口 $port 疑似已被占用"
-                read -rp "  › 是否强制使用？[y/N]: " f_port
+                log_warn "端口 $port 已被占用"
+                read -rp "  › 强制使用？[y/N]: " f_port
                 [[ "$f_port" =~ ^[yY]$ ]] && break
             else
                 break
             fi
         else
-            log_warn "端口必须为 1-65535 的整数"
+            log_warn "无效端口 (1-65535)"
         fi
     done
 
     # Credentials
     if [ "$protocol" = "vless" ] || [ "$protocol" = "vmess" ]; then
-        prompt_input "请输入用户 UUID" "$(rand_uuid)" client_id
+        prompt_input "用户 UUID" "$(rand_uuid)" client_id
     elif [ "$protocol" = "trojan" ] || [ "$protocol" = "hysteria" ]; then
-        prompt_input "请输入认证密码" "$(rand_str 16)" client_id
+        prompt_input "认证密码" "$(rand_str 16)" client_id
     elif [ "$protocol" = "shadowsocks" ]; then
         if [ "$ss_method" = "2022-blake3-aes-128-gcm" ]; then
             ss_pass=$(openssl rand -base64 16)
@@ -677,18 +680,18 @@ add_node_wizard() {
         else
             ss_pass=$(rand_str 16)
         fi
-        prompt_input "请输入密码/PSK" "$ss_pass" ss_pass
+        prompt_input "密码/PSK" "$ss_pass" ss_pass
     fi
 
     # Transport Path / ServiceName
-    [ "$transport" = "xhttp" ] && prompt_input "请输入 XHTTP 分流路径" "/$(rand_str 8)" path
-    [ "$transport" = "ws" ] && prompt_input "请输入 WebSocket 分流路径" "/$(rand_str 8)" path
-    [ "$transport" = "ws" ] && [ "$security" = "none" ] && prompt_input "请输入 CDN 伪装域名/Host (可选直接回车)" "" sni
-    [ "$transport" = "grpc" ] && prompt_input "请输入 gRPC serviceName" "grpc-$(rand_str 6)" service_name
+    [ "$transport" = "xhttp" ] && prompt_input "分流路径" "/$(rand_str 8)" path
+    [ "$transport" = "ws" ] && prompt_input "分流路径" "/$(rand_str 8)" path
+    [ "$transport" = "ws" ] && [ "$security" = "none" ] && prompt_input "CDN 伪装域名/Host (可选)" "" sni
+    [ "$transport" = "grpc" ] && prompt_input "gRPC serviceName" "grpc-$(rand_str 6)" service_name
 
     # Security (REALITY / TLS)
     if [ "$security" = "reality" ]; then
-        prompt_input "请输入 REALITY 伪装域名 (SNI)" "www.apple.com" sni
+        prompt_input "REALITY 伪装域名 (SNI)" "www.apple.com" sni
         local x_out
         x_out=$("$XRAY_BIN" x25519 2>/dev/null || echo "")
         priv_key=$(echo "$x_out" | grep -i "PrivateKey:" | awk '{print $NF}')
@@ -699,24 +702,24 @@ add_node_wizard() {
         [ "$protocol" = "vless" ] && [ "$transport" = "tcp" ] && flow="xtls-rprx-vision"
 
     elif [ "$security" = "tls" ]; then
-        prompt_choice "请选择 TLS 证书" "1" c_sel "自动生成自签名 EC 证书 (零门槛)" "使用已有自定义证书文件"
+        prompt_choice "TLS 证书类型" "1" c_sel "自动生成自签名 EC 证书" "指定已有证书文件路径"
         if [ "$c_sel" = "1" ]; then
-            prompt_input "请输入伪装域名 (SNI)" "www.cloudflare.com" sni
+            prompt_input "伪装域名 (SNI)" "www.cloudflare.com" sni
             generate_self_signed_cert "$sni"
             cert_file="$XRAY_CERTS_DIR/self_signed.crt"
             key_file="$XRAY_CERTS_DIR/self_signed.key"
             insecure="1"
         else
-            prompt_input "请输入域名 (SNI)" "example.com" sni
-            prompt_input "请输入证书 .crt 绝对路径" "/root/cert.crt" cert_file
-            prompt_input "请输入私钥 .key 绝对路径" "/root/private.key" key_file
+            prompt_input "域名 (SNI)" "example.com" sni
+            prompt_input "证书 .crt 绝对路径" "/root/cert.crt" cert_file
+            prompt_input "私钥 .key 绝对路径" "/root/private.key" key_file
             insecure="0"
         fi
         [ "$protocol" = "vless" ] && [ "$transport" = "tcp" ] && flow="xtls-rprx-vision"
     fi
 
     local remark
-    prompt_input "请输入节点备注" "${protocol^^}-${transport^^}-${port}" remark
+    prompt_input "节点备注" "${protocol^^}-${transport^^}-${port}" remark
 
     # Construct JSON Objects
     local stream_settings
@@ -768,7 +771,7 @@ add_node_wizard() {
     local new_config
     new_config=$(jq --argjson inb "$inbound_obj" '.inbounds += [$inb]' "$XRAY_CONFIG")
 
-    log_info "正在验证并生效配置..."
+    log_info "验证并应用配置..."
     if validate_and_apply_config "$new_config"; then
         log_success "节点已添加并生效"
         view_node_detail "$(($(jq '.inbounds | length' "$XRAY_CONFIG") - 1))"
@@ -890,11 +893,11 @@ view_node_detail() {
     [ "$meta_proto" = "hysteria" ] && echo -e "  ${C_GRAY}兼容链接 (hy2://):${C_RESET}\n  ${C_CYAN}${share_link/hysteria2:\/\//hy2:\/\/}${C_RESET}"
 
     line
-    echo -e "  ${C_CYAN}1.${C_RESET} 导出客户端配置 JSON    ${C_GRAY}0. 返回列表 (回车)${C_RESET}"
+    echo -e "  ${C_CYAN}1.${C_RESET} 查看客户端 JSON 配置    ${C_GRAY}0. 返回列表 (回车)${C_RESET}"
     read -rp "  › 请选择操作 [0]: " opt
     if [ "$opt" = "1" ]; then
         line
-        echo -e "  ${C_BOLD}Xray 客户端 Outbound 配置片段:${C_RESET}"
+        echo -e "  ${C_BOLD}客户端 Outbound 配置:${C_RESET}"
         echo "$node" | jq \
             --arg ip "$SERVER_IP" --arg pbk "$meta_pbk" --arg sid "$meta_sid" --arg sni "$meta_sni" \
             '{
@@ -919,11 +922,11 @@ view_node_detail() {
 list_nodes() {
     while true; do
         header
-        ! is_installed && { log_warn "未安装 Xray 核心"; pause; return; }
+        ! is_installed && { log_warn "核心未安装"; pause; return; }
 
         local count=0
         [ -f "$XRAY_CONFIG" ] && count=$(jq '.inbounds | length' "$XRAY_CONFIG" 2>/dev/null || echo 0)
-        [ "$count" -eq 0 ] && { log_warn "暂无已配置的入站节点"; pause; return; }
+        [ "$count" -eq 0 ] && { log_warn "暂无节点"; pause; return; }
 
         printf "  ${C_GRAY}%-4s  %-14s  %-9s  %-12s  %-11s  %s${C_RESET}\n" "#" "协议" "端口" "传输" "安全" "备注"
         line
@@ -937,7 +940,7 @@ list_nodes() {
         done < <(jq -r '.inbounds[] | "\(.port)|\(._meta.protocol // .protocol)|\(._meta.transport // .streamSettings.network // "raw")|\(._meta.security // .streamSettings.security // "none")|\(._meta.remark // .tag // "Node")"' "$XRAY_CONFIG" 2>/dev/null)
 
         line
-        read -rp "  › 请输入节点编号查看详情 [1-$count, 回车返回]: " node_choice
+        read -rp "  › 请输入节点编号 [1-$count, 回车返回]: " node_choice
         [ -z "$node_choice" ] || [ "$node_choice" = "0" ] && break
 
         if [[ "$node_choice" =~ ^[0-9]+$ ]] && [ "$node_choice" -ge 1 ] && [ "$node_choice" -le "$count" ]; then
@@ -951,14 +954,12 @@ list_nodes() {
 delete_node() {
     while true; do
         header
-        ! is_installed && { log_warn "未安装 Xray 核心"; pause; return; }
+        ! is_installed && { log_warn "核心未安装"; pause; return; }
 
         local count=0
         [ -f "$XRAY_CONFIG" ] && count=$(jq '.inbounds | length' "$XRAY_CONFIG" 2>/dev/null || echo 0)
         if [ "$count" -eq 0 ]; then
-            log_warn "暂无已配置的入站节点"
-            pause
-            return
+            log_warn "暂无节点"; pause; return;
         fi
 
         echo -e "  ${C_BOLD}删除入站节点${C_RESET}"
@@ -971,25 +972,25 @@ delete_node() {
         done < <(jq -r '.inbounds[] | "\(.port)|\(._meta.protocol // .protocol)|\(._meta.remark // .tag // "Node")"' "$XRAY_CONFIG" 2>/dev/null)
         line
 
-        read -rp "  › 请输入要删除的序号 [1-$count, 回车/0返回主界面]: " del_idx
+        read -rp "  › 请输入要删除的编号 [1-$count, 回车返回]: " del_idx
         [ -z "$del_idx" ] || [ "$del_idx" = "0" ] && break
 
         if [[ "$del_idx" =~ ^[0-9]+$ ]] && [ "$del_idx" -ge 1 ] && [ "$del_idx" -le "$count" ]; then
             local real_idx=$((del_idx - 1))
-            read -rp "  › 确认删除该节点？[y/N]: " confirm_del
+            read -rp "  › 确认删除？[y/N]: " confirm_del
             if [[ "$confirm_del" =~ ^[yY]$ ]]; then
                 local new_config
                 new_config=$(jq --argjson idx "$real_idx" 'del(.inbounds[$idx])' "$XRAY_CONFIG")
                 if validate_and_apply_config "$new_config"; then
-                    log_success "节点已删除并生效"
+                    log_success "节点已删除"
                     sleep 1
                 fi
             else
-                log_info "已取消删除"
+                log_info "已取消"
                 sleep 1
             fi
         else
-            log_warn "输入无效，请输入 1 到 $count 之间的数字"
+            log_warn "输入无效 (1-$count)"
             sleep 1
         fi
     done
@@ -1000,17 +1001,17 @@ delete_node() {
 # ------------------------------------------------------------------------------
 enable_bbr() {
     header
-    echo -e "  ${C_BOLD}开启 BBR 拥塞控制${C_RESET}"
+    echo -e "  ${C_BOLD}BBR 拥塞控制${C_RESET}"
     line
 
     local current_cc
     current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || echo "")
     if [ "$current_cc" = "bbr" ]; then
-        log_success "系统已处于 BBR 状态，无需重复配置"
+        log_success "BBR 处于开启状态"
         pause && return
     fi
 
-    log_info "正在配置 BBR 内核参数..."
+    log_info "配置 BBR 内核参数..."
     modprobe tcp_bbr 2>/dev/null || true
 
     local sysctl_file="/etc/sysctl.d/99-bbr.conf"
@@ -1026,7 +1027,7 @@ enable_bbr() {
     if [ "$new_cc" = "bbr" ]; then
         log_success "BBR 开启成功"
     else
-        log_warn "已写入参数，当前状态: $new_cc"
+        log_warn "已应用，当前算法: $new_cc"
     fi
     pause
 }
@@ -1071,11 +1072,11 @@ main() {
             11) uninstall_xray ;;
             0|q|exit)
                 clear 2>/dev/null || true
-                echo -e "\n  ${C_CYAN}感谢使用 Xray 管理脚本，再见！${C_RESET}\n"
+                echo -e "\n  ${C_CYAN}已退出 Xray 管理面板${C_RESET}\n"
                 exit 0
                 ;;
             *)
-                log_warn "输入无效，请重新选择" && sleep 1
+                log_warn "输入无效" && sleep 1
                 ;;
         esac
     done
