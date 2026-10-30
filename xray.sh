@@ -7,8 +7,8 @@
 # ==============================================================================
 
 if [ -z "$BASH_VERSION" ]; then
-    case "$0" in
-        *bash|*sh) ;;
+    case "$(basename "$0")" in
+        sh|bash|ash|-sh|-bash|-ash) ;;
         *)
             if ! command -v bash >/dev/null 2>&1; then
                 if [ -f /etc/alpine-release ]; then
@@ -45,11 +45,11 @@ SCRIPT_LINK="/usr/local/bin/xray"
 
 # Colors & Formatting
 if [ -t 1 ]; then
-    C_RESET="\033[0m" C_BOLD="\033[1m" C_DIM="\033[2m"
-    C_CYAN="\033[36m" C_GREEN="\033[32m" C_YELLOW="\033[33m"
-    C_RED="\033[31m" C_GRAY="\033[90m"
+    C_RESET=$'\033[0m' C_BOLD=$'\033[1m'
+    C_CYAN=$'\033[36m' C_GREEN=$'\033[32m' C_YELLOW=$'\033[33m'
+    C_RED=$'\033[31m' C_GRAY=$'\033[90m'
 else
-    C_RESET="" C_BOLD="" C_DIM="" C_CYAN="" C_GREEN="" C_YELLOW="" C_RED="" C_GRAY=""
+    C_RESET="" C_BOLD="" C_CYAN="" C_GREEN="" C_YELLOW="" C_RED="" C_GRAY=""
 fi
 
 # ------------------------------------------------------------------------------
@@ -60,7 +60,7 @@ log_info()    { echo -e "  ${C_CYAN}›${C_RESET} $1"; }
 log_success() { echo -e "  ${C_GREEN}✔${C_RESET} $1"; }
 log_warn()    { echo -e "  ${C_YELLOW}!${C_RESET} $1"; }
 log_error()   { echo -e "  ${C_RED}✖${C_RESET} $1"; }
-pause()       { echo ""; read -rp "  › 按回车键继续..." dummy; }
+pause()       { echo ""; read -r -p "  › 按回车键继续..." || true; }
 
 header() {
     clear 2>/dev/null || true
@@ -95,34 +95,37 @@ header() {
 prompt_input() {
     local prompt="$1" default_val="$2" var_name="$3" user_val=""
     if [ -n "$default_val" ]; then
-        read -rp "  › ${prompt} [${C_CYAN}${default_val}${C_RESET}]: " user_val
+        echo -ne "  › ${prompt} [${C_CYAN}${default_val}${C_RESET}]: "
+        read -r user_val
         [ -z "$user_val" ] && user_val="$default_val"
     else
-        read -rp "  › ${prompt}: " user_val
+        echo -ne "  › ${prompt}: "
+        read -r user_val
     fi
-    eval "$var_name=\"\$user_val\""
+    printf -v "$var_name" '%s' "$user_val"
 }
 
 prompt_choice() {
     local prompt="$1" default_idx="$2" var_name="$3"; shift 3
-    local options=("$@")
     echo -e "  › ${C_BOLD}${prompt}:${C_RESET}"
-    for i in "${!options[@]}"; do
-        local idx=$((i + 1))
+    local idx=1
+    for opt in "$@"; do
         if [ "$idx" -eq "$default_idx" ]; then
-            echo -e "    ${C_CYAN}${idx}.${C_RESET} ${options[i]} ${C_GRAY}(默认)${C_RESET}"
+            echo -e "    ${C_CYAN}${idx}.${C_RESET} ${opt} ${C_GRAY}(默认)${C_RESET}"
         else
-            echo -e "    ${C_GRAY}${idx}.${C_RESET} ${options[i]}"
+            echo -e "    ${C_GRAY}${idx}.${C_RESET} ${opt}"
         fi
+        idx=$((idx + 1))
     done
+    local total=$#
     while true; do
-        read -rp "  › 请选择 [1-${#options[@]}, 默认: ${default_idx}]: " choice
+        read -rp "  › 请选择 [1-${total}, 默认: ${default_idx}]: " choice
         [ -z "$choice" ] && choice="$default_idx"
-        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#options[@]}" ]; then
-            eval "$var_name=\"\$choice\""
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$total" ]; then
+            printf -v "$var_name" '%s' "$choice"
             break
         else
-            log_warn "输入无效，请输入 1 到 ${#options[@]}"
+            log_warn "输入无效，请输入 1 到 ${total}"
         fi
     done
 }
@@ -178,12 +181,12 @@ get_public_ip() {
 }
 
 install_deps() {
-    local missing=()
+    local missing=""
     for cmd in curl wget unzip tar openssl jq; do
-        command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+        command -v "$cmd" >/dev/null 2>&1 || missing="$missing $cmd"
     done
-    if [ ${#missing[@]} -gt 0 ]; then
-        log_info "正在安装必要依赖: ${missing[*]}..."
+    if [ -n "$missing" ]; then
+        log_info "正在安装必要依赖:${missing}..."
         if [ "$OS_TYPE" = "alpine" ]; then
             apk update >/dev/null 2>&1 && apk add curl wget unzip tar openssl jq ca-certificates procps bash >/dev/null 2>&1
         elif [ "$OS_TYPE" = "debian" ]; then
@@ -207,7 +210,7 @@ setup_shortcut() {
         sed -i "s|command=\"/usr/local/bin/xray\"|command=\"$XRAY_BIN\"|g" "$OPENRC_SERVICE"
     fi
     local target_script="$SCRIPT_SELF"
-    if [ -f "$target_script" ] && [ "$(basename "$target_script")" != "bash" ] && [ "$(basename "$target_script")" != "sh" ]; then
+    if [ -f "$target_script" ] && [ "$target_script" != "$SCRIPT_LINK" ] && [ "$(basename "$target_script")" != "bash" ] && [ "$(basename "$target_script")" != "sh" ]; then
         ln -sf "$target_script" "$SCRIPT_LINK" 2>/dev/null || true
         chmod +x "$SCRIPT_LINK" 2>/dev/null || true
     fi
@@ -257,8 +260,11 @@ svc() {
                 echo $! > "$DAEMON_PID_FILE"
                 ;;
             stop)
-                [ -f "$DAEMON_PID_FILE" ] && kill "$(cat "$DAEMON_PID_FILE" 2>/dev/null)" 2>/dev/null || true
-                rm -f "$DAEMON_PID_FILE"; pkill -x xray-core 2>/dev/null || true
+                if [ -f "$DAEMON_PID_FILE" ]; then
+                    kill "$(cat "$DAEMON_PID_FILE" 2>/dev/null)" 2>/dev/null || true
+                    rm -f "$DAEMON_PID_FILE"
+                fi
+                pkill -x xray-core 2>/dev/null || true
                 ;;
             restart)
                 svc stop; sleep 1; svc start
@@ -268,20 +274,41 @@ svc() {
 }
 
 service_start() {
-    is_running && { log_info "服务已在运行中"; return; }
-    svc start; sleep 1
-    is_running && log_success "服务启动成功" || log_error "服务启动失败，请检查配置或日志"
+    if is_running; then
+        log_info "服务已在运行中"
+        return
+    fi
+    svc start
+    sleep 1
+    if is_running; then
+        log_success "服务启动成功"
+    else
+        log_error "服务启动失败，请检查配置或日志"
+    fi
 }
 
 service_stop() {
-    ! is_running && { log_info "服务未运行"; return; }
-    svc stop; sleep 1
-    ! is_running && log_success "服务已停止" || log_error "服务停止失败"
+    if ! is_running; then
+        log_info "服务未运行"
+        return
+    fi
+    svc stop
+    sleep 1
+    if ! is_running; then
+        log_success "服务已停止"
+    else
+        log_error "服务停止失败"
+    fi
 }
 
 service_restart() {
-    svc restart; sleep 1
-    is_running && log_success "服务重启成功" || log_error "服务重启失败，请检查日志"
+    svc restart
+    sleep 1
+    if is_running; then
+        log_success "服务重启成功"
+    else
+        log_error "服务重启失败，请检查日志"
+    fi
 }
 
 service_toggle_autostart() {
@@ -359,7 +386,8 @@ LimitNOFILE=1000000
 [Install]
 WantedBy=multi-user.target
 EOF
-        systemctl daemon-reload && systemctl enable xray >/dev/null 2>&1 || true
+        systemctl daemon-reload
+        systemctl enable xray >/dev/null 2>&1 || true
     elif [ "$INIT_TYPE" = "openrc" ]; then
         cat << EOF > "$OPENRC_SERVICE"
 #!/sbin/openrc-run
@@ -450,7 +478,7 @@ uninstall_xray() {
 rand_port() {
     local p
     while true; do
-        p=$(( RANDOM % 50000 + 10000 ))
+        p=$(shuf -i 10000-60000 -n 1 2>/dev/null || awk 'BEGIN{srand(); print int(rand()*50000)+10000}')
         ! is_port_used "$p" && { echo "$p"; break; }
     done
 }
@@ -468,8 +496,8 @@ base64_encode() { echo -n "$1" | base64 | tr -d '\r\n'; }
 is_port_used() {
     local port="$1"
     [ -f "$XRAY_CONFIG" ] && jq -e --argjson p "$port" '.inbounds[]? | select(.port == $p)' "$XRAY_CONFIG" >/dev/null 2>&1 && return 0
-    command -v ss >/dev/null 2>&1 && ss -tunlp 2>/dev/null | grep -qw ":$port" && return 0
-    command -v netstat >/dev/null 2>&1 && netstat -tunlp 2>/dev/null | grep -qw ":$port" && return 0
+    command -v ss >/dev/null 2>&1 && ss -tunlp 2>/dev/null | grep -E -q "[:]$port([[:space:]]|$)" && return 0
+    command -v netstat >/dev/null 2>&1 && netstat -tunlp 2>/dev/null | grep -E -q "[:]$port([[:space:]]|$)" && return 0
     return 1
 }
 
@@ -484,15 +512,16 @@ generate_self_signed_cert() {
 }
 
 validate_and_apply_config() {
-    local new_config="$1" bak="$XRAY_CONFIG.bak"
+    local new_config="$1" bak="$XRAY_CONFIG.bak" err_msg
     cp "$XRAY_CONFIG" "$bak"
     echo "$new_config" > "$XRAY_CONFIG"
-    if "$XRAY_BIN" run -test -c "$XRAY_CONFIG" >/dev/null 2>&1; then
+    if err_msg=$("$XRAY_BIN" run -test -c "$XRAY_CONFIG" 2>&1); then
         rm -f "$bak"
         service_restart
         return 0
     else
         log_error "配置验证失败，已自动回退旧配置"
+        [ -n "$err_msg" ] && echo -e "${C_GRAY}${err_msg}${C_RESET}"
         mv -f "$bak" "$XRAY_CONFIG"
         return 1
     fi
@@ -509,6 +538,7 @@ add_node_wizard() {
     echo -e "  ${C_BOLD}添加入站节点${C_RESET}"
     line
 
+    local p_sel="" t_sel="" s_sel="" sm_sel="" c_sel=""
     prompt_choice "请选择代理协议" "1" p_sel \
         "VLESS        (轻量高效，推荐)" \
         "VMess        (经典兼容)" \
@@ -613,6 +643,7 @@ add_node_wizard() {
     # Transport Path / ServiceName
     [ "$transport" = "xhttp" ] && prompt_input "请输入 XHTTP 分流路径" "/$(rand_str 8)" path
     [ "$transport" = "ws" ] && prompt_input "请输入 WebSocket 分流路径" "/$(rand_str 8)" path
+    [ "$transport" = "ws" ] && [ "$security" = "none" ] && prompt_input "请输入 CDN 伪装域名/Host (可选直接回车)" "" sni
     [ "$transport" = "grpc" ] && prompt_input "请输入 gRPC serviceName" "grpc-$(rand_str 6)" service_name
 
     # Security (REALITY / TLS)
@@ -654,8 +685,8 @@ add_node_wizard() {
         --arg dest "${sni}:443" --arg sni "$sni" --arg pk "$priv_key" --arg sid "$short_id" \
         --arg crt "$cert_file" --arg key "$key_file" \
         '{network: $net} +
-        (if $net == "xhttp" then {xhttpSettings: {path: $path, mode: "auto"}}
-         elif $net == "ws" then {wsSettings: {path: $path}}
+        (if $net == "xhttp" then {xhttpSettings: {path: $path}}
+         elif $net == "ws" then {wsSettings: ({path: $path} + (if $sni != "" then {host: $sni} else {} end))}
          elif $net == "grpc" then {grpcSettings: {serviceName: $svc}}
          elif $net == "hysteria" then {hysteriaSettings: {version: 2}}
          else {} end) +
@@ -666,15 +697,15 @@ add_node_wizard() {
     local settings
     if [ "$protocol" = "vless" ]; then
         settings=$(jq -c -n --arg id "$client_id" --arg flow "$flow" \
-            '{clients: ([{id: $id} + (if $flow != "" then {flow: $flow} else {} end)]), decryption: "none"}')
+            '{users: ([{id: $id} + (if $flow != "" then {flow: $flow} else {} end)]), decryption: "none"}')
     elif [ "$protocol" = "vmess" ]; then
-        settings=$(jq -c -n --arg id "$client_id" '{clients: [{id: $id, alterId: 0}]}')
+        settings=$(jq -c -n --arg id "$client_id" '{users: [{id: $id}]}')
     elif [ "$protocol" = "trojan" ]; then
-        settings=$(jq -c -n --arg pwd "$client_id" '{clients: [{password: $pwd}]}')
+        settings=$(jq -c -n --arg pwd "$client_id" '{users: [{password: $pwd}]}')
     elif [ "$protocol" = "shadowsocks" ]; then
-        settings=$(jq -c -n --arg m "$ss_method" --arg p "$ss_pass" '{method: $m, password: $p, network: "tcp,udp"}')
+        settings=$(jq -c -n --arg m "$ss_method" --arg p "$ss_pass" '{network: "tcp,udp", method: $m, password: $p}')
     elif [ "$protocol" = "hysteria" ]; then
-        settings=$(jq -c -n --arg auth "$client_id" '{version: 2, clients: [{auth: $auth}]}')
+        settings=$(jq -c -n --arg auth "$client_id" '{version: 2, users: [{auth: $auth}]}')
     fi
 
     local inbound_obj
@@ -714,16 +745,16 @@ get_node_share_link() {
     node=$(jq -c ".inbounds[$idx]" "$XRAY_CONFIG" 2>/dev/null)
     [ -z "$node" ] && return
 
-    local proto port meta_proto meta_trans meta_sec meta_rmk meta_path meta_svc meta_sni meta_pbk meta_sid meta_insec meta_flow id_or_pwd
-    IFS='|' read -r proto port meta_proto meta_trans meta_sec meta_rmk meta_path meta_svc meta_sni meta_pbk meta_sid meta_insec meta_flow id_or_pwd < <(
+    local port meta_proto meta_trans meta_sec meta_rmk meta_path meta_svc meta_sni meta_pbk meta_sid meta_insec meta_flow id_or_pwd
+    IFS='|' read -r _ port meta_proto meta_trans meta_sec meta_rmk meta_path meta_svc meta_sni meta_pbk meta_sid meta_insec meta_flow id_or_pwd < <(
         echo "$node" | jq -r '[
             .protocol, (.port | tostring), (._meta.protocol // .protocol),
             (._meta.transport // .streamSettings.network // "raw"), (._meta.security // .streamSettings.security // "none"),
             (._meta.remark // .tag // "Node"), (._meta.path // .streamSettings.xhttpSettings.path // .streamSettings.wsSettings.path // ""),
             (._meta.serviceName // .streamSettings.grpcSettings.serviceName // ""), (._meta.sni // .streamSettings.realitySettings.serverNames[0] // ""),
             (._meta.publicKey // ""), (._meta.shortId // .streamSettings.realitySettings.shortIds[0] // ""), (._meta.insecure // "0"),
-            (._meta.flow // .settings.clients[0].flow // ""),
-            (.settings.clients[0].id // .settings.clients[0].password // .settings.clients[0].auth // .settings.password // "")
+            (._meta.flow // .settings.users[0].flow // .settings.clients[0].flow // ""),
+            (.settings.users[0].id // .settings.clients[0].id // .settings.users[0].password // .settings.clients[0].password // .settings.users[0].auth // .settings.clients[0].auth // .settings.password // "")
         ] | join("|")'
     )
 
@@ -736,7 +767,7 @@ get_node_share_link() {
             [ "$meta_sec" = "reality" ] && link="${link}&pbk=${meta_pbk}&fp=chrome&sni=${meta_sni}&sid=${meta_sid}"
             [ "$meta_sec" = "tls" ] && link="${link}&fp=chrome&sni=${meta_sni}"
             [ "$meta_trans" = "xhttp" ] && link="${link}&path=${enc_path}&mode=auto"
-            [ "$meta_trans" = "ws" ] && link="${link}&path=${enc_path}&host=${meta_sni}"
+            [ "$meta_trans" = "ws" ] && link="${link}&path=${enc_path}" && [ -n "$meta_sni" ] && link="${link}&host=${meta_sni}"
             [ "$meta_trans" = "grpc" ] && link="${link}&serviceName=${meta_svc}&mode=gun"
             [ "$meta_trans" = "tcp" ] && [ -n "$meta_flow" ] && link="${link}&flow=${meta_flow}"
             link="${link}#${enc_rmk}"
@@ -756,7 +787,7 @@ get_node_share_link() {
         trojan)
             link="trojan://${id_or_pwd}@${SERVER_IP}:${port}?security=${meta_sec}&sni=${meta_sni}&type=${meta_trans}"
             [ "$meta_sec" = "reality" ] && link="${link}&pbk=${meta_pbk}&sid=${meta_sid}&fp=chrome"
-            [ "$meta_trans" = "ws" ] && link="${link}&path=${enc_path}&host=${meta_sni}"
+            [ "$meta_trans" = "ws" ] && link="${link}&path=${enc_path}" && [ -n "$meta_sni" ] && link="${link}&host=${meta_sni}"
             [ "$meta_trans" = "grpc" ] && link="${link}&serviceName=${meta_svc}"
             [ "$meta_trans" = "xhttp" ] && link="${link}&path=${enc_path}"
             link="${link}#${enc_rmk}"
@@ -778,16 +809,16 @@ view_node_detail() {
     node=$(jq -c ".inbounds[$idx]" "$XRAY_CONFIG" 2>/dev/null)
     [ -z "$node" ] || [ "$node" = "null" ] && { log_error "节点不存在"; pause; return; }
 
-    local proto port meta_proto meta_trans meta_sec meta_rmk meta_path meta_svc meta_sni meta_pbk meta_sid meta_insec meta_flow id_or_pwd
-    IFS='|' read -r proto port meta_proto meta_trans meta_sec meta_rmk meta_path meta_svc meta_sni meta_pbk meta_sid meta_insec meta_flow id_or_pwd < <(
+    local port meta_proto meta_trans meta_sec meta_rmk meta_path meta_svc meta_sni meta_pbk meta_sid meta_insec meta_flow id_or_pwd
+    IFS='|' read -r _ port meta_proto meta_trans meta_sec meta_rmk meta_path meta_svc meta_sni meta_pbk meta_sid meta_insec meta_flow id_or_pwd < <(
         echo "$node" | jq -r '[
             .protocol, (.port | tostring), (._meta.protocol // .protocol),
             (._meta.transport // .streamSettings.network // "raw"), (._meta.security // .streamSettings.security // "none"),
             (._meta.remark // .tag // "Node"), (._meta.path // .streamSettings.xhttpSettings.path // .streamSettings.wsSettings.path // ""),
             (._meta.serviceName // .streamSettings.grpcSettings.serviceName // ""), (._meta.sni // .streamSettings.realitySettings.serverNames[0] // ""),
             (._meta.publicKey // ""), (._meta.shortId // .streamSettings.realitySettings.shortIds[0] // ""), (._meta.insecure // "0"),
-            (._meta.flow // .settings.clients[0].flow // ""),
-            (.settings.clients[0].id // .settings.clients[0].password // .settings.clients[0].auth // .settings.password // "")
+            (._meta.flow // .settings.users[0].flow // .settings.clients[0].flow // ""),
+            (.settings.users[0].id // .settings.clients[0].id // .settings.users[0].password // .settings.clients[0].password // .settings.users[0].auth // .settings.clients[0].auth // .settings.password // "")
         ] | join("|")'
     )
 
@@ -834,16 +865,18 @@ view_node_detail() {
             --arg ip "$SERVER_IP" --arg pbk "$meta_pbk" --arg sid "$meta_sid" --arg sni "$meta_sni" \
             '{
                 tag: ("proxy-" + .protocol), protocol: .protocol,
-                settings: (if .protocol == "vless" then {vnext: [{address: $ip, port: .port, users: [{id: .settings.clients[0].id, encryption: "none"}]}]}
-                           elif .protocol == "vmess" then {vnext: [{address: $ip, port: .port, users: [{id: .settings.clients[0].id, alterId: 0}]}]}
-                           elif .protocol == "trojan" then {servers: [{address: $ip, port: .port, password: .settings.clients[0].password}]}
+                settings: (if .protocol == "vless" then {vnext: [{address: $ip, port: .port, users: [{id: (.settings.users[0].id // .settings.clients[0].id), encryption: "none"} + (if (._meta.flow // "") != "" then {flow: ._meta.flow} else {} end)]}]}
+                           elif .protocol == "vmess" then {vnext: [{address: $ip, port: .port, users: [{id: (.settings.users[0].id // .settings.clients[0].id), alterId: 0}]}]}
+                           elif .protocol == "trojan" then {servers: [{address: $ip, port: .port, password: (.settings.users[0].password // .settings.clients[0].password)}]}
                            elif .protocol == "shadowsocks" then {servers: [{address: $ip, port: .port, method: .settings.method, password: .settings.password}]}
                            elif .protocol == "hysteria" then {version: 2, address: $ip, port: .port}
                            else .settings end),
                 streamSettings: (.streamSettings |
                     if .security == "reality" then .realitySettings = {serverName: $sni, fingerprint: "chrome", show: false, publicKey: $pbk, shortId: $sid}
-                    elif .security == "tls" then .tlsSettings = {serverName: $sni}
-                    else . end)
+                    elif .security == "tls" then .tlsSettings = ({serverName: $sni} + (if .network == "hysteria" then {alpn: ["h3"]} else {} end))
+                    else . end |
+                    if .network == "hysteria" then .hysteriaSettings = {version: 2, auth: (.. | .auth? // empty)} else . end
+                )
             }'
         pause
     fi
@@ -917,7 +950,9 @@ delete_node() {
         if [[ "$confirm_del" =~ ^[yY]$ ]]; then
             local new_config
             new_config=$(jq --argjson idx "$real_idx" 'del(.inbounds[$idx])' "$XRAY_CONFIG")
-            validate_and_apply_config "$new_config" && log_success "节点已删除并生效"
+            if validate_and_apply_config "$new_config"; then
+                log_success "节点已删除并生效"
+            fi
         else
             log_info "已取消删除"
         fi
@@ -955,7 +990,11 @@ enable_bbr() {
 
     local new_cc
     new_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || echo "")
-    [ "$new_cc" = "bbr" ] && log_success "BBR 开启成功" || log_warn "已写入参数，当前状态: $new_cc"
+    if [ "$new_cc" = "bbr" ]; then
+        log_success "BBR 开启成功"
+    else
+        log_warn "已写入参数，当前状态: $new_cc"
+    fi
     pause
 }
 
@@ -983,10 +1022,8 @@ main() {
         echo -e "   ${C_CYAN}4.${C_RESET} 安装/更新核心   ${C_CYAN}8.${C_RESET} 实时日志    ${C_CYAN} 0.${C_RESET} 退出面板"
         line
 
-        if ! read -rp "  › 请选择操作 [0-11]: " choice; then
-            echo ""
-            exit 0
-        fi
+        read -rp "  › 请选择操作 [0-11]: " choice || exit 0
+        [ -z "$choice" ] && continue
         case "$choice" in
             1) add_node_wizard ;;
             2) list_nodes ;;
