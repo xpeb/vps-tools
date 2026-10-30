@@ -186,10 +186,38 @@ detect_arch() {
     esac
 }
 
+format_url_host() {
+    local ip="$1"
+    if [[ "$ip" == *:* ]] && [[ "$ip" != \[*\] ]]; then
+        echo "[$ip]"
+    else
+        echo "$ip"
+    fi
+}
+
 get_public_ip() {
     [ -n "$SERVER_IP" ] && return
-    SERVER_IP=$(curl -s4m 3 https://api.ipify.org || curl -s4m 3 https://ipv4.icanhazip.com || curl -s4m 3 https://ifconfig.me 2>/dev/null || echo "")
-    [ -z "$SERVER_IP" ] && SERVER_IP=$(curl -s6m 3 https://api64.ipify.org 2>/dev/null || echo "127.0.0.1")
+    if ip -4 route show default 2>/dev/null | grep -q default; then
+        SERVER_IP=$(curl -s4m 2 https://api.ipify.org || curl -s4m 2 https://ipv4.icanhazip.com || curl -s4m 2 https://ifconfig.me 2>/dev/null || echo "")
+    fi
+    if [ -z "$SERVER_IP" ]; then
+        SERVER_IP=$(curl -s6m 2 https://api6.ipify.org || curl -s6m 2 https://ipv6.icanhazip.com || curl -s6m 2 https://api64.ipify.org 2>/dev/null || echo "")
+    fi
+    [ -z "$SERVER_IP" ] && SERVER_IP="127.0.0.1"
+}
+
+check_ipv6_only() {
+    if ! ip -4 route show default 2>/dev/null | grep -q default; then
+        if ip -6 route show default 2>/dev/null | grep -q default; then
+            if ! curl -sIm 3 https://github.com >/dev/null 2>&1 && ! wget -q -T 3 -O /dev/null https://github.com 2>/dev/null; then
+                log_info "检测到纯 IPv6 环境，正在接入 DNS64 加速通道..."
+                if ! grep -q "2001:67c:2b0::4" /etc/resolv.conf 2>/dev/null; then
+                    echo "nameserver 2001:67c:2b0::4" >> /etc/resolv.conf 2>/dev/null || true
+                    echo "nameserver 2a01:4f8:c2c:123f::1" >> /etc/resolv.conf 2>/dev/null || true
+                fi
+            fi
+        fi
+    fi
 }
 
 install_deps() {
@@ -297,43 +325,27 @@ svc() {
     fi
 }
 
-service_start() {
-    if is_running; then
-        log_info "服务运行中"
-        return
-    fi
-    svc start
-    sleep 1
-    if is_running; then
-        log_success "服务已启动"
-    else
-        log_error "启动失败，请检查日志"
-    fi
+service_ctrl() {
+    case "$1" in
+        start)
+            if is_running; then log_info "服务运行中"; return; fi
+            svc start; sleep 1
+            if is_running; then log_success "服务已启动"; else log_error "启动失败，请检查日志"; fi
+            ;;
+        stop)
+            if ! is_running; then log_info "服务未运行"; return; fi
+            svc stop; sleep 1
+            if ! is_running; then log_success "服务已停止"; else log_error "停止失败"; fi
+            ;;
+        restart)
+            svc restart; sleep 1
+            if is_running; then log_success "服务已重启"; else log_error "重启失败，请检查日志"; fi
+            ;;
+    esac
 }
-
-service_stop() {
-    if ! is_running; then
-        log_info "服务未运行"
-        return
-    fi
-    svc stop
-    sleep 1
-    if ! is_running; then
-        log_success "服务已停止"
-    else
-        log_error "停止失败"
-    fi
-}
-
-service_restart() {
-    svc restart
-    sleep 1
-    if is_running; then
-        log_success "服务已重启"
-    else
-        log_error "重启失败，请检查日志"
-    fi
-}
+service_start() { service_ctrl start; }
+service_stop() { service_ctrl stop; }
+service_restart() { service_ctrl restart; }
 
 service_toggle_autostart() {
     if is_autostart_enabled; then
@@ -376,11 +388,15 @@ init_config_if_needed() {
     touch "$XRAY_ACCESS_LOG" "$XRAY_ERROR_LOG"
     chmod 755 "$XRAY_LOG_DIR" && chmod 644 "$XRAY_ACCESS_LOG" "$XRAY_ERROR_LOG"
     if [ ! -s "$XRAY_CONFIG" ]; then
-        cat << 'EOF' > "$XRAY_CONFIG"
+        local freedom_settings="{}"
+        if ! ip -4 route show default 2>/dev/null | grep -q default && ip -6 route show default 2>/dev/null | grep -q default; then
+            freedom_settings='{"domainStrategy": "UseIPv6"}'
+        fi
+        cat << EOF > "$XRAY_CONFIG"
 {
   "log": {"loglevel": "warning", "access": "/var/log/xray/access.log", "error": "/var/log/xray/error.log"},
   "inbounds": [],
-  "outbounds": [{"protocol": "freedom", "tag": "direct"}, {"protocol": "blackhole", "tag": "blocked"}],
+  "outbounds": [{"protocol": "freedom", "tag": "direct", "settings": $freedom_settings}, {"protocol": "blackhole", "tag": "blocked"}],
   "routing": {"domainStrategy": "IPIfNonMatch", "rules": [{"type": "field", "ip": ["geoip:private"], "outboundTag": "blocked"}]}
 }
 EOF
@@ -553,6 +569,7 @@ generate_self_signed_cert() {
 
 validate_and_apply_config() {
     local new_config="$1" bak="$XRAY_CONFIG.bak" err_msg
+    [ -z "$new_config" ] && { log_error "配置数据为空，已拒绝应用"; return 1; }
     cp "$XRAY_CONFIG" "$bak"
     echo "$new_config" > "$XRAY_CONFIG"
     if err_msg=$("$XRAY_BIN" run -test -c "$XRAY_CONFIG" 2>&1); then
@@ -675,12 +692,14 @@ add_node_wizard() {
     elif [ "$protocol" = "shadowsocks" ]; then
         if [ "$ss_method" = "2022-blake3-aes-128-gcm" ]; then
             ss_pass=$(openssl rand -base64 16)
+            prompt_input "密码/PSK (16字节Base64)" "$ss_pass" ss_pass
         elif [ "$ss_method" = "2022-blake3-aes-256-gcm" ]; then
             ss_pass=$(openssl rand -base64 32)
+            prompt_input "密码/PSK (32字节Base64)" "$ss_pass" ss_pass
         else
             ss_pass=$(rand_str 16)
+            prompt_input "连接密码" "$ss_pass" ss_pass
         fi
-        prompt_input "密码/PSK" "$ss_pass" ss_pass
     fi
 
     # Transport Path / ServiceName
@@ -696,8 +715,10 @@ add_node_wizard() {
         x_out=$("$XRAY_BIN" x25519 2>/dev/null || echo "")
         priv_key=$(echo "$x_out" | grep -i "PrivateKey:" | awk '{print $NF}')
         pbk=$(echo "$x_out" | grep -i "PublicKey):" | awk '{print $NF}')
-        [ -z "$priv_key" ] && priv_key=$(openssl rand -base64 32)
-        [ -z "$pbk" ] && pbk=$(openssl rand -base64 32)
+        if [ -z "$priv_key" ] || [ -z "$pbk" ]; then
+            log_error "生成 x25519 密钥对失败，请检查核心状态"
+            pause && return 1
+        fi
         short_id=$(openssl rand -hex 8)
         [ "$protocol" = "vless" ] && [ "$transport" = "tcp" ] && flow="xtls-rprx-vision"
 
@@ -759,7 +780,7 @@ add_node_wizard() {
         --arg path "$path" --arg svc "$service_name" --arg sni "$sni" --arg pbk "$pbk" \
         --arg sid "$short_id" --arg insec "$insecure" --arg flow "$flow" \
         '{
-            tag: $tag, port: $port, listen: "0.0.0.0", protocol: $proto, settings: $set, streamSettings: $ss,
+            tag: $tag, port: $port, listen: "::", protocol: $proto, settings: $set, streamSettings: $ss,
             sniffing: (if $proto == "shadowsocks" or $proto == "hysteria" then null else {enabled: true, destOverride: ["http", "tls", "quic"]} end),
             _meta: {
                 protocol: $proto, transport: $trans, security: $sec, remark: $rmk,
@@ -799,12 +820,13 @@ parse_node_meta() {
 }
 
 build_share_link() {
-    local enc_rmk enc_path link=""
+    local enc_rmk enc_path link="" url_host
     enc_rmk=$(urlencode "$meta_rmk") enc_path=$(urlencode "$meta_path")
+    url_host=$(format_url_host "$SERVER_IP")
 
     case "$meta_proto" in
         vless)
-            link="vless://${id_or_pwd}@${SERVER_IP}:${port}?type=${meta_trans}&security=${meta_sec}"
+            link="vless://${id_or_pwd}@${url_host}:${port}?type=${meta_trans}&security=${meta_sec}"
             [ "$meta_sec" = "reality" ] && link="${link}&pbk=${meta_pbk}&fp=chrome&sni=${meta_sni}&sid=${meta_sid}"
             [ "$meta_sec" = "tls" ] && link="${link}&fp=chrome&sni=${meta_sni}"
             [ "$meta_trans" = "xhttp" ] && link="${link}&path=${enc_path}&mode=auto"
@@ -826,7 +848,7 @@ build_share_link() {
             link="vmess://$(base64_encode "$vjson")"
             ;;
         trojan)
-            link="trojan://${id_or_pwd}@${SERVER_IP}:${port}?security=${meta_sec}&sni=${meta_sni}&type=${meta_trans}"
+            link="trojan://${id_or_pwd}@${url_host}:${port}?security=${meta_sec}&sni=${meta_sni}&type=${meta_trans}"
             [ "$meta_sec" = "reality" ] && link="${link}&pbk=${meta_pbk}&sid=${meta_sid}&fp=chrome"
             [ "$meta_trans" = "ws" ] && link="${link}&path=${enc_path}" && [ -n "$meta_sni" ] && link="${link}&host=${meta_sni}"
             [ "$meta_trans" = "grpc" ] && link="${link}&serviceName=${meta_svc}"
@@ -836,21 +858,13 @@ build_share_link() {
         shadowsocks)
             local method
             method=$(echo "$node" | jq -r '.settings.method // ""')
-            link="ss://$(base64_encode "${method}:${id_or_pwd}")@${SERVER_IP}:${port}#${enc_rmk}"
+            link="ss://$(base64_encode "${method}:${id_or_pwd}")@${url_host}:${port}#${enc_rmk}"
             ;;
         hysteria)
-            link="hysteria2://${id_or_pwd}@${SERVER_IP}:${port}/?sni=${meta_sni}&insecure=${meta_insec}#${enc_rmk}"
+            link="hysteria2://${id_or_pwd}@${url_host}:${port}/?sni=${meta_sni}&insecure=${meta_insec}#${enc_rmk}"
             ;;
     esac
     echo "$link"
-}
-
-get_node_share_link() {
-    local node
-    node=$(jq -c ".inbounds[$1]" "$XRAY_CONFIG" 2>/dev/null)
-    [ -z "$node" ] && return
-    parse_node_meta "$node"
-    build_share_link
 }
 
 view_node_detail() {
@@ -899,7 +913,7 @@ view_node_detail() {
         line
         echo -e "  ${C_BOLD}客户端 Outbound 配置:${C_RESET}"
         echo "$node" | jq \
-            --arg ip "$SERVER_IP" --arg pbk "$meta_pbk" --arg sid "$meta_sid" --arg sni "$meta_sni" \
+            --arg ip "$SERVER_IP" --arg pbk "$meta_pbk" --arg sid "$meta_sid" --arg sni "$meta_sni" --arg auth "$id_or_pwd" \
             '{
                 tag: ("proxy-" + .protocol), protocol: .protocol,
                 settings: (if .protocol == "vless" then {vnext: [{address: $ip, port: .port, users: [{id: (.settings.users[0].id // .settings.clients[0].id), encryption: "none"} + (if (._meta.flow // "") != "" then {flow: ._meta.flow} else {} end)]}]}
@@ -912,7 +926,9 @@ view_node_detail() {
                     if .security == "reality" then .realitySettings = {serverName: $sni, fingerprint: "chrome", show: false, publicKey: $pbk, shortId: $sid}
                     elif .security == "tls" then .tlsSettings = ({serverName: $sni} + (if .network == "hysteria" then {alpn: ["h3"]} else {} end))
                     else . end |
-                    if .network == "hysteria" then .hysteriaSettings = {version: 2, auth: (.. | .auth? // empty)} else . end
+                    if .network == "hysteria" then .hysteriaSettings = {version: 2, auth: $auth}
+                    elif .network == "xhttp" then .xhttpSettings += {mode: "auto", xmux: {maxConcurrency: 16}}
+                    else . end
                 )
             }'
         pause
@@ -1040,6 +1056,7 @@ main() {
     detect_os
     detect_init
     detect_arch
+    check_ipv6_only
     install_deps
     setup_shortcut
     get_public_ip
@@ -1063,9 +1080,9 @@ main() {
             2) list_nodes ;;
             3) delete_node ;;
             4) install_xray ;;
-            5) service_start; pause ;;
-            6) service_stop; pause ;;
-            7) service_restart; pause ;;
+            5) service_ctrl start; pause ;;
+            6) service_ctrl stop; pause ;;
+            7) service_ctrl restart; pause ;;
             8) view_logs ;;
             9) service_toggle_autostart; pause ;;
             10) enable_bbr ;;
