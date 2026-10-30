@@ -31,6 +31,9 @@ if [ -z "$BASH_VERSION" ]; then
 fi
 
 set -o pipefail
+if [ ! -t 0 ] && { exec < /dev/tty; } 2>/dev/null; then
+    :
+fi
 
 # ------------------------------------------------------------------------------
 # Constants & Paths
@@ -50,6 +53,7 @@ DAEMON_PID_FILE="/run/xray.pid"
 
 SCRIPT_SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 SCRIPT_LINK="/usr/local/bin/xray"
+SCRIPT_URL="https://raw.githubusercontent.com/xpeb/vps-tools/main/xray.sh"
 
 # Colors & Formatting
 if [ -t 1 ]; then
@@ -226,10 +230,15 @@ setup_shortcut() {
         sed -i "s|command=\"/usr/local/bin/xray\"|command=\"$XRAY_BIN\"|g" "$OPENRC_SERVICE"
     fi
     local target_script="$SCRIPT_SELF"
-    if [ -f "$target_script" ] && [ "$target_script" != "$SCRIPT_LINK" ]; then
+    if [ -f "$target_script" ] && [ "$target_script" != "$SCRIPT_LINK" ] && [[ "$target_script" != /proc/* ]] && [[ "$target_script" != /dev/fd/* ]]; then
         cp -f "$target_script" "$SCRIPT_LINK" 2>/dev/null || true
-        chmod +x "$SCRIPT_LINK" 2>/dev/null || true
+    else
+        if [ ! -s "$SCRIPT_LINK" ]; then
+            curl -fsSL "$SCRIPT_URL" -o "$SCRIPT_LINK" 2>/dev/null || \
+            wget -qO "$SCRIPT_LINK" "$SCRIPT_URL" 2>/dev/null || true
+        fi
     fi
+    chmod +x "$SCRIPT_LINK" 2>/dev/null || true
 }
 
 # ------------------------------------------------------------------------------
@@ -771,12 +780,8 @@ add_node_wizard() {
 # ------------------------------------------------------------------------------
 # Node Listing & Details
 # ------------------------------------------------------------------------------
-get_node_share_link() {
-    local idx="$1" node
-    node=$(jq -c ".inbounds[$idx]" "$XRAY_CONFIG" 2>/dev/null)
-    [ -z "$node" ] && return
-
-    local port meta_proto meta_trans meta_sec meta_rmk meta_path meta_svc meta_sni meta_pbk meta_sid meta_insec meta_flow id_or_pwd
+parse_node_meta() {
+    local node="$1"
     IFS='|' read -r _ port meta_proto meta_trans meta_sec meta_rmk meta_path meta_svc meta_sni meta_pbk meta_sid meta_insec meta_flow id_or_pwd < <(
         echo "$node" | jq -r '[
             .protocol, (.port | tostring), (._meta.protocol // .protocol),
@@ -788,7 +793,9 @@ get_node_share_link() {
             (.settings.users[0].id // .settings.clients[0].id // .settings.users[0].password // .settings.clients[0].password // .settings.users[0].auth // .settings.clients[0].auth // .settings.password // "")
         ] | join("|")'
     )
+}
 
+build_share_link() {
     local enc_rmk enc_path link=""
     enc_rmk=$(urlencode "$meta_rmk") enc_path=$(urlencode "$meta_path")
 
@@ -835,24 +842,20 @@ get_node_share_link() {
     echo "$link"
 }
 
+get_node_share_link() {
+    local node
+    node=$(jq -c ".inbounds[$1]" "$XRAY_CONFIG" 2>/dev/null)
+    [ -z "$node" ] && return
+    parse_node_meta "$node"
+    build_share_link
+}
+
 view_node_detail() {
     local idx="$1" node
     node=$(jq -c ".inbounds[$idx]" "$XRAY_CONFIG" 2>/dev/null)
     [ -z "$node" ] || [ "$node" = "null" ] && { log_error "节点不存在"; pause; return; }
 
-    local port meta_proto meta_trans meta_sec meta_rmk meta_path meta_svc meta_sni meta_pbk meta_sid meta_insec meta_flow id_or_pwd
-    IFS='|' read -r _ port meta_proto meta_trans meta_sec meta_rmk meta_path meta_svc meta_sni meta_pbk meta_sid meta_insec meta_flow id_or_pwd < <(
-        echo "$node" | jq -r '[
-            .protocol, (.port | tostring), (._meta.protocol // .protocol),
-            (._meta.transport // .streamSettings.network // "raw"), (._meta.security // .streamSettings.security // "none"),
-            (._meta.remark // .tag // "Node"), (._meta.path // .streamSettings.xhttpSettings.path // .streamSettings.wsSettings.path // ""),
-            (._meta.serviceName // .streamSettings.grpcSettings.serviceName // ""), (._meta.sni // .streamSettings.realitySettings.serverNames[0] // ""),
-            (._meta.publicKey // ""), (._meta.shortId // .streamSettings.realitySettings.shortIds[0] // ""), (._meta.insecure // "0"),
-            (._meta.flow // .settings.users[0].flow // .settings.clients[0].flow // ""),
-            (.settings.users[0].id // .settings.clients[0].id // .settings.users[0].password // .settings.clients[0].password // .settings.users[0].auth // .settings.clients[0].auth // .settings.password // "")
-        ] | join("|")'
-    )
-
+    parse_node_meta "$node"
     header
     echo -e "  ${C_BOLD}节点配置详情${C_RESET}"
     line
@@ -881,7 +884,7 @@ view_node_detail() {
 
     line
     local share_link
-    share_link=$(get_node_share_link "$idx")
+    share_link=$(build_share_link)
     echo -e "  ${C_BOLD}分享链接:${C_RESET}"
     echo -e "  ${C_CYAN}${share_link}${C_RESET}"
     [ "$meta_proto" = "hysteria" ] && echo -e "  ${C_GRAY}兼容链接 (hy2://):${C_RESET}\n  ${C_CYAN}${share_link/hysteria2:\/\//hy2:\/\/}${C_RESET}"
@@ -925,19 +928,13 @@ list_nodes() {
         printf "  ${C_GRAY}%-4s  %-14s  %-9s  %-12s  %-11s  %s${C_RESET}\n" "#" "协议" "端口" "传输" "安全" "备注"
         line
 
-        for ((i=0; i<count; i++)); do
-            local node
-            node=$(jq -c ".inbounds[$i]" "$XRAY_CONFIG" 2>/dev/null)
-            local p_port p_proto p_trans p_sec p_rmk
-            p_port=$(echo "$node" | jq -r '.port')
-            p_proto=$(echo "$node" | jq -r '._meta.protocol // .protocol')
-            p_trans=$(echo "$node" | jq -r '._meta.transport // .streamSettings.network // "raw"')
-            p_sec=$(echo "$node" | jq -r '._meta.security // .streamSettings.security // "none"')
-            p_rmk=$(echo "$node" | jq -r '._meta.remark // .tag // "Node"')
-
+        local i=1
+        while IFS='|' read -r p_port p_proto p_trans p_sec p_rmk; do
+            [ -z "$p_port" ] && continue
             printf "  %-4d  %-12s  %-7s  %-10s  %-9s  %s\n" \
-                "$((i+1))" "${p_proto^^}" "$p_port" "$p_trans" "${p_sec^^}" "$p_rmk"
-        done
+                "$i" "${p_proto^^}" "$p_port" "$p_trans" "${p_sec^^}" "$p_rmk"
+            i=$((i + 1))
+        done < <(jq -r '.inbounds[] | "\(.port)|\(._meta.protocol // .protocol)|\(._meta.transport // .streamSettings.network // "raw")|\(._meta.security // .streamSettings.security // "none")|\(._meta.remark // .tag // "Node")"' "$XRAY_CONFIG" 2>/dev/null)
 
         line
         read -rp "  › 请输入节点编号查看详情 [1-$count, 回车返回]: " node_choice
@@ -966,15 +963,12 @@ delete_node() {
 
         echo -e "  ${C_BOLD}删除入站节点${C_RESET}"
         line
-        for ((i=0; i<count; i++)); do
-            local node
-            node=$(jq -c ".inbounds[$i]" "$XRAY_CONFIG" 2>/dev/null)
-            local p_port p_proto p_rmk
-            p_port=$(echo "$node" | jq -r '.port')
-            p_proto=$(echo "$node" | jq -r '._meta.protocol // .protocol')
-            p_rmk=$(echo "$node" | jq -r '._meta.remark // .tag // "Node"')
-            printf "  %2d. %-10s 端口: %-5s (%s)\n" "$((i+1))" "${p_proto^^}" "$p_port" "$p_rmk"
-        done
+        local i=1
+        while IFS='|' read -r p_port p_proto p_rmk; do
+            [ -z "$p_port" ] && continue
+            printf "  %2d. %-10s 端口: %-5s (%s)\n" "$i" "${p_proto^^}" "$p_port" "$p_rmk"
+            i=$((i + 1))
+        done < <(jq -r '.inbounds[] | "\(.port)|\(._meta.protocol // .protocol)|\(._meta.remark // .tag // "Node")"' "$XRAY_CONFIG" 2>/dev/null)
         line
 
         read -rp "  › 请输入要删除的序号 [1-$count, 回车/0返回主界面]: " del_idx
