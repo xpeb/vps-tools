@@ -967,6 +967,177 @@ list_nodes() {
     done
 }
 
+edit_single_node() {
+    local idx="$1" node=""
+    node=$(jq -c ".inbounds[$idx]" "$XRAY_CONFIG" 2>/dev/null)
+    [ -z "$node" ] || [ "$node" = "null" ] && { log_error "节点不存在"; pause; return; }
+    parse_node_meta "$node"
+
+    while true; do
+        header
+        echo -e "  ${C_BOLD}修改节点: ${C_CYAN}${meta_rmk}${C_RESET} (${meta_proto^^} · ${port})"
+        line
+        echo -e "   ${C_CYAN}1.${C_RESET} 监听端口        [当前: ${port}]"
+
+        local cred_label="认证密码"
+        [ "$meta_proto" = "vless" ] || [ "$meta_proto" = "vmess" ] && cred_label="用户 UUID"
+        [ "$meta_proto" = "shadowsocks" ] && cred_label="连接密码"
+        echo -e "   ${C_CYAN}2.${C_RESET} ${cred_label}    [当前: ${id_or_pwd:0:8}...]"
+
+        local trans_show=""
+        { [ "$meta_trans" = "xhttp" ] || [ "$meta_trans" = "ws" ]; } && trans_show="分流路径"
+        [ "$meta_trans" = "grpc" ] && trans_show="serviceName"
+        [ -n "$trans_show" ] && echo -e "   ${C_CYAN}3.${C_RESET} ${trans_show}        [当前: ${meta_path:-$meta_svc}]"
+
+        if [ "$meta_sec" = "reality" ] || [ "$meta_sec" = "tls" ]; then
+            echo -e "   ${C_CYAN}4.${C_RESET} 伪装域名 (SNI)  [当前: ${meta_sni}]"
+        fi
+        [ "$meta_sec" = "reality" ] && echo -e "   ${C_CYAN}5.${C_RESET} 重置 REALITY 密钥对与 ShortId"
+        echo -e "   ${C_CYAN}6.${C_RESET} 节点备注名称    [当前: ${meta_rmk}]"
+        echo -e "   ${C_CYAN}7.${C_RESET} 完整重新配置该节点"
+        line
+        read -rp "  › 请选择修改项 [回车返回]: " mod_opt
+        [ -z "$mod_opt" ] || [ "$mod_opt" = "0" ] && break
+
+        local up_inb="" msg=""
+        case "$mod_opt" in
+            1)
+                local new_port
+                while true; do
+                    prompt_input "新监听端口" "$port" new_port
+                    if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1 ] && [ "$new_port" -le 65535 ]; then
+                        if [ "$new_port" != "$port" ] && is_port_used "$new_port"; then
+                            log_warn "端口 $new_port 已被占用"
+                            read -rp "  › 强制使用？[y/N]: " f_port
+                            [[ "$f_port" =~ ^[yY]$ ]] && break
+                        else
+                            break
+                        fi
+                    else
+                        log_warn "无效端口 (1-65535)"
+                    fi
+                done
+                if [ "$new_port" != "$port" ]; then
+                    up_inb=$(echo "$node" | jq --argjson p "$new_port" '.port = $p | ._meta.port = $p | .tag = ((._meta.protocol // "node") + "-" + ($p|tostring))')
+                    msg="端口已更新为 $new_port"
+                fi
+                ;;
+            2)
+                local new_cred=""
+                if [ "$meta_proto" = "vless" ] || [ "$meta_proto" = "vmess" ]; then
+                    prompt_input "用户 UUID (输入 r 随机生成)" "$id_or_pwd" new_cred
+                    [ "$new_cred" = "r" ] && new_cred=$(rand_uuid)
+                    up_inb=$(echo "$node" | jq --arg id "$new_cred" '.settings.users[0].id = $id | ._meta.uuid = $id')
+                elif [ "$meta_proto" = "trojan" ]; then
+                    prompt_input "连接密码 (输入 r 随机生成)" "$id_or_pwd" new_cred
+                    [ "$new_cred" = "r" ] && new_cred=$(rand_str 16)
+                    up_inb=$(echo "$node" | jq --arg pwd "$new_cred" '.settings.users[0].password = $pwd | ._meta.password = $pwd')
+                elif [ "$meta_proto" = "hysteria" ]; then
+                    prompt_input "认证密码 (输入 r 随机生成)" "$id_or_pwd" new_cred
+                    [ "$new_cred" = "r" ] && new_cred=$(rand_str 16)
+                    up_inb=$(echo "$node" | jq --arg pwd "$new_cred" '.settings.users[0].auth = $pwd | ._meta.auth = $pwd')
+                elif [ "$meta_proto" = "shadowsocks" ]; then
+                    prompt_input "密码/PSK" "$id_or_pwd" new_cred
+                    up_inb=$(echo "$node" | jq --arg pwd "$new_cred" '.settings.password = $pwd | ._meta.password = $pwd')
+                fi
+                [ -n "$new_cred" ] && [ "$new_cred" != "$id_or_pwd" ] && msg="${cred_label}已更新" || up_inb=""
+                ;;
+            3)
+                if [ "$meta_trans" = "xhttp" ]; then
+                    local new_path; prompt_input "分流路径" "$meta_path" new_path
+                    up_inb=$(echo "$node" | jq --arg p "$new_path" '.streamSettings.xhttpSettings.path = $p | ._meta.path = $p')
+                elif [ "$meta_trans" = "ws" ]; then
+                    local new_path; prompt_input "分流路径" "$meta_path" new_path
+                    up_inb=$(echo "$node" | jq --arg p "$new_path" '.streamSettings.wsSettings.path = $p | ._meta.path = $p')
+                elif [ "$meta_trans" = "grpc" ]; then
+                    local new_svc; prompt_input "gRPC serviceName" "$meta_svc" new_svc
+                    up_inb=$(echo "$node" | jq --arg s "$new_svc" '.streamSettings.grpcSettings.serviceName = $s | ._meta.serviceName = $s')
+                fi
+                msg="路径/服务名已更新"
+                ;;
+            4)
+                if [ "$meta_sec" = "reality" ] || [ "$meta_sec" = "tls" ]; then
+                    local new_sni; prompt_input "伪装域名 (SNI)" "$meta_sni" new_sni
+                    if [ "$meta_sec" = "reality" ]; then
+                        up_inb=$(echo "$node" | jq --arg s "$new_sni" --arg dest "${new_sni}:443" \
+                            '.streamSettings.realitySettings.serverNames = [$s] | .streamSettings.realitySettings.dest = $dest | ._meta.sni = $s')
+                    else
+                        up_inb=$(echo "$node" | jq --arg s "$new_sni" '._meta.sni = $s')
+                    fi
+                    msg="SNI 伪装域名已更新"
+                fi
+                ;;
+            5)
+                if [ "$meta_sec" = "reality" ]; then
+                    local x_out priv_k pub_k sid
+                    x_out=$("$XRAY_BIN" x25519 2>/dev/null || echo "")
+                    priv_k=$(echo "$x_out" | grep -i "PrivateKey:" | awk '{print $NF}')
+                    pub_k=$(echo "$x_out" | grep -i "PublicKey):" | awk '{print $NF}')
+                    sid=$(openssl rand -hex 8)
+                    if [ -n "$priv_k" ] && [ -n "$pub_k" ]; then
+                        up_inb=$(echo "$node" | jq --arg pk "$priv_k" --arg sid "$sid" --arg pbk "$pub_k" \
+                            '.streamSettings.realitySettings.privateKey = $pk | .streamSettings.realitySettings.shortIds = [$sid] | ._meta.publicKey = $pbk | ._meta.shortId = $sid')
+                        msg="REALITY 密钥对已重置"
+                    fi
+                fi
+                ;;
+            6)
+                local new_rmk; prompt_input "节点备注" "$meta_rmk" new_rmk
+                up_inb=$(echo "$node" | jq --arg r "$new_rmk" '._meta.remark = $r')
+                msg="备注已更新为 $new_rmk"
+                ;;
+            7)
+                log_info "进入完整重配向导..."
+                local new_cfg
+                new_cfg=$(jq --argjson idx "$idx" 'del(.inbounds[$idx])' "$XRAY_CONFIG")
+                validate_and_apply_config "$new_cfg"
+                add_node_wizard
+                return
+                ;;
+        esac
+
+        if [ -n "$up_inb" ]; then
+            local new_cfg
+            new_cfg=$(jq --argjson idx "$idx" --argjson inb "$up_inb" '.inbounds[$idx] = $inb' "$XRAY_CONFIG")
+            if validate_and_apply_config "$new_cfg"; then
+                log_success "$msg"
+                node=$(jq -c ".inbounds[$idx]" "$XRAY_CONFIG")
+                parse_node_meta "$node" && sleep 1
+            fi
+        fi
+    done
+}
+
+modify_node() {
+    while true; do
+        header
+        ! is_installed && { log_warn "核心未安装"; pause; return; }
+
+        local count=0
+        [ -f "$XRAY_CONFIG" ] && count=$(jq '.inbounds | length' "$XRAY_CONFIG" 2>/dev/null || echo 0)
+        [ "$count" -eq 0 ] && { log_warn "暂无节点"; pause; return; }
+
+        echo -e "  ${C_BOLD}修改入站节点${C_RESET}"
+        line
+        local i=1
+        while IFS='|' read -r p_port p_proto p_rmk; do
+            [ -z "$p_port" ] && continue
+            printf "  %2d. %-10s 端口: %-5s (%s)\n" "$i" "${p_proto^^}" "$p_port" "$p_rmk"
+            i=$((i + 1))
+        done < <(jq -r '.inbounds[] | "\(.port)|\(._meta.protocol // .protocol)|\(._meta.remark // .tag // "Node")"' "$XRAY_CONFIG" 2>/dev/null)
+        line
+
+        read -rp "  › 请输入要修改的编号 [1-$count, 回车返回]: " mod_idx
+        [ -z "$mod_idx" ] || [ "$mod_idx" = "0" ] && break
+
+        if [[ "$mod_idx" =~ ^[0-9]+$ ]] && [ "$mod_idx" -ge 1 ] && [ "$mod_idx" -le "$count" ]; then
+            edit_single_node "$((mod_idx - 1))"
+        else
+            log_warn "输入无效 (1-$count)" && sleep 1
+        fi
+    done
+}
+
 delete_node() {
     while true; do
         header
@@ -1067,31 +1238,31 @@ main() {
         local auto_tag="${C_GRAY}关${C_RESET}"
         is_autostart_enabled && auto_tag="${C_GREEN}开${C_RESET}"
 
-        echo -e "   ${C_CYAN}1.${C_RESET} 添加入站节点    ${C_CYAN}5.${C_RESET} 启动服务    ${C_CYAN} 9.${C_RESET} 自启开关 [${auto_tag}]"
-        echo -e "   ${C_CYAN}2.${C_RESET} 查看节点列表    ${C_CYAN}6.${C_RESET} 停止服务    ${C_CYAN}10.${C_RESET} 开启 BBR"
-        echo -e "   ${C_CYAN}3.${C_RESET} 删除入站节点    ${C_CYAN}7.${C_RESET} 重启服务    ${C_CYAN}11.${C_RESET} 卸载核心"
-        echo -e "   ${C_CYAN}4.${C_RESET} 安装/更新核心   ${C_CYAN}8.${C_RESET} 实时日志    ${C_CYAN} 0.${C_RESET} 退出面板"
+        echo -e "   ${C_CYAN}1.${C_RESET} 添加入站节点    ${C_CYAN}5.${C_RESET} 启动服务    ${C_CYAN} 9.${C_RESET} 安装/更新核心"
+        echo -e "   ${C_CYAN}2.${C_RESET} 查看节点列表    ${C_CYAN}6.${C_RESET} 停止服务    ${C_CYAN}10.${C_RESET} 自启开关 [${auto_tag}]"
+        echo -e "   ${C_CYAN}3.${C_RESET} 修改入站节点    ${C_CYAN}7.${C_RESET} 重启服务    ${C_CYAN}11.${C_RESET} 开启 BBR"
+        echo -e "   ${C_CYAN}4.${C_RESET} 删除入站节点    ${C_CYAN}8.${C_RESET} 实时日志    ${C_CYAN}12.${C_RESET} 卸载核心"
         line
 
-        read -rp "  › 请选择操作 [0-11]: " choice || exit 0
-        [ -z "$choice" ] && continue
+        read -rp "  › 请选择操作 [回车退出]: " choice || exit 0
         case "$choice" in
-            1) add_node_wizard ;;
-            2) list_nodes ;;
-            3) delete_node ;;
-            4) install_xray ;;
-            5) service_ctrl start; pause ;;
-            6) service_ctrl stop; pause ;;
-            7) service_ctrl restart; pause ;;
-            8) view_logs ;;
-            9) service_toggle_autostart; pause ;;
-            10) enable_bbr ;;
-            11) uninstall_xray ;;
-            0|q|exit)
+            ""|0|q|exit)
                 clear 2>/dev/null || true
                 echo -e "\n  ${C_CYAN}已退出 Xray 管理面板${C_RESET}\n"
                 exit 0
                 ;;
+            1) add_node_wizard ;;
+            2) list_nodes ;;
+            3) modify_node ;;
+            4) delete_node ;;
+            5) service_ctrl start; pause ;;
+            6) service_ctrl stop; pause ;;
+            7) service_ctrl restart; pause ;;
+            8) view_logs ;;
+            9) install_xray ;;
+            10) service_toggle_autostart; pause ;;
+            11) enable_bbr ;;
+            12) uninstall_xray ;;
             *)
                 log_warn "输入无效" && sleep 1
                 ;;
