@@ -91,7 +91,6 @@ get_node_count() {
 
 header() {
     clear 2>/dev/null || true
-    line
     local core_ver="未安装" status_str="${C_GRAY}○ 未安装${C_RESET}"
     if is_installed; then
         core_ver="$("$XRAY_BIN" version 2>/dev/null | head -n 1 | awk '{print $2}')"
