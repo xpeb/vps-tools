@@ -287,6 +287,19 @@ get_public_ip() {
     fi
 }
 
+check_mptcp_security() {
+    local mptcp_val
+    mptcp_val=$(sysctl -n net.mptcp.enabled 2>/dev/null || cat /proc/sys/net/mptcp/enabled 2>/dev/null || echo "")
+    if [ "$mptcp_val" = "1" ]; then
+        sysctl -w net.mptcp.enabled=0 >/dev/null 2>&1 || true
+        local conf="/etc/sysctl.d/99-mptcp.conf"
+        [ ! -d "/etc/sysctl.d" ] && conf="/etc/sysctl.conf"
+        sed -i '/net.mptcp.enabled/d' "$conf" 2>/dev/null || true
+        printf 'net.mptcp.enabled=0\n' >> "$conf"
+        sysctl -p "$conf" >/dev/null 2>&1 || true
+    fi
+}
+
 check_ipv6_only() {
     if ! ip -4 route show default 2>/dev/null | grep -q default && ip -6 route show default 2>/dev/null | grep -q default; then
         if ! curl -sIm 3 https://github.com >/dev/null 2>&1 && ! wget -q -T 3 -O /dev/null https://github.com 2>/dev/null; then
@@ -403,7 +416,7 @@ svc() {
         case "$action" in
             start)
                 mkdir -p "$XRAY_LOG_DIR"
-                nohup "$XRAY_BIN" run -c "$XRAY_CONFIG" >> "$XRAY_ACCESS_LOG" 2>> "$XRAY_ERROR_LOG" </dev/null &
+                nohup env GODEBUG="multipathtcp=0" "$XRAY_BIN" run -c "$XRAY_CONFIG" >> "$XRAY_ACCESS_LOG" 2>> "$XRAY_ERROR_LOG" </dev/null &
                 echo $! > "$DAEMON_PID_FILE"
                 ;;
             stop)
@@ -515,7 +528,7 @@ User=root
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
-Environment="XRAY_LOCATION_ASSET=$XRAY_SHARE_DIR"
+Environment="XRAY_LOCATION_ASSET=$XRAY_SHARE_DIR" "GODEBUG=multipathtcp=0"
 ExecStart=$XRAY_BIN run -c $XRAY_CONFIG
 Restart=on-failure
 RestartPreventExitStatus=23
@@ -539,6 +552,7 @@ pidfile="$DAEMON_PID_FILE"
 output_log="$XRAY_ACCESS_LOG"
 error_log="$XRAY_ERROR_LOG"
 export XRAY_LOCATION_ASSET="$XRAY_SHARE_DIR"
+export GODEBUG="multipathtcp=0"
 
 depend() {
     need net
@@ -585,6 +599,7 @@ install_xray() {
     rm -rf "$tmp_dir"
 
     is_running && svc stop
+    check_mptcp_security
     init_config_if_needed
     setup_service_units
     setup_shortcut
@@ -1392,11 +1407,11 @@ enable_bbr() {
     local sysctl_file="/etc/sysctl.d/99-bbr.conf"
     [ ! -d "/etc/sysctl.d" ] && sysctl_file="/etc/sysctl.conf"
 
-    sed -i '/net.core.default_qdisc/d;/net.ipv4.tcp_congestion_control/d' "$sysctl_file" 2>/dev/null || true
+    sed -i '/net.core.default_qdisc/d;/net.ipv4.tcp_congestion_control/d;/net.mptcp.enabled/d' "$sysctl_file" 2>/dev/null || true
     if [ "$sysctl_file" != "/etc/sysctl.conf" ]; then
-        sed -i '/net.core.default_qdisc/d;/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf 2>/dev/null || true
+        sed -i '/net.core.default_qdisc/d;/net.ipv4.tcp_congestion_control/d;/net.mptcp.enabled/d' /etc/sysctl.conf 2>/dev/null || true
     fi
-    printf 'net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n' >> "$sysctl_file"
+    printf 'net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\nnet.mptcp.enabled=0\n' >> "$sysctl_file"
 
     sysctl -p "$sysctl_file" >/dev/null 2>&1 || sysctl -p >/dev/null 2>&1 || true
 
@@ -1420,6 +1435,7 @@ detect_arch
 main() {
     check_root
     check_ipv6_only
+    check_mptcp_security
     install_deps
     setup_shortcut
     get_public_ip
