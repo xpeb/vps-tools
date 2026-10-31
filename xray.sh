@@ -90,7 +90,7 @@ header() {
     [ "$rem" -lt 1 ] && rem=1
 
     printf "  ${C_BOLD}%-32s${C_RESET} ${C_GRAY}状态:${C_RESET} %b\n" "Xray Core Manager" "$status_str"
-    printf "  ${C_GRAY}系统:${C_RESET} %-26s ${C_GRAY}地址:${C_RESET} %s\n" "${OS_NAME:-Linux} (${ARCH:-64})" "$ip_str"
+    printf "  ${C_GRAY}系统:${C_RESET} %-26s ${C_GRAY}地址:${C_RESET} %s\n" "${OS_NAME:-Linux}" "$ip_str"
     printf "  ${C_GRAY}节点:${C_RESET} %d 个活跃入站%*s${C_GRAY}自启:${C_RESET} %b\n" "$node_count" "$rem" "" "$auto_str"
     line
 }
@@ -141,31 +141,68 @@ check_root() {
 }
 
 detect_os() {
+    local id_val="" ver_id="" name_val=""
     if [ -f /etc/os-release ]; then
         # shellcheck disable=SC1091
         . /etc/os-release
-        OS_NAME="${PRETTY_NAME:-$NAME}"
-        case "$ID" in
-            alpine) OS_TYPE="alpine" ;;
-            debian|ubuntu|kali|armbian) OS_TYPE="debian" ;;
-            *)
-                if [[ "${ID_LIKE:-}" == *debian* ]] || [[ "${ID_LIKE:-}" == *ubuntu* ]]; then
-                    OS_TYPE="debian"
-                else
-                    OS_TYPE="unknown"
-                fi
-                ;;
-        esac
-    elif [ -f /etc/alpine-release ]; then
-        OS_TYPE="alpine"
-        OS_NAME="Alpine $(cat /etc/alpine-release 2>/dev/null)"
-    elif [ -f /etc/debian_version ]; then
-        OS_TYPE="debian"
-        OS_NAME="Debian $(cat /etc/debian_version 2>/dev/null)"
-    else
-        OS_TYPE="unknown"
-        OS_NAME="Linux"
+        id_val="$(echo "${ID:-}" | tr '[:upper:]' '[:lower:]')"
+        ver_id="${VERSION_ID:-}"
+        name_val="${NAME:-}"
     fi
+
+    case "$id_val" in
+        debian*)
+            OS_TYPE="debian"
+            local dver="${ver_id%%.*}"
+            [ -z "$dver" ] && [ -f /etc/debian_version ] && dver=$(cut -d. -f1 /etc/debian_version 2>/dev/null)
+            OS_NAME="Debian ${dver}"
+            ;;
+        ubuntu*)
+            OS_TYPE="debian"
+            OS_NAME="Ubuntu ${ver_id}"
+            ;;
+        alpine*)
+            OS_TYPE="alpine"
+            local aver="${ver_id}"
+            [ -z "$aver" ] && [ -f /etc/alpine-release ] && aver=$(cat /etc/alpine-release 2>/dev/null)
+            aver=$(echo "$aver" | cut -d. -f1,2)
+            OS_NAME="Alpine ${aver}"
+            ;;
+        centos*)
+            OS_TYPE="rhel"
+            OS_NAME="CentOS ${ver_id%%.*}"
+            ;;
+        rocky*)
+            OS_TYPE="rhel"
+            OS_NAME="Rocky ${ver_id%%.*}"
+            ;;
+        alma*)
+            OS_TYPE="rhel"
+            OS_NAME="Alma ${ver_id%%.*}"
+            ;;
+        fedora*)
+            OS_TYPE="fedora"
+            OS_NAME="Fedora ${ver_id%%.*}"
+            ;;
+        arch*)
+            OS_TYPE="arch"
+            OS_NAME="Arch Linux"
+            ;;
+        *)
+            if [ -f /etc/alpine-release ]; then
+                OS_TYPE="alpine"
+                OS_NAME="Alpine $(cut -d. -f1,2 /etc/alpine-release 2>/dev/null)"
+            elif [ -f /etc/debian_version ]; then
+                OS_TYPE="debian"
+                OS_NAME="Debian $(cut -d. -f1 /etc/debian_version 2>/dev/null)"
+            else
+                OS_TYPE="unknown"
+                local first_word="${name_val%% *}"
+                OS_NAME="${first_word:-Linux}${ver_id:+ ${ver_id%%.*}}"
+            fi
+            ;;
+    esac
+    OS_NAME="${OS_NAME% }"
 }
 
 detect_init() {
