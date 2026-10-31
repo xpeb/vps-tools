@@ -22,6 +22,7 @@ if [ -z "$BASH_VERSION" ]; then
 fi
 
 set -o pipefail
+shopt -s checkwinsize 2>/dev/null || true
 if [ ! -t 0 ]; then
     { exec < /dev/tty; } 2>/dev/null || true
 fi
@@ -63,7 +64,19 @@ fi
 # ------------------------------------------------------------------------------
 # UI Helpers
 # ------------------------------------------------------------------------------
-line()        { echo -e "${C_GRAY}────────────────────────────────────────────────────────────────${C_RESET}"; }
+line() {
+    local cols="${COLUMNS:-}"
+    [ -z "$cols" ] && cols=$(tput cols 2>/dev/null)
+    [ -z "$cols" ] && { cols=$(stty size < /dev/tty | awk '{print $2}'); } 2>/dev/null
+    [ -z "$cols" ] && cols=$(stty size 2>/dev/null | awk '{print $2}')
+    [[ "$cols" =~ ^[0-9]+$ ]] && [ "$cols" -ge 20 ] || cols=80
+
+    local l="────────────────────────────────────────────────────────────────"
+    while [ "${#l}" -lt "$cols" ]; do
+        l="${l}${l}"
+    done
+    echo -e "${C_GRAY}${l:0:$cols}${C_RESET}"
+}
 log_info()    { echo -e "  ${C_CYAN}›${C_RESET} $1"; }
 log_success() { echo -e "  ${C_GREEN}✔${C_RESET} $1"; }
 log_warn()    { echo -e "  ${C_YELLOW}!${C_RESET} $1"; }
