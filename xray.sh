@@ -115,13 +115,9 @@ header() {
     printf "  ${C_GRAY}状态:${C_RESET} %b\n" "$status_str"
     printf "  ${C_GRAY}自启:${C_RESET} %b\n" "$auto_str"
     printf "  ${C_GRAY}节点:${C_RESET} %d 个活跃入站\n" "$node_count"
-    if [ -n "$SERVER_IPV4" ] && [ -n "$SERVER_IPV6" ]; then
-        printf "  ${C_GRAY}IPv4:${C_RESET} %s\n" "$SERVER_IPV4"
-        printf "  ${C_GRAY}IPv6:${C_RESET} %s\n" "$SERVER_IPV6"
-    elif [ -n "$SERVER_IPV4" ]; then
-        printf "  ${C_GRAY}IPv4:${C_RESET} %s\n" "$SERVER_IPV4"
-    elif [ -n "$SERVER_IPV6" ]; then
-        printf "  ${C_GRAY}IPv6:${C_RESET} %s\n" "$SERVER_IPV6"
+    if [ -n "$SERVER_IPV4" ] || [ -n "$SERVER_IPV6" ]; then
+        [ -n "$SERVER_IPV4" ] && printf "  ${C_GRAY}IPv4:${C_RESET} %s\n" "$SERVER_IPV4"
+        [ -n "$SERVER_IPV6" ] && printf "  ${C_GRAY}IPv6:${C_RESET} %s\n" "$SERVER_IPV6"
     else
         printf "  ${C_GRAY}地址:${C_RESET} %s\n" "${SERVER_IP:-获取中...}"
     fi
@@ -813,9 +809,11 @@ add_node_wizard() {
 
     # Port selection
     local def_port="443"
-    [ "$security" = "none" ] && [ "$protocol" != "shadowsocks" ] && def_port="80"
-    [ "$protocol" = "shadowsocks" ] && def_port=$(rand_port)
-    [ "$protocol" = "hysteria" ] && def_port="8443"
+    case "$protocol" in
+        shadowsocks) def_port=$(rand_port) ;;
+        hysteria)    def_port="8443" ;;
+        *)           [ "$security" = "none" ] && def_port="80" ;;
+    esac
     is_port_used "$def_port" && def_port=$(rand_port)
 
     local port
@@ -909,14 +907,14 @@ add_node_wizard() {
         --argjson set "$settings" --argjson ss "$stream_settings" \
         --arg trans "$transport" --arg sec "$security" --arg rmk "$remark" \
         --arg path "$path" --arg svc "$service_name" --arg sni "$sni" --arg pbk "$pbk" \
-        --arg sid "$short_id" --arg insec "$insecure" --arg flow "$flow" \
+        --arg sid "$short_id" --arg insec "$insecure" --arg flow "$flow" --arg method "$ss_method" \
         '{
             tag: $tag, port: $port, listen: "::", protocol: $proto, settings: $set, streamSettings: $ss,
             sniffing: (if $proto == "shadowsocks" or $proto == "hysteria" then null else {enabled: true, destOverride: ["http", "tls", "quic"]} end),
             _meta: {
                 protocol: $proto, transport: $trans, security: $sec, remark: $rmk,
                 path: $path, serviceName: $svc, sni: $sni, publicKey: $pbk,
-                shortId: $sid, insecure: $insec, flow: $flow
+                shortId: $sid, insecure: $insec, flow: $flow, method: $method
             }
         } | del(.sniffing | nulls)')
 
@@ -927,7 +925,7 @@ add_node_wizard() {
     if validate_and_apply_config "$new_config"; then
         log_success "节点已添加并生效"
         local inb_len
-        inb_len=$(jq '.inbounds | length // 0' "$XRAY_CONFIG" 2>/dev/null)
+        inb_len=$(get_node_count)
         view_node_detail "$((inb_len - 1))"
     else
         pause
@@ -954,6 +952,7 @@ parse_node_meta() {
         read -r meta_flow
         read -r id_or_pwd
         read -r meta_address
+        read -r meta_method
     } < <(
         echo "$node" | jq -r '
             (.port | tostring),
@@ -969,7 +968,8 @@ parse_node_meta() {
             (._meta.insecure // "0"),
             (._meta.flow // .settings.users[0].flow // .settings.clients[0].flow // ""),
             (.settings.users[0].id // .settings.clients[0].id // .settings.users[0].password // .settings.clients[0].password // .settings.users[0].auth // .settings.clients[0].auth // .settings.password // ""),
-            (._meta.address // "")
+            (._meta.address // ""),
+            (._meta.method // .settings.method // "")
         '
     )
 }
@@ -1038,9 +1038,7 @@ build_share_link() {
             link="${link}#${enc_rmk}"
             ;;
         shadowsocks)
-            local method
-            method=$(echo "$node" | jq -r '.settings.method // ""')
-            link="ss://$(base64_encode "${method}:${id_or_pwd}")@${connect_host}:${port}#${enc_rmk}"
+            link="ss://$(base64_encode "${meta_method}:${id_or_pwd}")@${connect_host}:${port}#${enc_rmk}"
             ;;
         hysteria)
             link="hysteria2://${id_or_pwd}@${connect_host}:${port}/?sni=${meta_sni}&insecure=${meta_insec}#${enc_rmk}"
@@ -1073,13 +1071,9 @@ view_node_detail() {
     if [ "$connect_host" != "$SERVER_IP" ] && [ "$connect_host" != "[$SERVER_IP]" ]; then
         printf "  ${C_GRAY}连接地址${C_RESET}  %s (域名/CDN)\n" "$connect_host"
     fi
-    if [ -n "$SERVER_IPV4" ] && [ -n "$SERVER_IPV6" ]; then
-        printf "  ${C_GRAY}IPv4地址${C_RESET}  %s\n" "$SERVER_IPV4"
-        printf "  ${C_GRAY}IPv6地址${C_RESET}  %s\n" "$SERVER_IPV6"
-    elif [ -n "$SERVER_IPV4" ]; then
-        printf "  ${C_GRAY}IPv4地址${C_RESET}  %s\n" "$SERVER_IPV4"
-    elif [ -n "$SERVER_IPV6" ]; then
-        printf "  ${C_GRAY}IPv6地址${C_RESET}  %s\n" "$SERVER_IPV6"
+    if [ -n "$SERVER_IPV4" ] || [ -n "$SERVER_IPV6" ]; then
+        [ -n "$SERVER_IPV4" ] && printf "  ${C_GRAY}IPv4地址${C_RESET}  %s\n" "$SERVER_IPV4"
+        [ -n "$SERVER_IPV6" ] && printf "  ${C_GRAY}IPv6地址${C_RESET}  %s\n" "$SERVER_IPV6"
     else
         printf "  ${C_GRAY}服务器IP${C_RESET}  %s\n" "${SERVER_IP:-获取中...}"
     fi
@@ -1091,7 +1085,7 @@ view_node_detail() {
         vless|vmess)        printf "  ${C_GRAY}用户UUID${C_RESET}  %s\n" "$id_or_pwd" ;;
         trojan|hysteria)    printf "  ${C_GRAY}认证密码${C_RESET}  %s\n" "$id_or_pwd" ;;
         shadowsocks)
-            printf "  ${C_GRAY}加密算法${C_RESET}  %s\n" "$(echo "$node" | jq -r '.settings.method // ""')"
+            printf "  ${C_GRAY}加密算法${C_RESET}  %s\n" "$meta_method"
             printf "  ${C_GRAY}连接密码${C_RESET}  %s\n" "$id_or_pwd"
             ;;
     esac
@@ -1239,22 +1233,27 @@ edit_single_node() {
                 ;;
             2)
                 local new_cred=""
-                if [ "$meta_proto" = "vless" ] || [ "$meta_proto" = "vmess" ]; then
-                    prompt_input "用户 UUID (输入 r 随机生成)" "$id_or_pwd" new_cred
-                    [ "$new_cred" = "r" ] && new_cred=$(rand_uuid)
-                    up_inb=$(echo "$node" | jq --arg id "$new_cred" 'if .settings.clients then .settings.clients[0].id = $id else .settings.users[0].id = $id end | ._meta.uuid = $id')
-                elif [ "$meta_proto" = "trojan" ]; then
-                    prompt_input "连接密码 (输入 r 随机生成)" "$id_or_pwd" new_cred
-                    [ "$new_cred" = "r" ] && new_cred=$(rand_str 16)
-                    up_inb=$(echo "$node" | jq --arg pwd "$new_cred" 'if .settings.clients then .settings.clients[0].password = $pwd else .settings.users[0].password = $pwd end | ._meta.password = $pwd')
-                elif [ "$meta_proto" = "hysteria" ]; then
-                    prompt_input "认证密码 (输入 r 随机生成)" "$id_or_pwd" new_cred
-                    [ "$new_cred" = "r" ] && new_cred=$(rand_str 16)
-                    up_inb=$(echo "$node" | jq --arg pwd "$new_cred" 'if .settings.clients then .settings.clients[0].auth = $pwd else .settings.users[0].auth = $pwd end | ._meta.auth = $pwd')
-                elif [ "$meta_proto" = "shadowsocks" ]; then
-                    prompt_input "密码/PSK" "$id_or_pwd" new_cred
-                    up_inb=$(echo "$node" | jq --arg pwd "$new_cred" '.settings.password = $pwd | ._meta.password = $pwd')
-                fi
+                case "$meta_proto" in
+                    vless|vmess)
+                        prompt_input "用户 UUID (输入 r 随机生成)" "$id_or_pwd" new_cred
+                        [ "$new_cred" = "r" ] && new_cred=$(rand_uuid)
+                        up_inb=$(echo "$node" | jq --arg id "$new_cred" 'if .settings.clients then .settings.clients[0].id = $id else .settings.users[0].id = $id end | ._meta.uuid = $id')
+                        ;;
+                    trojan)
+                        prompt_input "连接密码 (输入 r 随机生成)" "$id_or_pwd" new_cred
+                        [ "$new_cred" = "r" ] && new_cred=$(rand_str 16)
+                        up_inb=$(echo "$node" | jq --arg pwd "$new_cred" 'if .settings.clients then .settings.clients[0].password = $pwd else .settings.users[0].password = $pwd end | ._meta.password = $pwd')
+                        ;;
+                    hysteria)
+                        prompt_input "认证密码 (输入 r 随机生成)" "$id_or_pwd" new_cred
+                        [ "$new_cred" = "r" ] && new_cred=$(rand_str 16)
+                        up_inb=$(echo "$node" | jq --arg pwd "$new_cred" 'if .settings.clients then .settings.clients[0].auth = $pwd else .settings.users[0].auth = $pwd end | ._meta.auth = $pwd')
+                        ;;
+                    shadowsocks)
+                        prompt_input "密码/PSK" "$id_or_pwd" new_cred
+                        up_inb=$(echo "$node" | jq --arg pwd "$new_cred" '.settings.password = $pwd | ._meta.password = $pwd')
+                        ;;
+                esac
                 [ -n "$new_cred" ] && [ "$new_cred" != "$id_or_pwd" ] && msg="${cred_label}已更新" || up_inb=""
                 ;;
             3)
