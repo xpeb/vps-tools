@@ -129,15 +129,11 @@ header() {
 }
 
 prompt_input() {
-    local prompt="$1" default_val="$2" var_name="$3" user_val=""
-    if [ -n "$default_val" ]; then
-        echo -ne "  › ${prompt} [${C_CYAN}${default_val}${C_RESET}]: "
-        read -r user_val
-        [ -z "$user_val" ] && user_val="$default_val"
-    else
-        echo -ne "  › ${prompt}: "
-        read -r user_val
-    fi
+    local prompt="$1" default_val="$2" var_name="$3" user_val="" hint=""
+    [ -n "$default_val" ] && hint=" [${C_CYAN}${default_val}${C_RESET}]"
+    echo -ne "  › ${prompt}${hint}: "
+    read -r user_val
+    [ -z "$user_val" ] && user_val="$default_val"
     printf -v "$var_name" '%s' "$user_val"
 }
 
@@ -201,17 +197,12 @@ detect_os() {
             aver=$(echo "$aver" | cut -d. -f1,2)
             OS_NAME="Alpine ${aver}"
             ;;
-        centos*)
+        centos*|rocky*|alma*)
             OS_TYPE="rhel"
-            OS_NAME="CentOS ${ver_id%%.*}"
-            ;;
-        rocky*)
-            OS_TYPE="rhel"
-            OS_NAME="Rocky ${ver_id%%.*}"
-            ;;
-        alma*)
-            OS_TYPE="rhel"
-            OS_NAME="Alma ${ver_id%%.*}"
+            local dname="CentOS"
+            [ "$id_val" = "rocky" ] && dname="Rocky"
+            [ "$id_val" = "alma" ] && dname="Alma"
+            OS_NAME="${dname} ${ver_id%%.*}"
             ;;
         fedora*)
             OS_TYPE="fedora"
@@ -482,7 +473,9 @@ view_logs() {
 get_latest_xray_version() {
     local tag
     tag=$(curl -sIL -o /dev/null -w '%{url_effective}' --max-time 5 https://github.com/XTLS/Xray-core/releases/latest | grep -o '[^/]*$' || echo "")
-    [ -z "$tag" ] || [ "$tag" = "latest" ] && tag=$(curl -sL --max-time 5 https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r '.tag_name // empty' 2>/dev/null || echo "")
+    if [ -z "$tag" ] || [ "$tag" = "latest" ]; then
+        tag=$(curl -sL --max-time 5 https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r '.tag_name // empty' 2>/dev/null || echo "")
+    fi
     echo "${tag:-v26.10.31}"
 }
 
@@ -642,6 +635,34 @@ uninstall_xray() {
 # ------------------------------------------------------------------------------
 # Helpers: Math, Random, Certs, Config Validation
 # ------------------------------------------------------------------------------
+ask_port() {
+    local prompt="${1:-监听端口}" default_port="$2" current_port="$3" var_name="$4" p
+    while true; do
+        prompt_input "$prompt" "$default_port" p
+        if [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ]; then
+            if [ "$p" != "$current_port" ] && is_port_used "$p"; then
+                log_warn "端口 $p 已被占用"
+                read -rp "  › 强制使用？[y/N]: " f_port
+                [[ "$f_port" =~ ^[yY]$ ]] && break
+            else
+                break
+            fi
+        else
+            log_warn "无效端口 (1-65535)"
+        fi
+    done
+    printf -v "$var_name" '%s' "$p"
+}
+
+gen_reality_keys() {
+    local x_out
+    x_out=$("$XRAY_BIN" x25519 2>/dev/null || echo "")
+    REALITY_PRIV=$(printf '%s\n' "$x_out" | awk 'tolower($0) ~ /private/{print $NF; exit}')
+    REALITY_PUB=$(printf '%s\n' "$x_out" | awk 'tolower($0) ~ /public|password/{print $NF; exit}')
+    REALITY_SID=$(openssl rand -hex 8)
+    [ -n "$REALITY_PRIV" ] && [ -n "$REALITY_PUB" ]
+}
+
 rand_port() {
     local p
     while true; do
@@ -783,20 +804,7 @@ add_node_wizard() {
     is_port_used "$def_port" && def_port=$(rand_port)
 
     local port
-    while true; do
-        prompt_input "监听端口" "$def_port" port
-        if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
-            if is_port_used "$port"; then
-                log_warn "端口 $port 已被占用"
-                read -rp "  › 强制使用？[y/N]: " f_port
-                [[ "$f_port" =~ ^[yY]$ ]] && break
-            else
-                break
-            fi
-        else
-            log_warn "无效端口 (1-65535)"
-        fi
-    done
+    ask_port "监听端口" "$def_port" "" port
 
     # Credentials
     case "$protocol" in
@@ -826,15 +834,11 @@ add_node_wizard() {
     # Security (REALITY / TLS)
     if [ "$security" = "reality" ]; then
         prompt_input "REALITY 伪装域名 (SNI)" "www.apple.com" sni
-        local x_out
-        x_out=$("$XRAY_BIN" x25519 2>/dev/null || echo "")
-        priv_key=$(printf '%s\n' "$x_out" | awk 'tolower($0) ~ /private/{print $NF; exit}')
-        pbk=$(printf '%s\n' "$x_out" | awk 'tolower($0) ~ /public|password/{print $NF; exit}')
-        if [ -z "$priv_key" ] || [ -z "$pbk" ]; then
+        if ! gen_reality_keys; then
             log_error "生成 x25519 密钥对失败，请检查核心状态"
             pause && return 1
         fi
-        short_id=$(openssl rand -hex 8)
+        priv_key="$REALITY_PRIV" pbk="$REALITY_PUB" short_id="$REALITY_SID"
         [ "$protocol" = "vless" ] && [ "$transport" = "tcp" ] && flow="xtls-rprx-vision"
 
     elif [ "$security" = "tls" ]; then
@@ -1212,20 +1216,7 @@ edit_single_node() {
         case "$mod_opt" in
             1)
                 local new_port
-                while true; do
-                    prompt_input "新监听端口" "$port" new_port
-                    if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1 ] && [ "$new_port" -le 65535 ]; then
-                        if [ "$new_port" != "$port" ] && is_port_used "$new_port"; then
-                            log_warn "端口 $new_port 已被占用"
-                            read -rp "  › 强制使用？[y/N]: " f_port
-                            [[ "$f_port" =~ ^[yY]$ ]] && break
-                        else
-                            break
-                        fi
-                    else
-                        log_warn "无效端口 (1-65535)"
-                    fi
-                done
+                ask_port "新监听端口" "$port" "$port" new_port
                 if [ "$new_port" != "$port" ]; then
                     up_inb=$(echo "$node" | jq --argjson p "$new_port" '.port = $p | ._meta.port = $p | .tag = ((._meta.protocol // "node") + "-" + ($p|tostring))')
                     msg="端口已更新为 $new_port"
@@ -1277,13 +1268,8 @@ edit_single_node() {
                 ;;
             5)
                 if [ "$meta_sec" = "reality" ]; then
-                    local x_out priv_k pub_k sid
-                    x_out=$("$XRAY_BIN" x25519 2>/dev/null || echo "")
-                    priv_k=$(printf '%s\n' "$x_out" | awk 'tolower($0) ~ /private/{print $NF; exit}')
-                    pub_k=$(printf '%s\n' "$x_out" | awk 'tolower($0) ~ /public|password/{print $NF; exit}')
-                    sid=$(openssl rand -hex 8)
-                    if [ -n "$priv_k" ] && [ -n "$pub_k" ]; then
-                        up_inb=$(echo "$node" | jq --arg pk "$priv_k" --arg sid "$sid" --arg pbk "$pub_k" \
+                    if gen_reality_keys; then
+                        up_inb=$(echo "$node" | jq --arg pk "$REALITY_PRIV" --arg sid "$REALITY_SID" --arg pbk "$REALITY_PUB" \
                             '.streamSettings.realitySettings.privateKey = $pk | .streamSettings.realitySettings.shortIds = [$sid] | .streamSettings.realitySettings.minClientVer = "1.0.0" | ._meta.publicKey = $pbk | ._meta.shortId = $sid')
                         msg="REALITY 密钥对已重置"
                     fi
@@ -1410,7 +1396,7 @@ enable_bbr() {
     if [ "$sysctl_file" != "/etc/sysctl.conf" ]; then
         sed -i '/net.core.default_qdisc/d;/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf 2>/dev/null || true
     fi
-    echo -e "net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr" >> "$sysctl_file"
+    printf 'net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n' >> "$sysctl_file"
 
     sysctl -p "$sysctl_file" >/dev/null 2>&1 || sysctl -p >/dev/null 2>&1 || true
 
