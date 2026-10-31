@@ -52,8 +52,6 @@ TARGET_JAIL="sshd"
 SSHD_MAIN="/etc/ssh/sshd_config"
 SSHD_CONF_DIR="/etc/ssh/sshd_config.d"
 
-SUDO=""
-
 PKG_MGR=""; INIT_SYS=""; SSH_LOG=""; OS_NAME=""; OS_ID=""; OS_VER=""; OS_SHORT=""
 PKG_INDEX_REFRESHED=0
 DOCKER_VER=""; COMPOSE_VER=""
@@ -72,110 +70,11 @@ SYSCTL_BACKUP_MISSING=0
 ZRAM_CONFIG_FILE=""
 ZRAM_CONFIG_BACKUP=""
 ZRAM_CONFIG_MISSING=0
-SSHD_CONFIG_PARSE_FAILED=0
 CONTAINERD_SHARED_USE=0
 
-# 轻量事务上下文：用于需要多个文件一致修改的配置操作。领域代码可在此
-# 基础上实现更高层的服务回滚，但不应依赖 EXIT trap 猜测恢复目标。
-TXN_ACTIVE=0
-TXN_NAME=""
-TXN_BACKUP_DIR=""
 VPS_RUNTIME_DIR="${VPS_RUNTIME_DIR:-/run}"
-declare -a TXN_PATHS=() TXN_BACKUPS=() TXN_MISSING=()
-
-transaction_begin() {
-    local name="${1:-operation}"
-    [ "${TXN_ACTIVE:-0}" -eq 0 ] || return 1
-    mkdir -p "$VPS_RUNTIME_DIR" || return 1
-    TXN_BACKUP_DIR=$(mktemp -d "$VPS_RUNTIME_DIR/vps-${name}.XXXXXX") || return 1
-    TXN_NAME="$name"
-    TXN_PATHS=()
-    TXN_BACKUPS=()
-    TXN_MISSING=()
-    TXN_ACTIVE=1
-}
-
-transaction_backup_file() {
-    local path="$1" idx backup
-    [ "${TXN_ACTIVE:-0}" -eq 1 ] || return 1
-    [ -n "$path" ] || return 1
-    for idx in "${!TXN_PATHS[@]}"; do
-        [ "${TXN_PATHS[$idx]}" = "$path" ] && return 0
-    done
-    idx=${#TXN_PATHS[@]}
-    backup="$TXN_BACKUP_DIR/$idx"
-    if [ -e "$path" ] || [ -L "$path" ]; then
-        [ -f "$path" ] && [ ! -L "$path" ] || {
-            echo -e "${ERROR} 事务仅支持普通文件：$path" >&2
-            return 1
-        }
-        if ! cp -a "$path" "$backup"; then
-            rm -f "$backup"
-            return 1
-        fi
-        TXN_MISSING[$idx]=0
-    else
-        : > "${backup}.missing" || return 1
-        TXN_MISSING[$idx]=1
-    fi
-    TXN_PATHS[$idx]="$path"
-    TXN_BACKUPS[$idx]="$backup"
-}
-
-transaction_restore() {
-    local idx path backup tmp
-    [ "${TXN_ACTIVE:-0}" -eq 1 ] || return 0
-    for ((idx=${#TXN_PATHS[@]} - 1; idx >= 0; idx--)); do
-        path="${TXN_PATHS[$idx]}"
-        backup="${TXN_BACKUPS[$idx]}"
-        if [ "${TXN_MISSING[$idx]:-0}" -eq 1 ]; then
-            rm -rf "$path" || return 1
-        else
-            mkdir -p "$(dirname "$path")" || return 1
-            [ -f "$backup" ] || return 1
-            tmp=$(mktemp "${path}.restore.XXXXXX") || return 1
-            if ! cp -a "$backup" "$tmp" || ! mv -f "$tmp" "$path"; then
-                rm -f "$tmp"
-                return 1
-            fi
-        fi
-    done
-    return 0
-}
-
-transaction_commit() {
-    local rc=0
-    [ "${TXN_ACTIVE:-0}" -eq 1 ] || return 0
-    rm -rf "$TXN_BACKUP_DIR" || rc=1
-    if [ "$rc" -ne 0 ]; then
-        echo -e "${WARN} ${TXN_NAME:-配置}事务已提交，但备份目录清理失败：${TXN_BACKUP_DIR}" >&2
-    fi
-    TXN_ACTIVE=0
-    TXN_NAME=""
-    TXN_BACKUP_DIR=""
-    TXN_PATHS=()
-    TXN_BACKUPS=()
-    TXN_MISSING=()
-    return "$rc"
-}
-
-transaction_rollback() {
-    local rc=0
-    [ "${TXN_ACTIVE:-0}" -eq 1 ] || return 0
-    transaction_restore || rc=1
-    if [ "$rc" -eq 0 ]; then
-        transaction_commit || rc=1
-    else
-        echo -e "${ERROR} ${TXN_NAME:-配置}事务恢复失败，备份仍保留在：${TXN_BACKUP_DIR}" >&2
-    fi
-    return "$rc"
-}
 
 cleanup_runtime() {
-    if [ "${TXN_ACTIVE:-0}" -eq 1 ]; then
-        transaction_rollback >/dev/null 2>&1 || \
-            echo -e "${ERROR} 未提交事务恢复失败，备份仍保留在：${TXN_BACKUP_DIR}" >&2
-    fi
     if [ -n "${SSH_BACKUP_DIR:-}" ]; then
         if restore_ssh_config >/dev/null 2>&1 && restart_sshd >/dev/null 2>&1; then
             rm -rf "$SSH_BACKUP_DIR"
@@ -268,35 +167,6 @@ detect_ssh_log() {
     esac
 }
 
-capability_has() {
-    case "$1" in
-        package-manager) [ "$PKG_MGR" != "unknown" ] ;;
-        service-manager) [ "$INIT_SYS" != "unknown" ] ;;
-        ssh) command -v sshd >/dev/null 2>&1 ;;
-        firewall) command -v ufw >/dev/null 2>&1 || command -v firewall-cmd >/dev/null 2>&1 ;;
-        selinux) command -v getenforce >/dev/null 2>&1 && command -v semanage >/dev/null 2>&1 ;;
-        docker) command -v docker >/dev/null 2>&1 ;;
-        *) return 1 ;;
-    esac
-}
-
-service_name_for() {
-    case "$1" in
-        ssh)
-            if [ "$INIT_SYS" = "systemd" ]; then
-                systemctl list-unit-files 2>/dev/null | awk -F. '/^(ssh|sshd)\.service/{print $1; exit}'
-            elif [ "$OS_ID" = "alpine" ]; then
-                printf '%s\n' sshd
-            else
-                printf '%s\n' ssh
-            fi
-            ;;
-        fail2ban) printf '%s\n' fail2ban ;;
-        docker) printf '%s\n' docker ;;
-        *) return 1 ;;
-    esac
-}
-
 #------------------------------------------------------------------------------
 # 第 3 层：平台适配器——服务管理
 # 调用方使用统一的 svc_* 接口，不直接依赖 systemd/OpenRC/SysVinit。
@@ -336,24 +206,6 @@ svc_disable() {
 # 包索引刷新状态只在一次包操作事务内有效，任何安装/卸载后都失效。
 #------------------------------------------------------------------------------
 # ============ 包管理抽象 ============
-# 统一命令执行器：非进度型操作也必须保留失败日志和退出码。
-run_command() {
-    local label="$1"; shift
-    local log_file rc
-    log_file=$(mktemp /run/vps-command.XXXXXX) || {
-        "$@" 9>&-
-        return $?
-    }
-    "$@" 9>&- >"$log_file" 2>&1
-    rc=$?
-    if [ "$rc" -ne 0 ]; then
-        echo -e "${ERROR} ${label}失败。" >&2
-        cat "$log_file" >&2
-    fi
-    rm -f "$log_file"
-    return "$rc"
-}
-
 run_with_progress() {
     local label="$1"; shift
     local log_file pid rc width=28 pos=0 direction=1 j bar
@@ -453,10 +305,6 @@ pkg_remove() {
         *) return 1 ;;
     esac
 }
-pkg_remove_many() {
-    [ "$#" -gt 0 ] || return 0
-    pkg_remove "$@"
-}
 
 pkg_autoremove() {
     case "$PKG_MGR" in
@@ -501,7 +349,7 @@ check_eol_system() {
     case "$OS_ID" in
         debian)
             case "$OS_VER" in
-                8|9|10|11)
+                8|9|10)
                     echo -e "\n${YELLOW}${BOLD}[提示] 检测到 Debian ${OS_VER}，该系统已停止官方支持。${RESET}"
                     echo -e "${YELLOW}apt 源可能已失效，导致无法正常安装软件。${RESET}"
                     echo -e "${YELLOW}如果安装失败，可将 /etc/apt/sources.list 改为 archive 源：${RESET}\n"
@@ -510,7 +358,6 @@ check_eol_system() {
                         8) codename="jessie" ;;
                         9) codename="stretch" ;;
                         10) codename="buster" ;;
-                        11) codename="bullseye" ;;
                     esac
                     if [ -n "$codename" ]; then
                         echo -e "${CYAN}示例：${RESET}"
@@ -683,26 +530,16 @@ commit_f2b_config() {
 # sshd -T 失败时绝不静默套用默认值；调用方必须显式处理失败。
 get_sshd_config_val() {
     local key="$1" val="" parsed
-    SSHD_CONFIG_PARSE_FAILED=0
-    if ! command -v sshd &>/dev/null; then
-        SSHD_CONFIG_PARSE_FAILED=1
-        return 1
-    fi
-    if ! parsed=$(sshd -T 2>/dev/null); then
-        SSHD_CONFIG_PARSE_FAILED=1
-        return 1
-    fi
+    command -v sshd &>/dev/null || return 1
+    parsed=$(sshd -T 2>/dev/null) || return 1
     val=$(printf '%s\n' "$parsed" | awk -v key="${key,,}" 'tolower($1) == key {print $2; exit}')
-    if [ -z "$val" ]; then
-        SSHD_CONFIG_PARSE_FAILED=1
-        return 1
-    fi
+    [ -n "$val" ] || return 1
     printf '%s\n' "$val"
 }
 
 read_sshd_config_val() {
-    local key="$1" default_val="${2:-}" value
-    if ! value=$(get_sshd_config_val "$key" "$default_val"); then
+    local key="$1" value
+    if ! value=$(get_sshd_config_val "$key"); then
         echo -e "${ERROR} 无法解析当前 SSH 配置（sshd -T 失败），已取消相关操作。" >&2
         return 1
     fi
@@ -717,14 +554,23 @@ set_sshd_config() {
     mode=$(stat -c '%a' "$SSHD_MAIN" 2>/dev/null || true)
     tmpf=$(mktemp "${SSHD_MAIN}.tmp.XXXXXX") || return 1
     if ! awk -v p="$param" -v v="$value" '
-        BEGIN { target=tolower(p); inserted=0 }
+        BEGIN { target=tolower(p); inserted=0; in_match=0 }
         {
-            line=$0
-            sub(/^[[:space:]]*#[[:space:]]*/, "", line)
-            key=line
-            sub(/^[[:space:]]*/, "", key)
-            sub(/[[:space:]=].*$/, "", key)
-            if (tolower(key) == target) next
+            if (tolower($0) ~ /^[[:space:]]*match[[:space:]]/) in_match=1
+            raw=$0
+            sub(/^[[:space:]]*/, "", raw)
+            # 仅移除顶层有效配置或默认被注释掉的配置指令（如 #Port 22），保留 Match 块内的局部规则与说明性注释
+            if (!in_match) {
+                if (raw !~ /^#/) {
+                    n = split(raw, arr, /[[:space:]=]+/)
+                    if (n > 0 && tolower(arr[1]) == target) next
+                } else {
+                    comment_body = raw
+                    sub(/^#[[:space:]]*/, "", comment_body)
+                    n = split(comment_body, arr, /[[:space:]=]+/)
+                    if (n >= 1 && n <= 3 && tolower(arr[1]) == target) next
+                }
+            }
             if (!inserted && tolower($0) ~ /^[[:space:]]*(include|match)[[:space:]]/) {
                 print p " " v
                 inserted=1
@@ -746,7 +592,7 @@ set_sshd_config() {
 restart_sshd() {
     echo -e "${INFO} 正在检测 SSH 配置文件语法..."
     if command -v sshd &>/dev/null; then
-        if ! $SUDO sshd -t; then
+        if ! sshd -t; then
             echo -e "${ERROR} SSH 配置文件测试失败！检测到语法错误，已取消重启以防止断连锁死！"
             return 1
         fi
@@ -755,7 +601,7 @@ restart_sshd() {
     echo -e "${INFO} 正在重启 SSH 服务..."
     local restart_ok=1
     if [ "$INIT_SYS" = "systemd" ]; then
-        $SUDO systemctl daemon-reload &>/dev/null || true
+        systemctl daemon-reload &>/dev/null || true
         local ssh_unit=""
         if systemctl list-unit-files 2>/dev/null | grep -q '^ssh\.service'; then
             ssh_unit="ssh.service"
@@ -765,7 +611,7 @@ restart_sshd() {
             ssh_unit="ssh.socket"
         fi
         if [ -n "$ssh_unit" ]; then
-            if svc_restart "$ssh_unit" && systemctl is-active --quiet "$ssh_unit"; then
+            if svc_restart "$ssh_unit" && { systemctl is-active --quiet "$ssh_unit" || systemctl is-active --quiet ssh.socket 2>/dev/null; }; then
                 restart_ok=0
             fi
         else
@@ -835,7 +681,7 @@ extract_core_key() {
     awk '{
         for(i=1;i<=NF;i++){
             if($i ~ /^(ssh-|ecdsa-|sk-)/){
-                for(j=1;j<=i+1 && j<=NF;j++) printf "%s%s", $j, (j<i+1?" ":"")
+                for(j=i;j<=i+1 && j<=NF;j++) printf "%s%s", $j, (j<i+1?" ":"")
                 print ""
                 exit
             }
@@ -937,7 +783,7 @@ get_f2b_conf() {
     local result
     result=$(awk -v t="$TARGET_JAIL" -v k="$key" '
         BEGIN { in_block=0; result="" }
-        $0 ~ "^\\[" t "\\][[:space:]]*$" { in_block=1; next }
+        $0 ~ "^[[:space:]]*\\[" t "\\][[:space:]]*$" { in_block=1; next }
         /^[[:space:]]*\[/ { in_block=0 }
         in_block && $0 ~ "^[[:space:]]*" k "[[:space:]]*=" {
             value=$0
@@ -951,7 +797,7 @@ get_f2b_conf() {
     if [ -z "$result" ]; then
         result=$(awk -v k="$key" '
             BEGIN { in_block=0; result="" }
-            /^\[DEFAULT\][[:space:]]*$/ { in_block=1; next }
+            /^[[:space:]]*\[DEFAULT\][[:space:]]*$/ { in_block=1; next }
             /^[[:space:]]*\[/ { in_block=0 }
             in_block && $0 ~ "^[[:space:]]*" k "[[:space:]]*=" {
                 value=$0
@@ -970,22 +816,19 @@ get_f2b_conf() {
 # - 其余参数写入 [sshd] 段
 set_f2b_conf() {
     local key="$1" val="$2" target_section="$TARGET_JAIL"
-    local tmpf input_file
+    local tmpf input_file backup_created=0
     case "$key" in
         bantime.increment|bantime.factor|bantime.maxtime|dbfile|dbpurgeage)
             target_section="DEFAULT"
             ;;
     esac
 
-    if ! transaction_begin f2b-config; then
-        return 1
-    fi
-    if ! transaction_backup_file "$JAIL_CONF"; then
-        transaction_rollback >/dev/null 2>&1 || true
-        return 1
+    if [ -z "$F2B_BACKUP_DIR" ]; then
+        backup_f2b_config || return 1
+        backup_created=1
     fi
     tmpf=$(mktemp "$VPS_RUNTIME_DIR/f2b-config.XXXXXX") || {
-        transaction_rollback >/dev/null 2>&1 || true
+        [ "$backup_created" -eq 1 ] && { restore_f2b_config; commit_f2b_config; }
         return 1
     }
     input_file="$JAIL_CONF"
@@ -1014,7 +857,7 @@ set_f2b_conf() {
             current_key=line
             sub(/[[:space:]=].*$/, "", current_key)
             if (current_key == k) {
-            if (!key_written) print k " = " v
+                if (!key_written) print k " = " v
                 key_written=1
                 next
             }
@@ -1026,28 +869,23 @@ set_f2b_conf() {
         }
     ' "$input_file" 2>/dev/null > "$tmpf"; then
         rm -f "$tmpf"
-        transaction_rollback >/dev/null 2>&1 || true
+        [ "$backup_created" -eq 1 ] && { restore_f2b_config; commit_f2b_config; }
         return 1
     fi
     if ! atomic_write_file "$JAIL_CONF" < "$tmpf"; then
         rm -f "$tmpf"
-        transaction_rollback >/dev/null 2>&1 || true
+        [ "$backup_created" -eq 1 ] && { restore_f2b_config; commit_f2b_config; }
         return 1
     fi
     rm -f "$tmpf"
 
     if command -v fail2ban-client &>/dev/null && ! fail2ban-client -t >/dev/null 2>&1; then
-        if transaction_rollback >/dev/null 2>&1; then
-            echo -e "${ERROR} Fail2Ban 配置测试失败，已恢复原配置。"
-        else
-            echo -e "${ERROR} Fail2Ban 配置测试失败，且原配置恢复失败；请检查事务备份。" >&2
-        fi
+        echo -e "${ERROR} Fail2Ban 配置测试失败，已恢复原配置。"
+        restore_f2b_config
+        commit_f2b_config
         return 1
     fi
-    if ! transaction_commit; then
-        echo -e "${WARN} Fail2Ban 配置已写入，但事务备份清理失败。"
-        return 1
-    fi
+    [ "$backup_created" -eq 1 ] && commit_f2b_config
     return 0
 }
 
@@ -1090,13 +928,15 @@ get_fail2ban_status() {
 
 fmt_f2b_unit() {
     local val=$1 type=$2
+    [ -z "$val" ] && { echo "未设置"; return; }
     if [[ "$val" =~ ^[0-9]+$ ]]; then
         [ "$type" == "time" ] && echo "${val}秒" || { [ "$type" == "factor" ] && echo "${val}倍" || echo "$val"; }
     else echo "$val"; fi
 }
 
 validate_time() { [[ "$1" =~ ^[1-9][0-9]*[smhdw]?$ ]]; }
-validate_int() { [[ "$1" =~ ^[1-9][0-9]*(\.[0-9]+)?$ ]]; }
+validate_int() { [[ "$1" =~ ^[1-9][0-9]*$ ]]; }
+validate_float() { [[ "$1" =~ ^[1-9][0-9]*(\.[0-9]+)?$ ]]; }
 
 f2b_ssh_filter() {
     if [ "$OS_ID" = "alpine" ] && [ -f /etc/fail2ban/filter.d/alpine-sshd.conf ]; then
@@ -1150,61 +990,41 @@ EOF2
 }
 
 # 迁移：老配置里 [sshd] 段的递增参数挪到 [DEFAULT] 段
-# 老版本脚本把 bantime.increment/factor/maxtime 错误地写在了 [sshd] 段
-# Fail2Ban 只认 [DEFAULT]，导致"指数递增"完全不生效
-# 同时确保 dbfile 和 dbpurgeage 存在（递增功能必需数据库支持）
+# 确保 dbfile 和 dbpurgeage 存在（递增功能必需数据库支持）
 migrate_f2b_increment() {
-    [ -f "$JAIL_CONF" ] || return
-    local k
-    # 1. 删除 [sshd] 段内的递增参数
-    for k in bantime.increment bantime.factor bantime.maxtime; do
-        local sshd_has
-        sshd_has=$(awk -v t="$TARGET_JAIL" -v kk="$k" '
-            BEGIN { in_block=0; found=0 }
-            $0 ~ "^\\[" t "\\][[:space:]]*$" { in_block=1; next }
-            /^[[:space:]]*\[/ { in_block=0 }
-            in_block && $0 ~ "^[[:space:]]*" kk "[[:space:]]*=" { found=1 }
-            END { print found }
-        ' "$JAIL_CONF")
-        if [ "$sshd_has" = "1" ]; then
-            $SUDO sed -i "/^\[${TARGET_JAIL}\]/,/^\[/ {/^${k}[[:space:]]*=/d}" "$JAIL_CONF"
-        fi
-    done
+    [ -f "$JAIL_CONF" ] || return 0
+    [ -d "/var/lib/fail2ban" ] || { mkdir -p /var/lib/fail2ban && chmod 755 /var/lib/fail2ban 2>/dev/null || true; }
 
-    # 2. 检查 [DEFAULT] 段是否所有必需参数齐全（递增三参数 + 数据库两参数）
-    local need_fix=0
-    for k in bantime.increment bantime.factor bantime.maxtime dbfile dbpurgeage; do
-        local v
-        v=$(awk -v kk="$k" '
-            BEGIN { in_block=0; result="" }
-            /^\[DEFAULT\][[:space:]]*$/ { in_block=1; next }
-            /^[[:space:]]*\[/ { in_block=0 }
-            in_block && $0 ~ "^[[:space:]]*" kk "[[:space:]]*=" {
-                value=$0
-                sub(/^[[:space:]]*[^=]+=[[:space:]]*/, "", value)
-                sub(/[[:space:]]+$/, "", value)
-                result = value
-            }
-            END { if (result != "") print result }
-        ' "$JAIL_CONF")
-        [ -z "$v" ] && need_fix=1
-    done
-
-    # 3. 缺失则重写 [DEFAULT] 段的全部五行配置
-    if [ "$need_fix" = "1" ]; then
-        # 先清理可能存在的旧配置
-        for k in bantime.increment bantime.factor bantime.maxtime dbfile dbpurgeage; do
-            $SUDO sed -i "/^\[DEFAULT\]/,/^\[/ {/^${k}[[:space:]]*=/d}" "$JAIL_CONF"
-        done
-        # 批量插入完整配置（注意顺序：数据库配置在前，递增配置在后）
-        $SUDO sed -i '/^\[DEFAULT\]/a dbfile = /var/lib/fail2ban/fail2ban.sqlite3\ndbpurgeage = 648000\nbantime.increment = true\nbantime.factor = 2\nbantime.maxtime = 7d' "$JAIL_CONF"
+    # 1. 移除 [sshd] 段内误放的递增参数
+    local tmpf
+    tmpf=$(mktemp "$VPS_RUNTIME_DIR/f2b-migrate.XXXXXX") || return 1
+    if awk -v t="$TARGET_JAIL" '
+        BEGIN { in_target=0 }
+        /^[[:space:]]*\[/ {
+            header=$0; sub(/^[[:space:]]*/, "", header); sub(/[[:space:]]*$/, "", header)
+            in_target = (header == "[" t "]")
+            print; next
+        }
+        in_target && /^[[:space:]]*(bantime\.(increment|factor|maxtime))[[:space:]=]/ { next }
+        { print }
+    ' "$JAIL_CONF" > "$tmpf"; then
+        atomic_write_file "$JAIL_CONF" < "$tmpf"
     fi
+    rm -f "$tmpf"
 
-    # 4. 确保数据库目录存在且权限正确
-    if [ ! -d "/var/lib/fail2ban" ]; then
-        $SUDO mkdir -p /var/lib/fail2ban
-        $SUDO chmod 755 /var/lib/fail2ban
-    fi
+    # 2. 补齐 [DEFAULT] 段的递增与数据库参数
+    local item k v
+    local defaults=(
+        "dbfile=/var/lib/fail2ban/fail2ban.sqlite3"
+        "dbpurgeage=648000"
+        "bantime.increment=true"
+        "bantime.factor=2"
+        "bantime.maxtime=7d"
+    )
+    for item in "${defaults[@]}"; do
+        k="${item%%=*}"; v="${item#*=}"
+        [ -n "$(get_f2b_conf "$k")" ] || set_f2b_conf "$k" "$v"
+    done
 }
 
 check_f2b_install() {
@@ -1255,10 +1075,10 @@ check_f2b_install() {
         fi
 
         # 先生成配置文件（含递增参数 + 数据库配置），保证后续 restart 能读到完整配置
-        [ ! -f "$JAIL_CONF" ] && generate_default_jail_conf | $SUDO tee "$JAIL_CONF" > /dev/null
+        [ ! -f "$JAIL_CONF" ] && generate_default_jail_conf > "$JAIL_CONF"
 
         # 确保数据库目录存在（指数递增依赖数据库持久化 IP 历史封禁次数）
-        [ ! -d "/var/lib/fail2ban" ] && { $SUDO mkdir -p /var/lib/fail2ban; $SUDO chmod 755 /var/lib/fail2ban; }
+        [ ! -d "/var/lib/fail2ban" ] && { mkdir -p /var/lib/fail2ban; chmod 755 /var/lib/fail2ban; }
 
         svc_enable fail2ban
         # 关键修复：包管理器安装时可能已经自动启动 fail2ban（读的是默认 jail.conf），
@@ -1325,11 +1145,11 @@ check_f2b_install() {
                 hash -r 2>/dev/null
                 if command -v fail2ban-client &>/dev/null; then
                     echo -e "${WARN} 检测到残留，尝试 dpkg 强制清除..."
-                    $SUDO dpkg --purge --force-all fail2ban 2>/dev/null || true
+                    dpkg --purge --force-all fail2ban 2>/dev/null || true
                     remove_fail2ban_fallback_files
                     hash -r 2>/dev/null
                 fi
-                $SUDO rm -rf /etc/fail2ban
+                rm -rf /etc/fail2ban
                 remove_fail2ban_fallback_files
                 echo -e "${INFO} ${GREEN}Fail2Ban 已强制卸载。${RESET}"
                 sleep 1
@@ -1358,16 +1178,19 @@ check_f2b_install() {
             commit_f2b_config
             return 1
         fi
-        if ! printf '%s\n' "$generated_jail" | $SUDO tee "$JAIL_CONF" > /dev/null; then
+        if ! printf '%s\n' "$generated_jail" > "$JAIL_CONF"; then
             echo -e "${ERROR} 无法写入 Fail2Ban 配置。"
             restore_f2b_config
             commit_f2b_config
             return 1
         fi
     else
-        if ! grep -q "^\[DEFAULT\]" "$JAIL_CONF"; then
+        if ! grep -Eq "^[[:space:]]*\[DEFAULT\]" "$JAIL_CONF"; then
             local be="auto"; [ "$INIT_SYS" = "systemd" ] && be="systemd"
-            $SUDO sed -i "1i [DEFAULT]\nbackend = ${be}" "$JAIL_CONF"
+            local tmp_d
+            tmp_d=$(mktemp "$VPS_RUNTIME_DIR/f2b-default.XXXXXX") || return 1
+            printf '[DEFAULT]\nbackend = %s\n\n' "$be" | cat - "$JAIL_CONF" > "$tmp_d" && atomic_write_file "$JAIL_CONF" < "$tmp_d"
+            rm -f "$tmp_d"
         fi
         # 迁移老配置：把 [sshd] 段错放的递增参数挪到 [DEFAULT] + 确保数据库配置存在
         migrate_f2b_increment
@@ -1379,7 +1202,7 @@ check_f2b_install() {
                 commit_f2b_config
                 return 1
             fi
-            if ! printf '%s\n' "$generated_jail" | grep -A99 "^\[${TARGET_JAIL}\]" | $SUDO tee -a "$JAIL_CONF" > /dev/null; then
+            if ! printf '%s\n' "$generated_jail" | grep -A99 "^\[${TARGET_JAIL}\]" >> "$JAIL_CONF"; then
                 echo -e "${ERROR} 无法补全 Fail2Ban 配置。"
                 restore_f2b_config
                 commit_f2b_config
@@ -1485,14 +1308,13 @@ uninstall_f2b() {
     # 兜底：apt 卸载失败时用 dpkg 强制清除（dpkg 数据库损坏 / 静默失败场景）
     if command -v fail2ban-client &>/dev/null || dpkg-query -W fail2ban >/dev/null 2>&1; then
         echo -e "${WARN} 检测到 Fail2Ban 残留，尝试 dpkg 强制清除..."
-        $SUDO dpkg --purge --force-all fail2ban 2>/dev/null || true
-        remove_fail2ban_fallback_files
+        dpkg --purge --force-all fail2ban 2>/dev/null || true
     fi
     # 再兜底：仅删除已知的 Fail2Ban 二进制文件名。
     remove_fail2ban_fallback_files
     hash -r 2>/dev/null
     read -rp "是否同时删除配置目录 /etc/fail2ban？(y/N，q=取消): " del_conf
-    [[ "$del_conf" =~ ^[Yy]$ ]] && { $SUDO rm -rf /etc/fail2ban; echo -e "${INFO} 已删除 /etc/fail2ban"; }
+    [[ "$del_conf" =~ ^[Yy]$ ]] && { rm -rf /etc/fail2ban; echo -e "${INFO} 已删除 /etc/fail2ban"; }
     echo -e "${INFO} ${GREEN}Fail2Ban 卸载完成。${RESET}"; sleep 1
     return 0
 }
@@ -1509,7 +1331,7 @@ change_f2b_param() {
         [ -z "$new_val" ] && return
         if [ "$type" == "time" ] && validate_time "$new_val"; then break; fi
         if [ "$type" == "int" ] && validate_int "$new_val"; then break; fi
-        if [ "$type" == "factor" ] && validate_int "$new_val"; then break; fi
+        if [ "$type" == "factor" ] && validate_float "$new_val"; then break; fi
         printf '\033[1A\r\033[2K'
         transient_error "格式错误，请重试。"
     done
@@ -1567,7 +1389,7 @@ unban_f2b_ip() {
         transient_error "IP 或 CIDR 格式不正确。"
         return 1
     fi
-    $SUDO fail2ban-client set "$TARGET_JAIL" unbanip "$target_ip"
+    fail2ban-client set "$TARGET_JAIL" unbanip "$target_ip"
     [ $? -eq 0 ] && echo -e "${INFO} ${GREEN}解封成功: $target_ip${RESET}" || echo -e "${ERROR} 操作失败。"
     sleep 1
 }
@@ -1688,8 +1510,8 @@ menu_f2b_exponential() {
         echo -e "${CYAN}================================================${RESET}"
         echo -e " 说明: 对重复犯错的恶意 IP，封禁时间按设定系数成倍递增"
         echo -e "  ${GREEN}1.${RESET} 递增模式开关   [${S_INC}]"
-        echo -e "  ${GREEN}2.${RESET} 增长系数       [${YELLOW}${fac:-未设置}${RESET}]$(fmt_f2b_unit "$fac" "factor")"
-        echo -e "  ${GREEN}3.${RESET} 封禁上限       [${YELLOW}${max:-未设置}${RESET}]$(fmt_f2b_unit "$max" "time")"
+        echo -e "  ${GREEN}2.${RESET} 增长系数       [${YELLOW}$(fmt_f2b_unit "$fac" "factor")${RESET}]"
+        echo -e "  ${GREEN}3.${RESET} 封禁上限       [${YELLOW}$(fmt_f2b_unit "$max" "time")${RESET}]"
         read_menu_choice "请选择 [1-3]（q=返回）：" '^(1|2|3|[qQ])$' || return
         sc="$REPLY"
         is_q "$sc" && return
@@ -1728,8 +1550,8 @@ manage_fail2ban_menu() {
         echo -e "${CYAN}================================================${RESET}"
         echo -e "  服务状态: $(get_fail2ban_status)"
         echo -e "  ${GREEN}1.${RESET} 最大重试次数 [${YELLOW}${VAL_MAX:-默认}${RESET}]"
-        echo -e "  ${GREEN}2.${RESET} 初始封禁时间 [${YELLOW}${VAL_BAN:-默认}${RESET}]$(fmt_f2b_unit "$VAL_BAN" "time")"
-        echo -e "  ${GREEN}3.${RESET} 检测窗口     [${YELLOW}${VAL_FIND:-默认}${RESET}]$(fmt_f2b_unit "$VAL_FIND" "time")"
+        echo -e "  ${GREEN}2.${RESET} 初始封禁时间 [${YELLOW}$(fmt_f2b_unit "${VAL_BAN:-默认}" "time")${RESET}]"
+        echo -e "  ${GREEN}3.${RESET} 检测窗口     [${YELLOW}$(fmt_f2b_unit "${VAL_FIND:-默认}" "time")${RESET}]"
         echo -e "  ${GREEN}4.${RESET} 手动解封 IP"
         echo -e "  ${GREEN}5.${RESET} 添加 IP 白名单"
         echo -e "  ${GREEN}6.${RESET} 查看封禁日志 (最近20条)"
@@ -1761,13 +1583,14 @@ manage_fail2ban_menu() {
 
 # ============ 状态面板 ============
 show_status() {
-    local port pwd_auth pubkey_auth
-    if ! port=$(read_sshd_config_val "Port" "") || \
-       ! pwd_auth=$(read_sshd_config_val "PasswordAuthentication" "") || \
-       ! pubkey_auth=$(read_sshd_config_val "PubkeyAuthentication" ""); then
+    local port pwd_auth pubkey_auth root_login
+    if ! port=$(read_sshd_config_val "Port") || \
+       ! pwd_auth=$(read_sshd_config_val "PasswordAuthentication") || \
+       ! pubkey_auth=$(read_sshd_config_val "PubkeyAuthentication"); then
         echo -e "${ERROR} 无法读取 SSH 有效配置，状态面板已取消。"
         return 1
     fi
+    root_login=$(read_sshd_config_val "PermitRootLogin" 2>/dev/null || true)
     local f2b_stat; f2b_stat=$(get_fail2ban_status)
     local key_count; key_count=$(count_authorized_keys)
 
@@ -1786,6 +1609,8 @@ show_status() {
     fi
     if [[ "${pwd_auth,,}" == "no" ]]; then
         echo -e " 密码登录 : ${GREEN}已禁用 (PasswordAuthentication no)${RESET}"
+    elif [[ "${root_login,,}" =~ ^(no|prohibit-password|without-password)$ ]]; then
+        echo -e " 密码登录 : ${YELLOW}已启用 (但 PermitRootLogin=${root_login}，root 无法密码登录)${RESET}"
     else
         echo -e " 密码登录 : ${YELLOW}已启用 (推荐配置密钥后禁用)${RESET}"
     fi
@@ -1877,8 +1702,8 @@ generate_vps_keypair() {
     echo -e "${GREEN}${BOLD}公钥（可上传到 GitHub）：${RESET}"
     echo -e "${GREEN}${pub_content}${RESET}"
 
-    read -rp "确认已保存/下载密钥，是否立即删除 VPS 上的暂存密钥文件？(Y/n，q=取消): " rm_confirm
-    if [[ -z "$rm_confirm" || "$rm_confirm" =~ ^[Yy]$ ]]; then
+    read -rp "确认已保存/下载密钥，是否立即删除 VPS 上的暂存密钥文件？(y/N，q=取消): " rm_confirm
+    if [[ "$rm_confirm" =~ ^[Yy]$ ]]; then
         rm -f "$key_file" "$pub_file"
         echo -e "${INFO} ${GREEN}已成功删除 VPS 上的暂存密钥文件。${RESET}"
     else
@@ -2195,7 +2020,7 @@ manage_keys_menu() {
         echo -e " 输入 ${GREEN}[q]${RESET}    : 返回上级菜单"
         echo -e "${CYAN}================================================${RESET}"
         while true; do
-            read -rp "请输入操作指令（序号/all/q）：" key_action
+            read -rp "请输入操作指令（序号/all/q）：" key_action || return
             if is_q "$key_action" || [ "$key_action" = "all" ] || \
                { [[ "$key_action" =~ ^[0-9]+$ ]] && [ "$key_action" -ge 1 ] && [ "$key_action" -le "${#key_contents[@]}" ]; }; then
                 break
@@ -2282,6 +2107,15 @@ toggle_password_login() {
                 echo -e "${ERROR} SSH 重启失败，正在恢复原配置。"
                 rollback_ssh_config
             else
+                local root_login
+                root_login=$(read_sshd_config_val "PermitRootLogin" 2>/dev/null || true)
+                if [[ "${root_login,,}" =~ ^(no|prohibit-password|without-password)$ ]]; then
+                    echo -e "${WARN} 检测到当前 PermitRootLogin 为 ${root_login}，root 仍无法通过密码登录！"
+                    read -rp "是否将 PermitRootLogin 设置为 yes 以允许 root 密码登录？(Y/n，q=取消): " root_confirm
+                    if [[ -z "$root_confirm" || "$root_confirm" =~ ^[Yy]$ ]]; then
+                        set_sshd_config "PermitRootLogin" "yes" && restart_sshd
+                    fi
+                fi
                 commit_ssh_config
                 echo -e "${INFO} 已成功启用密码登录。"
 
@@ -2429,8 +2263,7 @@ change_ssh_port() {
     FIREWALL_BACKEND=""
     FIREWALL_RULE_ADDED=0
     FIREWALL_PORT=""
-    if ! current_port=$(get_sshd_config_val "Port" "") || [ -z "$current_port" ]; then
-        echo -e "${ERROR} 无法安全读取当前 SSH 端口，已取消操作。"
+    if ! current_port=$(read_sshd_config_val "Port"); then
         sleep 1
         return 1
     fi
@@ -2640,16 +2473,6 @@ atomic_write_file() {
     mv -f "$tmp" "$file" || { rm -f "$tmp"; return 1; }
 }
 
-# 配置适配器统一入口；调用方可在写入前使用 transaction_backup_file。
-config_write_atomic() {
-    atomic_write_file "$@"
-}
-
-config_validate_command() {
-    local label="$1"; shift
-    run_command "$label" "$@"
-}
-
 sysctl_set() {
     local key="$1" value="$2" tmp mode=""
     backup_sysctl_conf || return 1
@@ -2730,9 +2553,9 @@ run_system_cleanup() {
 
 current_timezone() {
     local tz=""
-    [ -f /etc/timezone ] && tz=$(cat /etc/timezone 2>/dev/null)
-    [ -z "$tz" ] && command -v timedatectl &>/dev/null && tz=$(timedatectl show -p Timezone --value 2>/dev/null)
+    command -v timedatectl &>/dev/null && tz=$(timedatectl show -p Timezone --value 2>/dev/null)
     [ -z "$tz" ] && tz=$(readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||')
+    [ -z "$tz" ] && [ -f /etc/timezone ] && tz=$(cat /etc/timezone 2>/dev/null)
     [ -z "$tz" ] && tz="未知"
     printf '%s\n' "$tz"
 }
@@ -2782,6 +2605,8 @@ manage_bbr() {
     echo -e "当前状态：拥塞控制=${current_cc:-未知}，队列调度=${current_qdisc:-未知}"
     read -rp "是否配置 BBR + FQ？(y/N，q=取消): " confirm
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        modprobe tcp_bbr 2>/dev/null || true
+        modprobe sch_fq 2>/dev/null || true
         if ! backup_sysctl_conf || ! sysctl_set "net.core.default_qdisc" "fq" || \
            ! sysctl_set "net.ipv4.tcp_congestion_control" "bbr" || ! sysctl -p >/dev/null 2>&1; then
             restore_sysctl_conf
@@ -2932,8 +2757,6 @@ compose_available() {
 check_docker_latest() {
     local compose_pkg docker_pkg
     LATEST_DOCKER=""; LATEST_COMPOSE=""
-    echo -e "${INFO} 正在刷新 ${OS_SHORT} 软件包索引..."
-    refresh_package_index || return 1
     case "$OS_ID" in
         debian) docker_pkg=docker.io ;;
         alpine) docker_pkg=docker ;;
@@ -2988,11 +2811,12 @@ remove_docker() {
                 rc=1
             fi
         fi
-        if [ "$rc" -eq 0 ] && [ "${#packages[@]}" -gt 0 ] && ! pkg_remove_many "${packages[@]}"; then
+        if [ "$rc" -eq 0 ] && [ "${#packages[@]}" -gt 0 ] && ! pkg_remove "${packages[@]}"; then
             rc=1
         fi
     else
         svc_stop docker || true
+        svc_disable docker 2>/dev/null || true
         for pkg in docker-ce docker-ce-cli containerd.io containerd docker-compose-plugin docker-buildx-plugin docker.io docker-compose docker-compose-v2; do
             if [ "${CONTAINERD_SHARED_USE:-0}" -eq 1 ] && \
                { [ "$pkg" = "containerd.io" ] || [ "$pkg" = "containerd" ]; }; then
@@ -3005,7 +2829,7 @@ remove_docker() {
         if [ "${CONTAINERD_SHARED_USE:-0}" -eq 1 ]; then
             echo -e "${WARN} 检测到可能由其他运行时使用 containerd，已跳过 containerd/containerd.io 软件包及自动依赖清理。${RESET}"
         fi
-        if [ "${#packages[@]}" -gt 0 ] && ! pkg_remove_many "${packages[@]}"; then
+        if [ "${#packages[@]}" -gt 0 ] && ! pkg_remove "${packages[@]}"; then
             rc=1
         fi
         if [ "$rc" -eq 0 ] && [ "${CONTAINERD_SHARED_USE:-0}" -eq 0 ] && \
@@ -3129,6 +2953,13 @@ manage_timezone() {
     echo -e "当前时区：${CYAN}${tz}${RESET}"
     read -rp "是否设置为 Asia/Shanghai？(y/N，q=取消): " confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || { sleep 1; return; }
+    if command -v timedatectl &>/dev/null && [ "$INIT_SYS" = "systemd" ]; then
+        if timedatectl set-timezone Asia/Shanghai 2>/dev/null; then
+            echo -e "${INFO} ${GREEN}时区已设置为 Asia/Shanghai。${RESET}"
+            sleep 1
+            return 0
+        fi
+    fi
     local zoneinfo="/usr/share/zoneinfo/Asia/Shanghai"
     if [ "$OS_ID" = "alpine" ] && [ ! -f "$zoneinfo" ]; then
         if ! pkg_install tzdata; then
