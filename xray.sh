@@ -2,37 +2,28 @@
 # ==============================================================================
 #  xray.sh - Minimalist Xray Core Management Script
 #  Supported OS: Debian / Ubuntu / Alpine Linux
-#  Protocols:    VLESS, VMess, Trojan, Shadowsocks, Hysteria (Hysteria 2)
+#  Protocols:    VLESS, VMess, Trojan, Shadowsocks, Hysteria 2
 #  Transports:   xhttp, grpc, websocket, raw/tcp
 # ==============================================================================
 
 if [ -z "$BASH_VERSION" ]; then
-    case "$(basename "$0")" in
-        sh|bash|ash|-sh|-bash|-ash) ;;
-        *)
-            if ! command -v bash >/dev/null 2>&1; then
-                if [ -f /etc/alpine-release ]; then
-                    if ! wget -q -T 3 -O /dev/null "https://dl-cdn.alpinelinux.org/alpine/" 2>/dev/null; then
-                        for m in "http://mirror.yandex.ru/mirrors/alpine" "http://mirrors.edge.kernel.org/alpine"; do
-                            if wget -q -T 3 -O /dev/null "$m/" 2>/dev/null; then
-                                sed -i "s|https\?://dl-cdn.alpinelinux.org/alpine|$m|g" /etc/apk/repositories 2>/dev/null || true
-                                break
-                            fi
-                        done
-                    fi
-                    apk update >/dev/null 2>&1 && apk add bash >/dev/null 2>&1
-                elif [ -f /etc/debian_version ]; then
-                    apt-get update -y >/dev/null 2>&1 && apt-get install -y bash >/dev/null 2>&1
-                fi
-            fi
-            exec bash "$0" "$@"
-            ;;
-    esac
+    if ! command -v bash >/dev/null 2>&1; then
+        if [ -f /etc/alpine-release ]; then
+            apk update >/dev/null 2>&1 && apk add bash >/dev/null 2>&1
+        elif [ -f /etc/debian_version ] || [ -f /etc/os-release ]; then
+            apt-get update -y >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y bash >/dev/null 2>&1
+        fi
+    fi
+    if [ -f "$0" ] && [ "$0" != "sh" ] && [ "$0" != "bash" ]; then
+        exec bash "$0" "$@"
+    else
+        exec bash -s -- "$@"
+    fi
 fi
 
 set -o pipefail
-if [ ! -t 0 ] && { exec < /dev/tty; } 2>/dev/null; then
-    :
+if [ ! -t 0 ]; then
+    { exec < /dev/tty; } 2>/dev/null || true
 fi
 
 # ------------------------------------------------------------------------------
@@ -67,7 +58,7 @@ fi
 # ------------------------------------------------------------------------------
 # UI Helpers
 # ------------------------------------------------------------------------------
-line() { echo -e "${C_GRAY}────────────────────────────────────────────────────────────────${C_RESET}"; }
+line()        { echo -e "${C_GRAY}────────────────────────────────────────────────────────────────${C_RESET}"; }
 log_info()    { echo -e "  ${C_CYAN}›${C_RESET} $1"; }
 log_success() { echo -e "  ${C_GREEN}✔${C_RESET} $1"; }
 log_warn()    { echo -e "  ${C_YELLOW}!${C_RESET} $1"; }
@@ -99,7 +90,7 @@ header() {
     [ "$rem" -lt 1 ] && rem=1
 
     printf "  ${C_BOLD}%-32s${C_RESET} ${C_GRAY}状态:${C_RESET} %b\n" "Xray Core Manager" "$status_str"
-    printf "  ${C_GRAY}系统:${C_RESET} %-26s ${C_GRAY}地址:${C_RESET} %s\n" "$OS_NAME ($ARCH)" "$ip_str"
+    printf "  ${C_GRAY}系统:${C_RESET} %-26s ${C_GRAY}地址:${C_RESET} %s\n" "${OS_NAME:-Linux} (${ARCH:-64})" "$ip_str"
     printf "  ${C_GRAY}节点:${C_RESET} %d 个活跃入站%*s${C_GRAY}自启:${C_RESET} %b\n" "$node_count" "$rem" "" "$auto_str"
     line
 }
@@ -150,14 +141,27 @@ check_root() {
 }
 
 detect_os() {
-    if [ -f /etc/alpine-release ]; then
+    if [ -f /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        OS_NAME="${PRETTY_NAME:-$NAME}"
+        case "$ID" in
+            alpine) OS_TYPE="alpine" ;;
+            debian|ubuntu|kali|armbian) OS_TYPE="debian" ;;
+            *)
+                if [[ "${ID_LIKE:-}" == *debian* ]] || [[ "${ID_LIKE:-}" == *ubuntu* ]]; then
+                    OS_TYPE="debian"
+                else
+                    OS_TYPE="unknown"
+                fi
+                ;;
+        esac
+    elif [ -f /etc/alpine-release ]; then
         OS_TYPE="alpine"
-        OS_NAME="Alpine $(cat /etc/alpine-release 2>/dev/null || echo "")"
+        OS_NAME="Alpine $(cat /etc/alpine-release 2>/dev/null)"
     elif [ -f /etc/debian_version ]; then
         OS_TYPE="debian"
-        local dver
-        dver=$(cat /etc/debian_version 2>/dev/null || echo "")
-        OS_NAME="Debian ${dver%%.*}"
+        OS_NAME="Debian $(cat /etc/debian_version 2>/dev/null)"
     else
         OS_TYPE="unknown"
         OS_NAME="Linux"
@@ -198,10 +202,10 @@ format_url_host() {
 get_public_ip() {
     [ -n "$SERVER_IP" ] && return
     if ip -4 route show default 2>/dev/null | grep -q default; then
-        SERVER_IP=$(curl -s4m 2 https://api.ipify.org || curl -s4m 2 https://ipv4.icanhazip.com || curl -s4m 2 https://ifconfig.me 2>/dev/null || echo "")
+        SERVER_IP=$(curl -s4m 3 https://api.ipify.org || curl -s4m 3 https://ipv4.icanhazip.com || curl -s4m 3 https://ifconfig.me 2>/dev/null || echo "")
     fi
     if [ -z "$SERVER_IP" ]; then
-        SERVER_IP=$(curl -s6m 2 https://api6.ipify.org || curl -s6m 2 https://ipv6.icanhazip.com || curl -s6m 2 https://api64.ipify.org 2>/dev/null || echo "")
+        SERVER_IP=$(curl -s6m 3 https://api6.ipify.org || curl -s6m 3 https://ipv6.icanhazip.com || curl -s6m 3 https://api64.ipify.org 2>/dev/null || echo "")
     fi
     [ -z "$SERVER_IP" ] && SERVER_IP="127.0.0.1"
 }
@@ -212,8 +216,8 @@ check_ipv6_only() {
             if ! curl -sIm 3 https://github.com >/dev/null 2>&1 && ! wget -q -T 3 -O /dev/null https://github.com 2>/dev/null; then
                 log_info "检测到纯 IPv6 环境，正在接入 DNS64 加速通道..."
                 if ! grep -q "2001:67c:2b0::4" /etc/resolv.conf 2>/dev/null; then
-                    echo "nameserver 2001:67c:2b0::4" >> /etc/resolv.conf 2>/dev/null || true
-                    echo "nameserver 2a01:4f8:c2c:123f::1" >> /etc/resolv.conf 2>/dev/null || true
+                    sed -i '1i nameserver 2001:67c:2b0::4\nnameserver 2a01:4f8:c2c:123f::1' /etc/resolv.conf 2>/dev/null || \
+                    echo -e "nameserver 2001:67c:2b0::4\nnameserver 2a01:4f8:c2c:123f::1" >> /etc/resolv.conf 2>/dev/null || true
                 fi
             fi
         fi
@@ -257,13 +261,22 @@ setup_shortcut() {
     if [ -f "$OPENRC_SERVICE" ] && grep -q 'command="/usr/local/bin/xray"' "$OPENRC_SERVICE"; then
         sed -i "s|command=\"/usr/local/bin/xray\"|command=\"$XRAY_BIN\"|g" "$OPENRC_SERVICE"
     fi
+
     local target_script="$SCRIPT_SELF"
-    if [ -f "$target_script" ] && [ "$target_script" != "$SCRIPT_LINK" ] && [[ "$target_script" != /proc/* ]] && [[ "$target_script" != /dev/fd/* ]]; then
+    if [ "$target_script" = "$SCRIPT_LINK" ]; then
+        chmod +x "$SCRIPT_LINK" 2>/dev/null || true
+        return
+    fi
+
+    if [ -f "$target_script" ] && [[ "$target_script" != /proc/* ]] && [[ "$target_script" != /dev/fd/* ]]; then
         cp -f "$target_script" "$SCRIPT_LINK" 2>/dev/null || true
     else
-        if [ ! -s "$SCRIPT_LINK" ]; then
-            curl -fsSL "$SCRIPT_URL" -o "$SCRIPT_LINK" 2>/dev/null || \
-            wget -qO "$SCRIPT_LINK" "$SCRIPT_URL" 2>/dev/null || true
+        local tmp_sh="/tmp/xray_sh_$$"
+        if curl -fsSL "$SCRIPT_URL" -o "$tmp_sh" 2>/dev/null || wget -qO "$tmp_sh" "$SCRIPT_URL" 2>/dev/null; then
+            if [ -s "$tmp_sh" ]; then
+                mv -f "$tmp_sh" "$SCRIPT_LINK" 2>/dev/null || true
+            fi
+            rm -f "$tmp_sh" 2>/dev/null || true
         fi
     fi
     chmod +x "$SCRIPT_LINK" 2>/dev/null || true
@@ -273,10 +286,7 @@ setup_shortcut() {
 # Service Lifecycle
 # ------------------------------------------------------------------------------
 is_installed() {
-    if [ -f "$XRAY_BIN" ] && ! head -c 4 "$XRAY_BIN" 2>/dev/null | grep -q "ELF"; then
-        rm -f "$XRAY_BIN"
-    fi
-    [ -f "$XRAY_BIN" ] && [ -x "$XRAY_BIN" ] && head -c 4 "$XRAY_BIN" 2>/dev/null | grep -q "ELF"
+    [ -x "$XRAY_BIN" ] && head -c 4 "$XRAY_BIN" 2>/dev/null | grep -q "ELF"
 }
 
 is_running() {
@@ -343,8 +353,8 @@ service_ctrl() {
             ;;
     esac
 }
-service_start() { service_ctrl start; }
-service_stop() { service_ctrl stop; }
+service_start()   { service_ctrl start; }
+service_stop()    { service_ctrl stop; }
 service_restart() { service_ctrl restart; }
 
 service_toggle_autostart() {
@@ -363,14 +373,11 @@ view_logs() {
     header
     echo -e "  ${C_CYAN}实时日志 (Ctrl+C 返回):${C_RESET}"
     line
-    if [ -f "$XRAY_ERROR_LOG" ] || [ -f "$XRAY_ACCESS_LOG" ]; then
-        trap ' ' INT
-        tail -n 50 -f "$XRAY_ERROR_LOG" "$XRAY_ACCESS_LOG" 2>/dev/null
-        trap - INT
-    else
-        log_warn "暂无日志"
-        pause
-    fi
+    mkdir -p "$XRAY_LOG_DIR"
+    touch "$XRAY_ERROR_LOG" "$XRAY_ACCESS_LOG"
+    trap ' ' INT
+    tail -n 50 -f "$XRAY_ERROR_LOG" "$XRAY_ACCESS_LOG" 2>/dev/null
+    trap - INT
 }
 
 # ------------------------------------------------------------------------------
@@ -386,6 +393,7 @@ get_latest_xray_version() {
 init_config_if_needed() {
     mkdir -p "$XRAY_CONFIG_DIR" "$XRAY_CERTS_DIR" "$XRAY_LOG_DIR" "$XRAY_SHARE_DIR"
     touch "$XRAY_ACCESS_LOG" "$XRAY_ERROR_LOG"
+    chown -R root:root "$XRAY_LOG_DIR" "$XRAY_CONFIG_DIR" "$XRAY_SHARE_DIR" 2>/dev/null || true
     chmod 755 "$XRAY_LOG_DIR" && chmod 644 "$XRAY_ACCESS_LOG" "$XRAY_ERROR_LOG"
     if [ ! -s "$XRAY_CONFIG" ]; then
         local freedom_settings="{}"
@@ -414,7 +422,7 @@ After=network.target nss-lookup.target
 [Service]
 Type=simple
 User=root
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 ExecStart=$XRAY_BIN run -c $XRAY_CONFIG
@@ -473,7 +481,12 @@ install_xray() {
         pause && return 1
     fi
 
-    unzip -q -o "$tmp_dir/xray.zip" -d "$tmp_dir"
+    if ! unzip -q -o "$tmp_dir/xray.zip" -d "$tmp_dir" || [ ! -f "$tmp_dir/xray" ]; then
+        log_error "解压核心失败"
+        rm -rf "$tmp_dir"
+        pause && return 1
+    fi
+
     install -m 755 "$tmp_dir/xray" "$XRAY_BIN"
     [ -f "$tmp_dir/geoip.dat" ] && install -m 644 "$tmp_dir/geoip.dat" "$XRAY_SHARE_DIR/"
     [ -f "$tmp_dir/geosite.dat" ] && install -m 644 "$tmp_dir/geosite.dat" "$XRAY_SHARE_DIR/"
@@ -515,13 +528,11 @@ uninstall_xray() {
     fi
 
     log_info "清理核心与配置文件..."
-    rm -rf "$XRAY_SHARE_DIR" "$XRAY_CONFIG_DIR" "$XRAY_LOG_DIR"
-    rm -rf /etc/xray /var/log/xray /usr/local/etc/xray /usr/local/share/xray
-    rm -f /usr/local/bin/xray-core /usr/local/bin/geoip.dat /usr/local/bin/geosite.dat
-    rm -f "$DAEMON_PID_FILE" /run/xray.pid /var/run/xray.pid
+    rm -rf "$XRAY_SHARE_DIR" "$XRAY_CONFIG_DIR" "$XRAY_LOG_DIR" /etc/xray
+    rm -f /usr/local/bin/xray-core /usr/local/bin/geoip.dat /usr/local/bin/geosite.dat "$DAEMON_PID_FILE" /run/xray.pid /var/run/xray.pid
 
     log_info "清理快捷指令..."
-    rm -f "$SCRIPT_LINK" /usr/local/bin/xray /usr/local/bin/xrsy /usr/bin/xray /usr/bin/xrsy
+    rm -f "$SCRIPT_LINK" /usr/local/bin/xrsy /usr/bin/xray /usr/bin/xrsy
 
     log_success "Xray 已彻底卸载"
     echo ""
@@ -529,7 +540,7 @@ uninstall_xray() {
 }
 
 # ------------------------------------------------------------------------------
-# Helpers: Math, Random, Certs
+# Helpers: Math, Random, Certs, Config Validation
 # ------------------------------------------------------------------------------
 rand_port() {
     local p
@@ -545,15 +556,15 @@ rand_uuid() {
     openssl rand -hex 16 | sed -E 's/(.{8})(.{4})(.{4})(.{4})(.{12})/\1-\2-\3-\4-\5/'
 }
 
-rand_str() { openssl rand -base64 "${1:-16}" | tr -dc 'a-zA-Z0-9' | head -c "${1:-16}"; }
-urlencode() { jq -rn --arg x "$1" '$x|@uri'; }
+rand_str()      { openssl rand -base64 "${1:-16}" | tr -dc 'a-zA-Z0-9' | head -c "${1:-16}"; }
+urlencode()     { jq -rn --arg x "$1" '$x|@uri'; }
 base64_encode() { echo -n "$1" | base64 | tr -d '\r\n'; }
 
 is_port_used() {
     local port="$1"
     [ -f "$XRAY_CONFIG" ] && jq -e --argjson p "$port" '.inbounds[]? | select(.port == $p)' "$XRAY_CONFIG" >/dev/null 2>&1 && return 0
-    command -v ss >/dev/null 2>&1 && ss -tunlp 2>/dev/null | grep -E -q "[:]$port([[:space:]]|$)" && return 0
-    command -v netstat >/dev/null 2>&1 && netstat -tunlp 2>/dev/null | grep -E -q "[:]$port([[:space:]]|$)" && return 0
+    command -v ss >/dev/null 2>&1 && ss -tunl 2>/dev/null | grep -E -q "[:]$port([[:space:]]|$)" && return 0
+    command -v netstat >/dev/null 2>&1 && netstat -tunl 2>/dev/null | grep -E -q "[:]$port([[:space:]]|$)" && return 0
     return 1
 }
 
@@ -661,7 +672,7 @@ add_node_wizard() {
         transport="hysteria" security="tls"
     fi
 
-    # Port
+    # Port selection
     local def_port="443"
     [ "$security" = "none" ] && [ "$protocol" != "shadowsocks" ] && def_port="80"
     [ "$protocol" = "shadowsocks" ] && def_port=$(rand_port)
@@ -703,9 +714,11 @@ add_node_wizard() {
     fi
 
     # Transport Path / ServiceName
-    [ "$transport" = "xhttp" ] && prompt_input "分流路径" "/$(rand_str 8)" path
-    [ "$transport" = "ws" ] && prompt_input "分流路径" "/$(rand_str 8)" path
-    [ "$transport" = "ws" ] && [ "$security" = "none" ] && prompt_input "CDN 伪装域名/Host (可选)" "" sni
+    if [ "$transport" = "xhttp" ] || [ "$transport" = "ws" ]; then
+        prompt_input "分流路径" "/$(rand_str 8)" path
+        [[ "$path" != /* ]] && path="/$path"
+    fi
+    [ "$security" = "none" ] && { [ "$transport" = "ws" ] || [ "$transport" = "xhttp" ]; } && prompt_input "CDN 伪装域名/Host (可选)" "" sni
     [ "$transport" = "grpc" ] && prompt_input "gRPC serviceName" "grpc-$(rand_str 6)" service_name
 
     # Security (REALITY / TLS)
@@ -732,8 +745,10 @@ add_node_wizard() {
             insecure="1"
         else
             prompt_input "域名 (SNI)" "example.com" sni
-            prompt_input "证书 .crt 绝对路径" "/root/cert.crt" cert_file
+            prompt_input "证书 .crt/.pem 绝对路径" "/root/cert.crt" cert_file
             prompt_input "私钥 .key 绝对路径" "/root/private.key" key_file
+            [ ! -f "$cert_file" ] && log_warn "提示: 证书文件当前不存在，请稍后补全"
+            [ ! -f "$key_file" ] && log_warn "提示: 私钥文件当前不存在，请稍后补全"
             insecure="0"
         fi
         [ "$protocol" = "vless" ] && [ "$transport" = "tcp" ] && flow="xtls-rprx-vision"
@@ -806,27 +821,70 @@ add_node_wizard() {
 # ------------------------------------------------------------------------------
 parse_node_meta() {
     local node="$1"
-    IFS='|' read -r _ port meta_proto meta_trans meta_sec meta_rmk meta_path meta_svc meta_sni meta_pbk meta_sid meta_insec meta_flow id_or_pwd < <(
-        echo "$node" | jq -r '[
-            .protocol, (.port | tostring), (._meta.protocol // .protocol),
-            (._meta.transport // .streamSettings.network // "raw"), (._meta.security // .streamSettings.security // "none"),
-            (._meta.remark // .tag // "Node"), (._meta.path // .streamSettings.xhttpSettings.path // .streamSettings.wsSettings.path // ""),
-            (._meta.serviceName // .streamSettings.grpcSettings.serviceName // ""), (._meta.sni // .streamSettings.realitySettings.serverNames[0] // ""),
-            (._meta.publicKey // ""), (._meta.shortId // .streamSettings.realitySettings.shortIds[0] // ""), (._meta.insecure // "0"),
+    {
+        read -r _
+        read -r port
+        read -r meta_proto
+        read -r meta_trans
+        read -r meta_sec
+        read -r meta_rmk
+        read -r meta_path
+        read -r meta_svc
+        read -r meta_sni
+        read -r meta_pbk
+        read -r meta_sid
+        read -r meta_insec
+        read -r meta_flow
+        read -r id_or_pwd
+        read -r meta_address
+    } < <(
+        echo "$node" | jq -r '
+            .protocol,
+            (.port | tostring),
+            (._meta.protocol // .protocol),
+            (._meta.transport // .streamSettings.network // "raw"),
+            (._meta.security // .streamSettings.security // "none"),
+            (._meta.remark // .tag // "Node"),
+            (._meta.path // .streamSettings.xhttpSettings.path // .streamSettings.wsSettings.path // ""),
+            (._meta.serviceName // .streamSettings.grpcSettings.serviceName // ""),
+            (._meta.sni // .streamSettings.realitySettings.serverNames[0] // .streamSettings.tlsSettings.serverName // ""),
+            (._meta.publicKey // ""),
+            (._meta.shortId // .streamSettings.realitySettings.shortIds[0] // ""),
+            (._meta.insecure // "0"),
             (._meta.flow // .settings.users[0].flow // .settings.clients[0].flow // ""),
-            (.settings.users[0].id // .settings.clients[0].id // .settings.users[0].password // .settings.clients[0].password // .settings.users[0].auth // .settings.clients[0].auth // .settings.password // "")
-        ] | join("|")'
+            (.settings.users[0].id // .settings.clients[0].id // .settings.users[0].password // .settings.clients[0].password // .settings.users[0].auth // .settings.clients[0].auth // .settings.password // ""),
+            (._meta.address // "")
+        '
     )
 }
 
+get_connect_host() {
+    if [ -n "$meta_address" ]; then
+        format_url_host "$meta_address"
+        return
+    fi
+    # 套 CDN 或配置了域名证书的 TLS 节点，优先使用域名作为连接地址
+    if [ "$meta_sec" = "tls" ] && [ -n "$meta_sni" ] && [ "$meta_insec" != "1" ]; then
+        echo "$meta_sni"
+        return
+    fi
+    # 明文传输 (None) 但配置了 CDN 域名/Host 的节点
+    if [ "$meta_sec" = "none" ] && [ -n "$meta_sni" ]; then
+        echo "$meta_sni"
+        return
+    fi
+    [ -z "$SERVER_IP" ] && get_public_ip
+    format_url_host "${SERVER_IP:-127.0.0.1}"
+}
+
 build_share_link() {
-    local enc_rmk enc_path link="" url_host
+    local enc_rmk enc_path link="" connect_host
     enc_rmk=$(urlencode "$meta_rmk") enc_path=$(urlencode "$meta_path")
-    url_host=$(format_url_host "$SERVER_IP")
+    connect_host=$(get_connect_host)
 
     case "$meta_proto" in
         vless)
-            link="vless://${id_or_pwd}@${url_host}:${port}?type=${meta_trans}&security=${meta_sec}"
+            link="vless://${id_or_pwd}@${connect_host}:${port}?type=${meta_trans}&security=${meta_sec}"
             [ "$meta_sec" = "reality" ] && link="${link}&pbk=${meta_pbk}&fp=chrome&sni=${meta_sni}&sid=${meta_sid}"
             [ "$meta_sec" = "tls" ] && link="${link}&fp=chrome&sni=${meta_sni}"
             [ "$meta_trans" = "xhttp" ] && link="${link}&path=${enc_path}&mode=auto"
@@ -841,27 +899,27 @@ build_share_link() {
             [ "$meta_trans" = "grpc" ] && v_path="$meta_svc"
             local vjson
             vjson=$(jq -c -n \
-                --arg ps "$meta_rmk" --arg add "$SERVER_IP" --argjson port "$port" \
+                --arg ps "$meta_rmk" --arg add "$connect_host" --argjson port "$port" \
                 --arg id "$id_or_pwd" --arg net "$meta_trans" --arg host "$meta_sni" \
                 --arg path "$v_path" --arg tls "$tls_flag" \
                 '{v:"2", ps:$ps, add:$add, port:$port, id:$id, aid:0, scy:"auto", net:$net, type:"none", host:$host, path:$path, tls:$tls}')
             link="vmess://$(base64_encode "$vjson")"
             ;;
         trojan)
-            link="trojan://${id_or_pwd}@${url_host}:${port}?security=${meta_sec}&sni=${meta_sni}&type=${meta_trans}"
+            link="trojan://${id_or_pwd}@${connect_host}:${port}?security=${meta_sec}&sni=${meta_sni}&type=${meta_trans}"
             [ "$meta_sec" = "reality" ] && link="${link}&pbk=${meta_pbk}&sid=${meta_sid}&fp=chrome"
             [ "$meta_trans" = "ws" ] && link="${link}&path=${enc_path}" && [ -n "$meta_sni" ] && link="${link}&host=${meta_sni}"
             [ "$meta_trans" = "grpc" ] && link="${link}&serviceName=${meta_svc}"
-            [ "$meta_trans" = "xhttp" ] && link="${link}&path=${enc_path}"
+            [ "$meta_trans" = "xhttp" ] && link="${link}&path=${enc_path}&mode=auto"
             link="${link}#${enc_rmk}"
             ;;
         shadowsocks)
             local method
             method=$(echo "$node" | jq -r '.settings.method // ""')
-            link="ss://$(base64_encode "${method}:${id_or_pwd}")@${url_host}:${port}#${enc_rmk}"
+            link="ss://$(base64_encode "${method}:${id_or_pwd}")@${connect_host}:${port}#${enc_rmk}"
             ;;
         hysteria)
-            link="hysteria2://${id_or_pwd}@${url_host}:${port}/?sni=${meta_sni}&insecure=${meta_insec}#${enc_rmk}"
+            link="hysteria2://${id_or_pwd}@${connect_host}:${port}/?sni=${meta_sni}&insecure=${meta_insec}#${enc_rmk}"
             ;;
     esac
     echo "$link"
@@ -873,12 +931,20 @@ view_node_detail() {
     [ -z "$node" ] || [ "$node" = "null" ] && { log_error "节点不存在"; pause; return; }
 
     parse_node_meta "$node"
+    local connect_host
+    connect_host=$(get_connect_host)
+
     header
     echo -e "  ${C_BOLD}节点配置详情${C_RESET}"
     line
     printf "  ${C_GRAY}备注名称${C_RESET}  %s\n" "$meta_rmk"
     printf "  ${C_GRAY}协议类型${C_RESET}  %s\n" "${meta_proto^^}"
-    printf "  ${C_GRAY}服务器IP${C_RESET}  %s\n" "$SERVER_IP"
+    if [ "$connect_host" != "$SERVER_IP" ] && [ "$connect_host" != "[$SERVER_IP]" ]; then
+        printf "  ${C_GRAY}连接地址${C_RESET}  %s (域名/CDN)\n" "$connect_host"
+        printf "  ${C_GRAY}服务器IP${C_RESET}  %s\n" "${SERVER_IP:-获取中...}"
+    else
+        printf "  ${C_GRAY}服务器IP${C_RESET}  %s\n" "${SERVER_IP:-获取中...}"
+    fi
     printf "  ${C_GRAY}监听端口${C_RESET}  %s\n" "$port"
     printf "  ${C_GRAY}传输方式${C_RESET}  %s\n" "$meta_trans"
     printf "  ${C_GRAY}安全加密${C_RESET}  %s\n" "${meta_sec^^}"
@@ -894,7 +960,13 @@ view_node_detail() {
 
     [ -n "$meta_path" ] && printf "  ${C_GRAY}分流路径${C_RESET}  %s\n" "$meta_path"
     [ -n "$meta_svc" ] && printf "  ${C_GRAY}服务名称${C_RESET}  %s\n" "$meta_svc"
-    [ -n "$meta_sni" ] && printf "  ${C_GRAY}伪装域名${C_RESET}  %s\n" "$meta_sni"
+    if [ -n "$meta_sni" ]; then
+        if [ "$meta_sec" = "reality" ]; then
+            printf "  ${C_GRAY}伪装域名${C_RESET}  %s (REALITY)\n" "$meta_sni"
+        else
+            printf "  ${C_GRAY}域名(SNI)${C_RESET} %s\n" "$meta_sni"
+        fi
+    fi
     [ -n "$meta_pbk" ] && printf "  ${C_GRAY}公钥 PBK${C_RESET}  %s\n" "$meta_pbk"
     [ -n "$meta_sid" ] && printf "  ${C_GRAY}Short ID${C_RESET}  %s\n" "$meta_sid"
     [ "$meta_sec" = "tls" ] && [ "$meta_insec" = "1" ] && printf "  ${C_GRAY}自签证书${C_RESET}  %s (insecure=1)\n" "允许"
@@ -913,7 +985,7 @@ view_node_detail() {
         line
         echo -e "  ${C_BOLD}客户端 Outbound 配置:${C_RESET}"
         echo "$node" | jq \
-            --arg ip "$SERVER_IP" --arg pbk "$meta_pbk" --arg sid "$meta_sid" --arg sni "$meta_sni" --arg auth "$id_or_pwd" \
+            --arg ip "$connect_host" --arg pbk "$meta_pbk" --arg sid "$meta_sid" --arg sni "$meta_sni" --arg auth "$id_or_pwd" \
             '{
                 tag: ("proxy-" + .protocol), protocol: .protocol,
                 settings: (if .protocol == "vless" then {vnext: [{address: $ip, port: .port, users: [{id: (.settings.users[0].id // .settings.clients[0].id), encryption: "none"} + (if (._meta.flow // "") != "" then {flow: ._meta.flow} else {} end)]}]}
@@ -933,6 +1005,15 @@ view_node_detail() {
             }'
         pause
     fi
+}
+
+print_node_list() {
+    local i=1
+    while IFS='|' read -r p_port p_proto p_rmk; do
+        [ -z "$p_port" ] && continue
+        printf "  %2d. %-10s 端口: %-5s (%s)\n" "$i" "${p_proto^^}" "$p_port" "$p_rmk"
+        i=$((i + 1))
+    done < <(jq -r '.inbounds[]? | "\(.port)|\(._meta.protocol // .protocol)|\(._meta.remark // .tag // "Node")"' "$XRAY_CONFIG" 2>/dev/null)
 }
 
 list_nodes() {
@@ -974,6 +1055,9 @@ edit_single_node() {
     parse_node_meta "$node"
 
     while true; do
+        local connect_host
+        connect_host=$(get_connect_host)
+
         header
         echo -e "  ${C_BOLD}修改节点: ${C_CYAN}${meta_rmk}${C_RESET} (${meta_proto^^} · ${port})"
         line
@@ -989,12 +1073,13 @@ edit_single_node() {
         [ "$meta_trans" = "grpc" ] && trans_show="serviceName"
         [ -n "$trans_show" ] && echo -e "   ${C_CYAN}3.${C_RESET} ${trans_show}        [当前: ${meta_path:-$meta_svc}]"
 
-        if [ "$meta_sec" = "reality" ] || [ "$meta_sec" = "tls" ]; then
-            echo -e "   ${C_CYAN}4.${C_RESET} 伪装域名 (SNI)  [当前: ${meta_sni}]"
+        if [ "$meta_sec" = "reality" ] || [ "$meta_sec" = "tls" ] || { [ "$meta_sec" = "none" ] && [ -n "$meta_sni" ]; }; then
+            echo -e "   ${C_CYAN}4.${C_RESET} 域名/SNI/Host   [当前: ${meta_sni}]"
         fi
         [ "$meta_sec" = "reality" ] && echo -e "   ${C_CYAN}5.${C_RESET} 重置 REALITY 密钥对与 ShortId"
         echo -e "   ${C_CYAN}6.${C_RESET} 节点备注名称    [当前: ${meta_rmk}]"
-        echo -e "   ${C_CYAN}7.${C_RESET} 完整重新配置该节点"
+        echo -e "   ${C_CYAN}7.${C_RESET} 连接地址/CDN域名 [当前: ${meta_address:-自动($connect_host)}]"
+        echo -e "   ${C_CYAN}8.${C_RESET} 完整重新配置该节点"
         line
         read -rp "  › 请选择修改项 [回车返回]: " mod_opt
         [ -z "$mod_opt" ] || [ "$mod_opt" = "0" ] && break
@@ -1045,9 +1130,11 @@ edit_single_node() {
             3)
                 if [ "$meta_trans" = "xhttp" ]; then
                     local new_path; prompt_input "分流路径" "$meta_path" new_path
+                    [[ "$new_path" != /* ]] && new_path="/$new_path"
                     up_inb=$(echo "$node" | jq --arg p "$new_path" '.streamSettings.xhttpSettings.path = $p | ._meta.path = $p')
                 elif [ "$meta_trans" = "ws" ]; then
                     local new_path; prompt_input "分流路径" "$meta_path" new_path
+                    [[ "$new_path" != /* ]] && new_path="/$new_path"
                     up_inb=$(echo "$node" | jq --arg p "$new_path" '.streamSettings.wsSettings.path = $p | ._meta.path = $p')
                 elif [ "$meta_trans" = "grpc" ]; then
                     local new_svc; prompt_input "gRPC serviceName" "$meta_svc" new_svc
@@ -1056,16 +1143,15 @@ edit_single_node() {
                 msg="路径/服务名已更新"
                 ;;
             4)
-                if [ "$meta_sec" = "reality" ] || [ "$meta_sec" = "tls" ]; then
-                    local new_sni; prompt_input "伪装域名 (SNI)" "$meta_sni" new_sni
-                    if [ "$meta_sec" = "reality" ]; then
-                        up_inb=$(echo "$node" | jq --arg s "$new_sni" --arg dest "${new_sni}:443" \
-                            '.streamSettings.realitySettings.serverNames = [$s] | .streamSettings.realitySettings.dest = $dest | ._meta.sni = $s')
-                    else
-                        up_inb=$(echo "$node" | jq --arg s "$new_sni" '._meta.sni = $s')
-                    fi
-                    msg="SNI 伪装域名已更新"
+                local new_sni; prompt_input "域名/SNI/Host" "$meta_sni" new_sni
+                if [ "$meta_sec" = "reality" ]; then
+                    up_inb=$(echo "$node" | jq --arg s "$new_sni" --arg dest "${new_sni}:443" \
+                        '.streamSettings.realitySettings.serverNames = [$s] | .streamSettings.realitySettings.dest = $dest | ._meta.sni = $s')
+                else
+                    up_inb=$(echo "$node" | jq --arg s "$new_sni" \
+                        '._meta.sni = $s | (if .streamSettings.wsSettings then .streamSettings.wsSettings.host = $s else . end)')
                 fi
+                msg="域名/SNI 已更新"
                 ;;
             5)
                 if [ "$meta_sec" = "reality" ]; then
@@ -1087,6 +1173,12 @@ edit_single_node() {
                 msg="备注已更新为 $new_rmk"
                 ;;
             7)
+                local new_addr
+                prompt_input "连接地址/域名/优选IP (留空则恢复自动检测)" "${meta_address}" new_addr
+                up_inb=$(echo "$node" | jq --arg a "$new_addr" '._meta.address = $a')
+                msg="连接地址已更新"
+                ;;
+            8)
                 log_info "进入完整重配向导..."
                 local new_cfg
                 new_cfg=$(jq --argjson idx "$idx" 'del(.inbounds[$idx])' "$XRAY_CONFIG")
@@ -1119,12 +1211,7 @@ modify_node() {
 
         echo -e "  ${C_BOLD}修改入站节点${C_RESET}"
         line
-        local i=1
-        while IFS='|' read -r p_port p_proto p_rmk; do
-            [ -z "$p_port" ] && continue
-            printf "  %2d. %-10s 端口: %-5s (%s)\n" "$i" "${p_proto^^}" "$p_port" "$p_rmk"
-            i=$((i + 1))
-        done < <(jq -r '.inbounds[] | "\(.port)|\(._meta.protocol // .protocol)|\(._meta.remark // .tag // "Node")"' "$XRAY_CONFIG" 2>/dev/null)
+        print_node_list
         line
 
         read -rp "  › 请输入要修改的编号 [1-$count, 回车返回]: " mod_idx
@@ -1145,18 +1232,11 @@ delete_node() {
 
         local count=0
         [ -f "$XRAY_CONFIG" ] && count=$(jq '.inbounds | length' "$XRAY_CONFIG" 2>/dev/null || echo 0)
-        if [ "$count" -eq 0 ]; then
-            log_warn "暂无节点"; pause; return;
-        fi
+        [ "$count" -eq 0 ] && { log_warn "暂无节点"; pause; return; }
 
         echo -e "  ${C_BOLD}删除入站节点${C_RESET}"
         line
-        local i=1
-        while IFS='|' read -r p_port p_proto p_rmk; do
-            [ -z "$p_port" ] && continue
-            printf "  %2d. %-10s 端口: %-5s (%s)\n" "$i" "${p_proto^^}" "$p_port" "$p_rmk"
-            i=$((i + 1))
-        done < <(jq -r '.inbounds[] | "\(.port)|\(._meta.protocol // .protocol)|\(._meta.remark // .tag // "Node")"' "$XRAY_CONFIG" 2>/dev/null)
+        print_node_list
         line
 
         read -rp "  › 请输入要删除的编号 [1-$count, 回车返回]: " del_idx
@@ -1222,11 +1302,12 @@ enable_bbr() {
 # ------------------------------------------------------------------------------
 # Main Loop
 # ------------------------------------------------------------------------------
+detect_os
+detect_init
+detect_arch
+
 main() {
     check_root
-    detect_os
-    detect_init
-    detect_arch
     check_ipv6_only
     install_deps
     setup_shortcut
