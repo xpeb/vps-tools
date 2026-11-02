@@ -6,6 +6,8 @@
 #  Transports:   xhttp, grpc, websocket, raw/tcp
 # ==============================================================================
 
+SCRIPT_URL="https://raw.githubusercontent.com/xpeb/vps-tools/main/xray.sh"
+
 if [ -z "$BASH_VERSION" ]; then
     if ! command -v bash >/dev/null 2>&1; then
         if [ -f /etc/alpine-release ]; then
@@ -17,7 +19,7 @@ if [ -z "$BASH_VERSION" ]; then
     if [ -f "$0" ] && [ "$0" != "sh" ] && [ "$0" != "bash" ]; then
         exec bash "$0" "$@"
     else
-        exec bash -s -- "$@"
+        exec bash -c "$(curl -fsSL "$SCRIPT_URL" 2>/dev/null || wget -qO- "$SCRIPT_URL" 2>/dev/null)" -s -- "$@"
     fi
 fi
 
@@ -45,7 +47,6 @@ DAEMON_PID_FILE="/run/xray.pid"
 
 SCRIPT_SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "${BASH_SOURCE[0]:-$0}")"
 SCRIPT_LINK="/usr/local/bin/xray"
-SCRIPT_URL="https://raw.githubusercontent.com/xpeb/vps-tools/main/xray.sh"
 
 SERVER_IP=""
 SERVER_IPV4=""
@@ -97,10 +98,12 @@ header() {
     if is_installed; then
         core_ver="$("$XRAY_BIN" version 2>/dev/null | awk 'NR==1{print $2}')"
         [ -z "$core_ver" ] && core_ver="已安装"
+        local ver_tag="${C_GRAY}(v${core_ver#v})${C_RESET}"
+        [ "$core_ver" = "已安装" ] && ver_tag=""
         if is_running; then
-            status_str="${C_GREEN}● 运行中${C_RESET} ${C_GRAY}(v${core_ver#v})${C_RESET}"
+            status_str="${C_GREEN}● 运行中${C_RESET} ${ver_tag}"
         else
-            status_str="${C_RED}○ 已停止${C_RESET} ${C_GRAY}(v${core_ver#v})${C_RESET}"
+            status_str="${C_RED}○ 已停止${C_RESET} ${ver_tag}"
         fi
     fi
 
@@ -270,8 +273,8 @@ get_public_ip() {
 
     local tmp_dir
     tmp_dir=$(mktemp -d 2>/dev/null || mktemp -d -t 'xray_ip.XXXXXX')
-    [ "$has_v4" -eq 1 ] && ( curl -s4m 3 https://api.ipify.org || curl -s4m 3 https://ipv4.icanhazip.com || curl -s4m 3 https://ifconfig.me ) > "$tmp_dir/v4" 2>/dev/null &
-    [ "$has_v6" -eq 1 ] && ( curl -s6m 3 https://api6.ipify.org || curl -s6m 3 https://ipv6.icanhazip.com || curl -s6m 3 https://api64.ipify.org ) > "$tmp_dir/v6" 2>/dev/null &
+    [ "$has_v4" -eq 1 ] && ( curl -fs4m 3 https://api.ipify.org || curl -fs4m 3 https://ipv4.icanhazip.com || curl -fs4m 3 https://ifconfig.me ) > "$tmp_dir/v4" 2>/dev/null &
+    [ "$has_v6" -eq 1 ] && ( curl -fs6m 3 https://api6.ipify.org || curl -fs6m 3 https://ipv6.icanhazip.com || curl -fs6m 3 https://api64.ipify.org ) > "$tmp_dir/v6" 2>/dev/null &
     wait 2>/dev/null
 
     [ -s "$tmp_dir/v4" ] && SERVER_IPV4=$(tr -d '[:space:]' < "$tmp_dir/v4")
@@ -305,9 +308,11 @@ check_ipv6_only() {
     if ! ip -4 route show default 2>/dev/null | grep -q default && ip -6 route show default 2>/dev/null | grep -q default; then
         if ! curl -sIm 3 https://github.com >/dev/null 2>&1 && ! wget -q -T 3 -O /dev/null https://github.com 2>/dev/null; then
             log_info "检测到纯 IPv6 环境，正在接入 DNS64 加速通道..."
-            if ! grep -q "2001:67c:2b0::4" /etc/resolv.conf 2>/dev/null; then
-                sed -i --follow-symlinks '1i nameserver 2001:67c:2b0::4\nnameserver 2a01:4f8:c2c:123f::1' /etc/resolv.conf 2>/dev/null || \
-                echo -e "nameserver 2001:67c:2b0::4\nnameserver 2a01:4f8:c2c:123f::1" >> /etc/resolv.conf 2>/dev/null || true
+            local rconf
+            rconf=$(readlink -f /etc/resolv.conf 2>/dev/null || echo "/etc/resolv.conf")
+            if ! grep -q "2001:67c:2b0::4" "$rconf" 2>/dev/null; then
+                sed -i '1i nameserver 2001:67c:2b0::4\nnameserver 2a01:4f8:c2c:123f::1' "$rconf" 2>/dev/null || \
+                echo -e "nameserver 2001:67c:2b0::4\nnameserver 2a01:4f8:c2c:123f::1" >> "$rconf" 2>/dev/null || true
             fi
         fi
     fi
@@ -403,6 +408,8 @@ is_autostart_enabled() {
         systemctl is-enabled --quiet xray 2>/dev/null
     elif [ "$INIT_TYPE" = "openrc" ]; then
         rc-status default 2>/dev/null | grep -q "\bxray\b"
+    else
+        return 1
     fi
 }
 
@@ -459,6 +466,10 @@ service_stop()    { service_ctrl stop; }
 service_restart() { service_ctrl restart; }
 
 service_toggle_autostart() {
+    if [ "$INIT_TYPE" != "systemd" ] && [ "$INIT_TYPE" != "openrc" ]; then
+        log_warn "当前环境 (${INIT_TYPE}) 不支持自启管理"
+        return
+    fi
     if is_autostart_enabled; then
         [ "$INIT_TYPE" = "systemd" ] && systemctl disable xray >/dev/null 2>&1
         [ "$INIT_TYPE" = "openrc" ] && rc-update del xray default >/dev/null 2>&1
@@ -598,12 +609,13 @@ install_xray() {
         pause && return 1
     fi
 
+    is_running && svc stop
+
     install -m 755 "$tmp_dir/xray" "$XRAY_BIN"
     [ -f "$tmp_dir/geoip.dat" ] && install -m 644 "$tmp_dir/geoip.dat" "$XRAY_SHARE_DIR/"
     [ -f "$tmp_dir/geosite.dat" ] && install -m 644 "$tmp_dir/geosite.dat" "$XRAY_SHARE_DIR/"
     rm -rf "$tmp_dir"
 
-    is_running && svc stop
     check_mptcp_security
     init_config_if_needed
     setup_service_units
@@ -716,6 +728,8 @@ generate_self_signed_cert() {
         local args=(-x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -sha256 -days 3650 -keyout "$key" -out "$crt" -subj "/CN=$domain")
         openssl req "${args[@]}" -addext "subjectAltName=DNS:$domain" >/dev/null 2>&1 || \
         openssl req "${args[@]}" >/dev/null 2>&1
+        chmod 600 "$key" 2>/dev/null || true
+        chmod 644 "$crt" 2>/dev/null || true
     fi
 }
 
@@ -741,7 +755,7 @@ validate_and_apply_config() {
 # ------------------------------------------------------------------------------
 add_node_wizard() {
     header
-    ! is_installed && { log_warn "核心未安装，请先安装"; pause; return; }
+    ! is_installed && { log_warn "核心未安装，请先安装"; pause; return 1; }
     init_config_if_needed
 
     echo -e "  ${C_BOLD}添加入站节点${C_RESET}"
@@ -749,11 +763,11 @@ add_node_wizard() {
 
     local p_sel="" t_sel="" s_sel="" sm_sel="" c_sel=""
     prompt_choice "代理协议" "1" p_sel \
-        "VLESS        (主流首选: 速度最快/抗封锁强)" \
+        "VLESS        (主流首选: 速度快/抗封锁强)" \
         "VMess        (经典协议: 兼容老旧客户端)" \
-        "Trojan       (伪装协议: 模拟标准网页访问)" \
-        "Shadowsocks  (经典协议: 游戏/路由器友好)" \
-        "Hysteria 2   (极速协议: 拯救恶劣丢包弱网)"
+        "Trojan       (伪装协议: 模拟标准 HTTPS)" \
+        "Shadowsocks  (传统协议: 游戏/路由器友好)" \
+        "Hysteria 2   (极速协议: UDP 弱网丢包优化)"
 
     local protocol transport="raw" security="none" path="" service_name="" sni="" pbk="" priv_key="" short_id=""
     local cert_file="" key_file="" insecure="0" ss_method="" ss_pass="" client_id="" flow=""
@@ -878,10 +892,16 @@ add_node_wizard() {
             insecure="1"
         else
             prompt_input "域名 (SNI)" "example.com" sni
-            prompt_input "证书 .crt/.pem 绝对路径" "/root/cert.crt" cert_file
-            prompt_input "私钥 .key 绝对路径" "/root/private.key" key_file
-            [ ! -f "$cert_file" ] && log_warn "提示: 证书文件当前不存在，请稍后补全"
-            [ ! -f "$key_file" ] && log_warn "提示: 私钥文件当前不存在，请稍后补全"
+            while true; do
+                prompt_input "证书 .crt/.pem 绝对路径" "/root/cert.crt" cert_file
+                prompt_input "私钥 .key 绝对路径" "/root/private.key" key_file
+                if [ -f "$cert_file" ] && [ -f "$key_file" ]; then
+                    break
+                fi
+                log_warn "证书或私钥文件不存在，Xray 校验将失败"
+                read -rp "  › 重新输入路径？[Y/n]: " retry_cert
+                [[ "$retry_cert" =~ ^[nN]$ ]] && { log_info "已取消添加"; pause; return 1; }
+            done
             insecure="0"
         fi
         [ "$protocol" = "vless" ] && [ "$transport" = "tcp" ] && flow="xtls-rprx-vision"
@@ -944,8 +964,10 @@ add_node_wizard() {
         local inb_len
         inb_len=$(get_node_count)
         view_node_detail "$((inb_len - 1))"
+        return 0
     else
         pause
+        return 1
     fi
 }
 
@@ -1013,7 +1035,8 @@ get_connect_host() {
 build_share_link() {
     local target_host="$1"
     local enc_rmk enc_path link="" connect_host
-    enc_rmk=$(urlencode "$meta_rmk") enc_path=$(urlencode "$meta_path")
+    enc_rmk=$(urlencode "$meta_rmk")
+    enc_path=$(jq -rn --arg x "$meta_path" '$x|@uri' | sed 's|%2F|/|g')
     if [ -n "$target_host" ]; then
         connect_host=$(format_url_host "$target_host")
     else
@@ -1057,7 +1080,9 @@ build_share_link() {
             link="ss://$(base64_encode "${meta_method}:${id_or_pwd}")@${connect_host}:${port}#${enc_rmk}"
             ;;
         hysteria)
-            link="hysteria2://${id_or_pwd}@${connect_host}:${port}/?sni=${meta_sni}&insecure=${meta_insec}#${enc_rmk}"
+            local insec_flag=""
+            [ "$meta_insec" = "1" ] && insec_flag="&insecure=1"
+            link="hysteria2://${id_or_pwd}@${connect_host}:${port}/?sni=${meta_sni}${insec_flag}#${enc_rmk}"
             ;;
     esac
     echo "$link"
@@ -1283,6 +1308,10 @@ edit_single_node() {
                 [ -n "$new_cred" ] && [ "$new_cred" != "$id_or_pwd" ] && msg="${cred_label}已更新" || up_inb=""
                 ;;
             3)
+                if [ -z "$trans_show" ]; then
+                    log_warn "当前传输协议 (${meta_trans}) 无需配置分流路径/服务名"
+                    sleep 1 && continue
+                fi
                 if [ "$meta_trans" = "grpc" ]; then
                     local new_svc; prompt_input "gRPC serviceName" "$meta_svc" new_svc
                     up_inb=$(echo "$node" | jq --arg s "$new_svc" '.streamSettings.grpcSettings.serviceName = $s | ._meta.serviceName = $s')
@@ -1296,6 +1325,10 @@ edit_single_node() {
                 msg="路径/服务名已更新"
                 ;;
             4)
+                if [ "$meta_sec" != "reality" ] && [ "$meta_sec" != "tls" ] && { [ "$meta_sec" != "none" ] || [ -z "$meta_sni" ]; }; then
+                    log_warn "当前节点配置无需配置域名/SNI"
+                    sleep 1 && continue
+                fi
                 local new_sni; prompt_input "域名/SNI/Host" "$meta_sni" new_sni
                 if [ "$meta_sec" = "reality" ]; then
                     up_inb=$(echo "$node" | jq --arg s "$new_sni" --arg dest "${new_sni}:443" \
@@ -1309,12 +1342,17 @@ edit_single_node() {
                 msg="域名/SNI 已更新"
                 ;;
             5)
-                if [ "$meta_sec" = "reality" ]; then
-                    if gen_reality_keys; then
-                        up_inb=$(echo "$node" | jq --arg pk "$REALITY_PRIV" --arg sid "$REALITY_SID" --arg pbk "$REALITY_PUB" \
-                            '.streamSettings.realitySettings.privateKey = $pk | .streamSettings.realitySettings.shortIds = [$sid] | .streamSettings.realitySettings.minClientVer = "1.0.0" | ._meta.publicKey = $pbk | ._meta.shortId = $sid')
-                        msg="REALITY 密钥对已重置"
-                    fi
+                if [ "$meta_sec" != "reality" ]; then
+                    log_warn "仅 REALITY 协议支持重置密钥对"
+                    sleep 1 && continue
+                fi
+                if gen_reality_keys; then
+                    up_inb=$(echo "$node" | jq --arg pk "$REALITY_PRIV" --arg sid "$REALITY_SID" --arg pbk "$REALITY_PUB" \
+                        '.streamSettings.realitySettings.privateKey = $pk | .streamSettings.realitySettings.shortIds = [$sid] | .streamSettings.realitySettings.minClientVer = "1.0.0" | ._meta.publicKey = $pbk | ._meta.shortId = $sid')
+                    msg="REALITY 密钥对已重置"
+                else
+                    log_error "生成 x25519 密钥对失败，请检查核心状态"
+                    pause && continue
                 fi
                 ;;
             6)
@@ -1329,14 +1367,18 @@ edit_single_node() {
                 msg="连接地址已更新"
                 ;;
             8)
-                log_warn "完整重新配置将先备份并移除当前节点，随后进入添加向导"
+                log_warn "将重置并重新配置当前节点"
                 read -rp "  › 确认继续？[y/N]: " conf_reconf
                 [[ "$conf_reconf" =~ ^[yY]$ ]] || continue
                 log_info "进入完整重配向导..."
-                local new_cfg
+                local orig_cfg new_cfg
+                orig_cfg=$(cat "$XRAY_CONFIG")
                 new_cfg=$(jq --argjson idx "$idx" 'del(.inbounds[$idx])' "$XRAY_CONFIG")
                 validate_and_apply_config "$new_cfg"
-                add_node_wizard
+                if ! add_node_wizard; then
+                    log_warn "重配向导未完成，正在恢复原节点配置..."
+                    validate_and_apply_config "$orig_cfg"
+                fi
                 return
                 ;;
         esac
