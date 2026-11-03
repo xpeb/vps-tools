@@ -1,10 +1,5 @@
 #!/usr/bin/env bash
-# ==============================================================================
-#  xray.sh - Minimalist Xray Core Management Script
-#  Supported OS: Debian / Ubuntu / Alpine Linux
-#  Protocols:    VLESS, VMess, Trojan, Shadowsocks, Hysteria 2
-#  Transports:   xhttp, tcp, grpc, websocket, hysteria
-# ==============================================================================
+# xray.sh — Minimalist Xray Core Management Script (Debian / Ubuntu / Alpine)
 
 SCRIPT_URL="${SCRIPT_URL:-https://raw.githubusercontent.com/xpeb/vps-tools/main/xray.sh}"
 SCRIPT_MARKER="Minimalist Xray Core Management Script"
@@ -26,9 +21,6 @@ fi
 set -o pipefail
 shopt -s checkwinsize 2>/dev/null || true
 
-# ------------------------------------------------------------------------------
-# Constants & Runtime State
-# ------------------------------------------------------------------------------
 XRAY_SHARE_DIR="/usr/local/share/xray"
 XRAY_BIN="$XRAY_SHARE_DIR/xray-core"
 XRAY_CONFIG_DIR="/usr/local/etc/xray"
@@ -56,9 +48,6 @@ SERVER_IP="" SERVER_IPV4="" SERVER_IPV6="" IP_FETCHED=0 XRAY_VER=""
 export XRAY_LOCATION_ASSET="$XRAY_SHARE_DIR"
 export GODEBUG="multipathtcp=0"
 
-# ------------------------------------------------------------------------------
-# UI & Interaction Helpers
-# ------------------------------------------------------------------------------
 if [ -t 1 ]; then
     C_RESET=$'\033[0m' C_BOLD=$'\033[1m' C_CYAN=$'\033[36m'
     C_GREEN=$'\033[32m' C_YELLOW=$'\033[33m' C_RED=$'\033[31m' C_GRAY=$'\033[90m'
@@ -176,9 +165,6 @@ header() {
     line
 }
 
-# ------------------------------------------------------------------------------
-# System Detection & Environment Setup
-# ------------------------------------------------------------------------------
 check_root() { [ "$(id -u)" -eq 0 ] || { log_error "请使用 root 权限运行"; exit 1; }; }
 
 check_os() {
@@ -344,7 +330,7 @@ install_deps() {
     [ -z "$missing" ] && return 0
 
     log_info "安装系统依赖:${missing}..."
-    local pkgs="curl unzip openssl jq ca-certificates procps iproute2 bash"
+    local pkgs=(curl unzip openssl jq ca-certificates procps iproute2 bash)
     if [ "$OS_TYPE" = "alpine" ]; then
         if ! wget -q -T 3 -O /dev/null "https://dl-cdn.alpinelinux.org/alpine/" 2>/dev/null; then
             local m
@@ -355,11 +341,9 @@ install_deps() {
                 fi
             done
         fi
-        # shellcheck disable=SC2086
-        apk update >/dev/null 2>&1 && apk add --no-cache $pkgs >/dev/null 2>&1
+        apk update >/dev/null 2>&1 && apk add --no-cache "${pkgs[@]}" >/dev/null 2>&1
     else
-        # shellcheck disable=SC2086
-        apt-get update -y >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1
+        apt-get update -y >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}" >/dev/null 2>&1
     fi
 
     missing=""
@@ -394,9 +378,6 @@ setup_shortcut() {
     rm -f "$tmp_sh" 2>/dev/null || true
 }
 
-# ------------------------------------------------------------------------------
-# Service Lifecycle
-# ------------------------------------------------------------------------------
 is_installed() { [ -x "$XRAY_BIN" ] && head -c 4 "$XRAY_BIN" 2>/dev/null | grep -q "ELF"; }
 
 is_running() {
@@ -489,9 +470,6 @@ view_logs() {
     trap - INT
 }
 
-# ------------------------------------------------------------------------------
-# Install & Uninstall
-# ------------------------------------------------------------------------------
 get_latest_xray_version() {
     local tag=""
     tag=$(curl -fsIL -o /dev/null -w '%{url_effective}' --max-time 8 https://github.com/XTLS/Xray-core/releases/latest 2>/dev/null | awk -F'/' '{print $NF}')
@@ -697,9 +675,6 @@ uninstall_xray() {
     exit 0
 }
 
-# ------------------------------------------------------------------------------
-# Crypto, Certs, Port & Atomic Config Helpers
-# ------------------------------------------------------------------------------
 rand_str()         { openssl rand -base64 "$(( ${1:-16} * 2 ))" | tr -dc 'a-zA-Z0-9' | head -c "${1:-16}"; }
 base64_encode()    { printf '%s' "$1" | base64 | tr -d '\r\n'; }
 base64url_encode() { printf '%s' "$1" | base64 | tr '+/' '-_' | tr -d '=\r\n'; }
@@ -842,9 +817,6 @@ validate_and_apply_config() {
     return 1
 }
 
-# ------------------------------------------------------------------------------
-# Inbound Node Wizard (Add / Atomic Reconfigure)
-# ------------------------------------------------------------------------------
 add_node_wizard() {
     local replace_idx="${1:-}" cur_port=""
     header
@@ -1028,9 +1000,6 @@ add_node_wizard() {
     return 1
 }
 
-# ------------------------------------------------------------------------------
-# Node Parsing, Share Links & Management Views
-# ------------------------------------------------------------------------------
 parse_node_meta() {
     local _m=()
     mapfile -t _m < <(printf '%s\n' "$1" | jq -r '
@@ -1397,9 +1366,6 @@ edit_single_node() {
     done
 }
 
-# ------------------------------------------------------------------------------
-# System Optimization (BBR)
-# ------------------------------------------------------------------------------
 enable_bbr() {
     header
     echo -e "  ${C_BOLD}TCP BBR 拥塞控制${C_RESET}"
@@ -1430,9 +1396,6 @@ enable_bbr() {
     pause
 }
 
-# ------------------------------------------------------------------------------
-# Main Entrypoint
-# ------------------------------------------------------------------------------
 detect_os
 detect_init
 detect_arch
