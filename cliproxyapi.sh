@@ -1,690 +1,651 @@
-#!/usr/bin/env bash
+#!/usr/bin/env sh
+# shellcheck shell=bash
 # =========================================================
-#  CLIProxyAPI + Caddy 运维管理脚本 (官方文档标准规范版)
-#  官方文档: https://help.router-for-me
+#  CLIProxyAPI 运维管理脚本 (仅支持 Debian / Ubuntu / Alpine)
+#  官方文档: https://help.router-for.me
 #  官方仓库: router-for-me/CLIProxyAPI
 # =========================================================
 
-RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"; BLUE="\033[34m"; PLAIN="\033[0m"
+# 兼容 sh 调用（Alpine 最小化环境自动补齐 bash）
+if [ -z "${BASH_VERSION:-}" ]; then
+    if [ -f /etc/alpine-release ] && ! command -v bash >/dev/null 2>&1; then
+        [ "$(id -u)" -eq 0 ] && apk add --no-cache bash >/dev/null 2>&1
+    fi
+    command -v bash >/dev/null 2>&1 && exec bash "$0" "$@"
+    echo "[错误] 请先安装 bash 后再运行此脚本！" >&2
+    exit 1
+fi
+
+set -o pipefail
+
+RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"; BLUE="\033[34m"; CYAN="\033[36m"; GRAY="\033[90m"; PLAIN="\033[0m"
+SEP="=============================================="
+LINE="----------------------------------------------"
+
 WORK_DIR="/root/cliproxyapi"
 AUTH_DIR="${WORK_DIR}/auth"
 BIN_PATH="${WORK_DIR}/cli-proxy-api"
 CONFIG_PATH="${WORK_DIR}/config.yaml"
 BACKUP_DIR="${WORK_DIR}/backup"
-VERSION_FILE="${WORK_DIR}/version.txt"
-SERVICE_PATH="/etc/systemd/system/cliproxy.service"
-CADDYFILE="/etc/caddy/Caddyfile"
+LOG_FILE="/var/log/cliproxy.log"
 OFFICIAL_REPO="router-for-me/CLIProxyAPI"
 
-# 0. 权限检查
-[[ "$EUID" -ne 0 ]] && { echo -e "${RED}[错误] 必须使用 root 用户执行此脚本！${PLAIN}"; exit 1; }
+info()   { echo -e "${BLUE}[信息]${PLAIN} $*"; }
+ok()     { echo -e "${GREEN}[成功]${PLAIN} $*"; }
+warn()   { echo -e "${YELLOW}[提示]${PLAIN} $*"; }
+err()    { echo -e "${RED}[错误]${PLAIN} $*" >&2; }
+header() { echo -e "\n${GREEN}${SEP}\n  $1\n${SEP}${PLAIN}"; }
 
-# 1. 系统与服务状态辅助函数
+# 0. 权限与发行版校验 (仅限 Debian / Ubuntu / Alpine)
+[[ "$EUID" -ne 0 ]] && { err "请使用 root 用户运行此脚本！"; exit 1; }
+
+check_os() {
+    [[ -f /etc/os-release ]] || { err "无法识别操作系统，本脚本仅支持 Debian / Ubuntu / Alpine 发行版！"; exit 1; }
+    local ID="" PRETTY_NAME=""
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    OS_ID="${ID,,}"
+    OS_NAME="${PRETTY_NAME:-$OS_ID}"
+    case "$OS_ID" in
+        debian|ubuntu) SERVICE_PATH="/etc/systemd/system/cliproxy.service" ;;
+        alpine)        SERVICE_PATH="/etc/init.d/cliproxy" ;;
+        *) err "当前系统 (${OS_NAME}) 不受支持！本脚本仅支持 Debian / Ubuntu / Alpine 发行版。"; exit 1 ;;
+    esac
+}
+check_os
+
+# 1. 系统与服务辅助函数 (统一封装 systemd 与 OpenRC)
 detect_arch() {
-    local machine
-    machine="$(uname -m)"
-    case "$machine" in
-        x86_64|amd64) echo "amd64" ;;
+    case "$(uname -m)" in
+        x86_64|amd64)  echo "amd64" ;;
         aarch64|arm64) echo "aarch64" ;;
-        *) echo "unsupported" ;;
+        *) return 1 ;;
     esac
 }
 
-is_musl() {
-    if command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi 'musl'; then
-        return 0
-    fi
-    [[ -f /etc/alpine-release || -f /etc/openwrt_release ]] && return 0
-    local m
-    for m in /lib/ld-musl* /usr/lib/ld-musl*; do
-        [[ -e "$m" ]] && return 0
+ensure_deps() {
+    local missing=() cmd
+    for cmd in curl tar; do
+        command -v "$cmd" &>/dev/null || missing+=("$cmd")
     done
-    return 1
+    [[ ${#missing[@]} -eq 0 ]] && return 0
+
+    info "正在安装基础依赖: ${missing[*]} ..."
+    if [[ "$OS_ID" == "alpine" ]]; then
+        apk add --no-cache "${missing[@]}"
+    else
+        apt-get update -y && apt-get install -y "${missing[@]}"
+    fi
 }
 
-get_service_status() {
-    local svc="$1"
-    if systemctl is-active --quiet "$svc" 2>/dev/null; then
-        echo "active"
-    elif [[ -f "/etc/systemd/system/${svc}.service" ]] || command -v "$svc" &>/dev/null; then
-        echo "inactive"
+get_port() {
+    local p=""
+    [[ -f "$CONFIG_PATH" ]] && p=$(awk '/^[[:space:]]*port:[[:space:]]*[0-9]+/ {print $2; exit}' "$CONFIG_PATH" 2>/dev/null)
+    echo "${p:-8317}"
+}
+
+get_server_ip() {
+    local ip
+    ip=$(curl -fsS4 --max-time 3 https://api.ipify.org 2>/dev/null \
+        || curl -fsS4 --max-time 3 https://ifconfig.me 2>/dev/null \
+        || ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')
+    echo "${ip:-127.0.0.1}"
+}
+
+svc_ctl() {
+    if [[ "$OS_ID" == "alpine" ]]; then
+        rc-service cliproxy "$1" >/dev/null 2>&1
     else
-        echo "未安装"
+        case "$1" in
+            status)  systemctl is-active --quiet cliproxy 2>/dev/null ;;
+            restart) systemctl daemon-reload && systemctl restart cliproxy ;;
+            *)       systemctl "$1" cliproxy 2>/dev/null ;;
+        esac
+    fi
+}
+
+is_installed() {
+    [[ -f "$SERVICE_PATH" || -x "$BIN_PATH" ]]
+}
+
+fmt_status() {
+    local short="${1:-}"
+    if svc_ctl status; then
+        [[ "$short" == "-s" ]] && echo -e "${GREEN}运行中${PLAIN}" || echo -e "${GREEN}运行中 (active)${PLAIN}"
+    elif is_installed; then
+        [[ "$short" == "-s" ]] && echo -e "${RED}已停止${PLAIN}" || echo -e "${RED}已停止 (inactive)${PLAIN}"
+    else
+        echo -e "${YELLOW}未安装${PLAIN}"
     fi
 }
 
 restart_cliproxy() {
-    [[ -f "$SERVICE_PATH" ]] || return 0
-    systemctl daemon-reload
-    systemctl restart cliproxy
-    sleep 2
-    systemctl is-active --quiet cliproxy
+    [[ -f "$SERVICE_PATH" ]] && svc_ctl restart && sleep 1 && svc_ctl status
 }
 
-# 2. 版本获取与解析
-parse_binary_version() {
-    local target="${1:-$BIN_PATH}"
-    [[ -x "$target" ]] || return 1
-    "$target" --help 2>&1 | awk -F'CLIProxyAPI Version: ' '/CLIProxyAPI Version:/ {print $2}' | awk -F',' '{print $1}' | tr -d 'v \r\n'
-}
-
-get_local_version() {
-    local ver
-    ver=$(parse_binary_version "$BIN_PATH")
-    [[ -z "$ver" && -f "$VERSION_FILE" ]] && ver=$(tr -d 'v \r\n' < "$VERSION_FILE" 2>/dev/null)
-    if [[ -z "$ver" ]]; then
-        [[ -f "$BIN_PATH" ]] && echo "未知" || echo "未安装"
-    else
-        echo "$ver"
-    fi
-}
-
-fetch_release_info() {
-    local arch
-    arch=$(detect_arch)
-    if [[ "$arch" == "unsupported" ]]; then
-        echo -e "${RED}[错误] 暂不支持当前系统架构: $(uname -m)${PLAIN}"
-        return 1
-    fi
-
-    local musl=false
-    is_musl && musl=true
-
-    local release_json=""
-    release_json=$(curl -sL --max-time 10 "https://api.github.com/repos/${OFFICIAL_REPO}/releases/latest" 2>/dev/null || true)
-    
-    LATEST_TAG=""
-    LATEST_VER=""
-    DOWNLOAD_URL=""
-
-    [[ -n "$release_json" ]] && LATEST_TAG=$(echo "$release_json" | jq -r '.tag_name // empty' 2>/dev/null || true)
-
-    # API 速率受限或无返回时通过 Location 标头兜底
-    if [[ -z "$LATEST_TAG" || "$LATEST_TAG" == "null" ]]; then
-        local loc_header
-        loc_header=$(curl -sIL --max-time 10 "https://github.com/${OFFICIAL_REPO}/releases/latest" 2>/dev/null | grep -i '^location:' | head -n 1 || true)
-        LATEST_TAG=$(echo "$loc_header" | awk -F'/tag/' '{print $2}' | tr -d '\r\n ')
-    fi
-
-    if [[ -z "$LATEST_TAG" || "$LATEST_TAG" == "null" ]]; then
-        echo -e "${RED}[错误] 无法获取官方最新版本信息，请检查网络或 GitHub 连通性！${PLAIN}"
-        return 1
-    fi
-
-    LATEST_VER="${LATEST_TAG#v}"
-
-    if [[ -n "$release_json" ]]; then
-        # shellcheck disable=SC2016
-        local filter='test("linux"; "i") and test($a; "i") and (test("rpm|deb|apk"; "i") | not)'
-        if [[ "$musl" == "true" ]]; then
-            filter+=' and test("no-plugin"; "i")'
-        else
-            filter+=' and (test("no-plugin"; "i") | not)'
-        fi
-        DOWNLOAD_URL=$(echo "$release_json" | jq -r --arg a "$arch" ".assets[] | select($filter) | .browser_download_url" 2>/dev/null | head -n 1)
-    fi
-
-    if [[ -z "$DOWNLOAD_URL" || "$DOWNLOAD_URL" == "null" ]]; then
-        local variant=""
-        [[ "$musl" == "true" ]] && variant="_no-plugin"
-        DOWNLOAD_URL="https://github.com/${OFFICIAL_REPO}/releases/download/${LATEST_TAG}/CLIProxyAPI_${LATEST_VER}_linux_${arch}${variant}.tar.gz"
-    fi
-
-    return 0
-}
-
-# 3. 基础运行环境检查与初始化
-init_system() {
-    local mem_total swap_total
-    mem_total=$(free -m 2>/dev/null | awk '/Mem:/ {print $2}' || echo 0)
-    swap_total=$(free -m 2>/dev/null | awk '/Swap:/ {print $2}' || echo 0)
-    if [[ "$swap_total" -eq 0 && "$mem_total" -lt 2048 && "$mem_total" -gt 0 ]]; then
-        echo -e "${YELLOW}[*] 检测到内存较小且无 Swap，配置 2GB Swap 虚拟内存...${PLAIN}"
-        fallocate -l 2G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048 2>/dev/null || true
-        chmod 600 /swapfile 2>/dev/null || true
-        mkswap /swapfile 2>/dev/null || true
-        swapon /swapfile 2>/dev/null || true
-        grep -q "/swapfile" /etc/fstab 2>/dev/null || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-    fi
-
-    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
-        ufw allow 80/tcp 443/tcp >/dev/null 2>&1 || true
-    fi
-    if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
-        firewall-cmd --permanent --add-port={80,443}/tcp >/dev/null 2>&1 || true
-        firewall-cmd --reload >/dev/null 2>&1 || true
-    fi
-
-    echo -e "${BLUE}[*] 检查安装基础运行环境与 Caddy...${PLAIN}"
-    if command -v apt-get &>/dev/null; then
-        apt-get update -y && apt-get install -y curl wget tar unzip jq psmisc debian-keyring debian-archive-keyring apt-transport-https
-        if ! command -v caddy &>/dev/null; then
-            curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg --yes 2>/dev/null || true
-            curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null 2>&1 || true
-            apt-get update -y && apt-get install -y caddy
-        fi
-    elif command -v yum &>/dev/null || command -v dnf &>/dev/null; then
-        yum install -y curl wget tar unzip jq psmisc
-        if ! command -v caddy &>/dev/null; then
-            yum install -y 'dnf-command(copr)' 2>/dev/null || true
-            yum copr enable -y @caddy/caddy && yum install -y caddy
-        fi
-    fi
-}
-
-# 4. 数据快照与备份管理
-backup_current_state() {
-    mkdir -p "$BACKUP_DIR"
-    local ts cur_v v_tag
-    ts=$(date +"%Y%m%d_%H%M%S")
-    cur_v=$(get_local_version)
-    [[ "$cur_v" == "未安装" || "$cur_v" == "未知" ]] && cur_v=""
-    v_tag="${cur_v:+_v${cur_v}}"
-
-    [[ -f "$CONFIG_PATH" ]] && cp -a "$CONFIG_PATH" "${BACKUP_DIR}/config${v_tag}_${ts}.yaml" && cp -a "$CONFIG_PATH" "${WORK_DIR}/config.yaml.bak"
-    [[ -f "$BIN_PATH" ]] && cp -a "$BIN_PATH" "${BACKUP_DIR}/cli-proxy-api${v_tag}_${ts}" && cp -a "$BIN_PATH" "${WORK_DIR}/cli-proxy-api.bak"
-
-    # 自动轮转保留最新 5 个历史备份
-    find "$BACKUP_DIR" -maxdepth 1 -type f -name "config_*" 2>/dev/null | sort | head -n -5 | xargs -r rm -f 2>/dev/null || true
-    find "$BACKUP_DIR" -maxdepth 1 -type f -name "cli-proxy-api_*" 2>/dev/null | sort | head -n -5 | xargs -r rm -f 2>/dev/null || true
-}
-
-# 5. 下载解压与核心二进制安装通用管道
-download_and_extract_pkg() {
-    local tmp_dir="$1"
-    echo -e "${BLUE}[*] 正在下载程序包: ${DOWNLOAD_URL}${PLAIN}"
-    if ! curl -sL -f -o "${tmp_dir}/pkg" "$DOWNLOAD_URL"; then
-        echo -e "${RED}[错误] 下载官方程序包失败！${PLAIN}"
-        return 1
-    fi
-
-    if tar -ztf "${tmp_dir}/pkg" &>/dev/null; then
-        tar -zxf "${tmp_dir}/pkg" -C "$tmp_dir"
-    elif unzip -t "${tmp_dir}/pkg" &>/dev/null; then
-        unzip -qo "${tmp_dir}/pkg" -d "$tmp_dir"
-    else
-        mv "${tmp_dir}/pkg" "${tmp_dir}/cli-proxy-api"
-    fi
-
-    local found
-    found=$(find "$tmp_dir" -type f \( -iname "*cliproxyapi*" -o -iname "*cli-proxy-api*" \) | head -n 1)
-    if [[ -z "$found" || ! -f "$found" ]]; then
-        echo -e "${RED}[错误] 未在解压包中找到核心可执行程序！${PLAIN}"
-        return 1
-    fi
-    chmod +x "$found"
-
-    # 运行前兼容性预检
-    local test_out
-    if ! test_out=$("$found" --help 2>&1); then
-        echo -e "${RED}[错误] 运行前预检失败，程序无法在当前系统中正常执行！${PLAIN}"
-        echo -e "${YELLOW}错误输出: ${test_out}${PLAIN}"
-        return 1
-    fi
-
-    # 原子替换安装
-    install -m 755 "$found" "$BIN_PATH" || mv -f "$found" "$BIN_PATH"
-
-    # 更新官方配置示例 (供用户参考，绝不影响 config.yaml)
-    local example_cfg
-    example_cfg=$(find "$tmp_dir" -type f -name "config.example.yaml" | head -n 1)
-    if [[ -n "$example_cfg" && -f "$example_cfg" ]]; then
-        cp -f "$example_cfg" "${WORK_DIR}/config.example.yaml" 2>/dev/null || true
-    fi
-
-    echo "$LATEST_VER" > "$VERSION_FILE"
-    return 0
-}
-
-download_official_binary() {
-    echo -e "${BLUE}[*] 正在向官方 GitHub 请求最新发布版本...${PLAIN}"
-    fetch_release_info || return 1
-    echo -e "${GREEN}[*] 官方最新版本号: ${LATEST_TAG}${PLAIN}"
-
-    local tmp_dir
-    tmp_dir=$(mktemp -d)
-    mkdir -p "$WORK_DIR"
-    if download_and_extract_pkg "$tmp_dir"; then
-        rm -rf "$tmp_dir"
-        echo -e "${GREEN}[成功] 官方程序文件就绪！(版本: ${LATEST_TAG})${PLAIN}"
-        return 0
-    else
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-}
-
-# 6. 无损平滑升级 (保留全部配置、授权数据与反代证书)
-upgrade_lossless() {
-    clear
-    echo -e "${GREEN}====================================================${PLAIN}"
-    echo -e "${GREEN}       CLIProxyAPI 无损平滑升级 (Zero Downtime)     ${PLAIN}"
-    echo -e "${GREEN}====================================================${PLAIN}"
-
-    if [[ ! -f "$BIN_PATH" ]]; then
-        echo -e "${YELLOW}[提示] 未检测到已安装的 CLIProxyAPI 程序 (${BIN_PATH})${PLAIN}"
-        read -rp "是否立即转为执行全新安装部署？[Y/n]: " do_install
-        [[ ! "$do_install" =~ ^[nN]$ ]] && deploy
-        return
-    fi
-
-    local local_ver
-    local_ver=$(get_local_version)
-    echo -e "${BLUE}[*] 当前本地版本: ${YELLOW}v${local_ver:-未知}${PLAIN}"
-    echo -e "${BLUE}[*] 正在向官方 GitHub 查询最新发布版本...${PLAIN}"
-    fetch_release_info || return 1
-    echo -e "${BLUE}[*] 官方最新版本: ${GREEN}${LATEST_TAG}${PLAIN}"
-
-    if [[ -n "$local_ver" && "$local_ver" != "未知" && "$local_ver" == "$LATEST_VER" ]]; then
-        echo -e "\n${GREEN}[✓] 当前本地运行版本与官方最新版本一致 (v${local_ver})。${PLAIN}"
-        read -rp "是否仍要重新下载并强制重新升级？[y/N]: " force_up
-        [[ ! "$force_up" =~ ^[yY]$ ]] && { echo -e "${BLUE}[*] 升级流程已取消。${PLAIN}"; return 0; }
-    fi
-
-    echo -e "\n${YELLOW}[*] 即将执行无损升级（将完整保留 config.yaml 配置与 auth/ 授权凭证）${PLAIN}"
-    read -rp "确认开始无损平滑升级？[Y/n]: " confirm_up
-    [[ "$confirm_up" =~ ^[nN]$ ]] && { echo -e "${BLUE}[*] 用户已取消。${PLAIN}"; return 0; }
-
-    echo -e "\n${BLUE}[*] 正在创建当前配置与运行快照备份...${PLAIN}"
-    backup_current_state
-
-    local tmp_dir
-    tmp_dir=$(mktemp -d)
-    if ! download_and_extract_pkg "$tmp_dir"; then
-        rm -rf "$tmp_dir"
-        echo -e "${RED}[错误] 升级失败！现有服务完全未受影响。${PLAIN}"
-        return 1
-    fi
-    rm -rf "$tmp_dir"
-
-    echo -e "${BLUE}[*] 正在平滑重启服务...${PLAIN}"
-    if ! restart_cliproxy; then
-        echo -e "\n${RED}[警告] 新版本启动异常，检测到 cliproxy 服务未能正常运行！${PLAIN}"
-        echo -e "${YELLOW}[*] 触发自动回滚保护机制，正在还原上一稳定版本...${PLAIN}"
-        if [[ -f "${WORK_DIR}/cli-proxy-api.bak" ]]; then
-            install -m 755 "${WORK_DIR}/cli-proxy-api.bak" "$BIN_PATH"
-            if restart_cliproxy; then
-                echo -e "${GREEN}[✓] 自动回滚成功！上一稳定版本已恢复正常运行。${PLAIN}"
-                local rb_ver
-                rb_ver=$(get_local_version)
-                echo "$rb_ver" > "$VERSION_FILE"
-                return 1
-            fi
-        fi
-        echo -e "${RED}[致命] 回滚后服务依然未启动成功，请检查日志: journalctl -u cliproxy -f${PLAIN}"
-        return 1
-    fi
-
-    if command -v caddy &>/dev/null; then
-        systemctl reload caddy >/dev/null 2>&1 || true
-    fi
-
-    # 升级成功，清理备份文件以释放空间
-    echo -e "${BLUE}[*] 升级成功，正在清理备份文件以释放磁盘空间...${PLAIN}"
-    rm -f "${WORK_DIR}/cli-proxy-api.bak" "${WORK_DIR}/config.yaml.bak" 2>/dev/null || true
-    if [[ -d "$BACKUP_DIR" ]]; then
-        rm -f "${BACKUP_DIR}"/config_* "${BACKUP_DIR}"/cli-proxy-api_* 2>/dev/null || true
-        rmdir "$BACKUP_DIR" 2>/dev/null || true
-    fi
-
-    local final_ver
-    final_ver=$(get_local_version)
-    echo -e "\n${GREEN}====================================================${PLAIN}"
-    echo -e "${GREEN}        🎉 CLIProxyAPI 无损平滑升级已成功完成！        ${PLAIN}"
-    echo -e "${GREEN}====================================================${PLAIN}"
-    echo -e "升级前版本   : ${YELLOW}v${local_ver:-未知}${PLAIN}"
-    echo -e "升级后版本   : ${GREEN}v${final_ver}${PLAIN}"
-    echo -e "后端服务状态 : ${GREEN}$(get_service_status cliproxy)${PLAIN}"
-    echo -e "用户配置文件 : ${BLUE}${CONFIG_PATH}${PLAIN} ${GREEN}(100% 完整保留)${PLAIN}"
-    echo -e "认证凭据目录 : ${BLUE}${AUTH_DIR}${PLAIN} ${GREEN}(100% 完整保留)${PLAIN}"
-    echo -e "参考配置示例 : ${YELLOW}${WORK_DIR}/config.example.yaml${PLAIN}"
-    echo -e "备份文件清理 : ${GREEN}已自动清理备份文件 (释放磁盘空间)${PLAIN}"
-    echo -e "====================================================${PLAIN}"
-}
-
-# 7. 版本回滚功能
-rollback() {
-    clear
-    echo -e "${GREEN}========================================${PLAIN}"
-    echo -e "${GREEN}         CLIProxyAPI 版本回滚           ${PLAIN}"
-    echo -e "${GREEN}========================================${PLAIN}"
-
-    local bak_bin="${WORK_DIR}/cli-proxy-api.bak"
-    local backup_list=()
-    if [[ -d "$BACKUP_DIR" ]]; then
-        while IFS= read -r f; do
-            [[ -n "$f" ]] && backup_list+=("$f")
-        done < <(find "$BACKUP_DIR" -maxdepth 1 -type f -name "cli-proxy-api_*" 2>/dev/null | sort -r)
-    fi
-
-    if [[ ! -f "$bak_bin" && ${#backup_list[@]} -eq 0 ]]; then
-        echo -e "${YELLOW}[提示] 未找到可回滚的历史二进制文件备份！${PLAIN}"
-        return 1
-    fi
-
-    echo -e "可用的回滚选项："
-    local idx=1
-    if [[ -f "$bak_bin" ]]; then
-        local bak_ver
-        bak_ver=$(parse_binary_version "$bak_bin")
-        echo -e "  [${idx}] 上一个版本 (.bak) [版本: v${bak_ver:-未知}]"
-        idx=$((idx+1))
-    fi
-
-    for bf in "${backup_list[@]}"; do
-        echo -e "  [${idx}] 历史备份: $(basename "$bf")"
-        idx=$((idx+1))
-    done
-    echo -e "  [0] 取消回滚"
-
-    local choice
-    read -rp "请选择要恢复的版本 [0-$((idx-1))]: " choice
-    [[ "$choice" == "0" || -z "$choice" ]] && { echo -e "${BLUE}[*] 已取消回滚。${PLAIN}"; return 0; }
-
-    local target_bin=""
-    if [[ -f "$bak_bin" && "$choice" -eq 1 ]]; then
-        target_bin="$bak_bin"
-    else
-        local offset=$choice
-        [[ -f "$bak_bin" ]] && offset=$((choice-1))
-        local target_index=$((offset-1))
-        if [[ $target_index -ge 0 && $target_index -lt ${#backup_list[@]} ]]; then
-            target_bin="${backup_list[$target_index]}"
-        fi
-    fi
-
-    if [[ -z "$target_bin" || ! -f "$target_bin" ]]; then
-        echo -e "${RED}[错误] 选择无效！${PLAIN}"
-        return 1
-    fi
-
-    echo -e "${BLUE}[*] 正在回滚至: $(basename "$target_bin")...${PLAIN}"
-    cp -f "$BIN_PATH" "${WORK_DIR}/cli-proxy-api.before_rollback" 2>/dev/null || true
-    install -m 755 "$target_bin" "$BIN_PATH" || mv -f "$target_bin" "$BIN_PATH"
-    local rb_ver
-    rb_ver=$(get_local_version)
-    echo "$rb_ver" > "$VERSION_FILE"
-
-    if restart_cliproxy; then
-        echo -e "${GREEN}[成功] 已成功回滚至版本: v${rb_ver}，服务运行正常！${PLAIN}"
-    else
-        echo -e "${RED}[错误] 回滚后服务启动失败，请检查日志: journalctl -u cliproxy -n 20${PLAIN}"
-    fi
-}
-
-# 8. 备份与还原管理
-backup_manage() {
-    clear
-    echo -e "${GREEN}========================================${PLAIN}"
-    echo -e "${GREEN}       CLIProxyAPI 备份与还原管理       ${PLAIN}"
-    echo -e "${GREEN}========================================${PLAIN}"
-    echo -e "  1. 手动创建当前完整备份 (配置 + 授权凭据 + 二进制)"
-    echo -e "  2. 还原历史配置文件 (config.yaml)"
-    echo -e "  3. 查看现有备份列表与空间占用"
-    echo -e "  4. 清理所有历史备份"
-    echo -e "  0. 返回主菜单"
-    echo -e "----------------------------------------"
-    local bopt
-    read -rp "请输入选项 [0-4]: " bopt
-    case "$bopt" in
-        1)
-            mkdir -p "$BACKUP_DIR"
-            local ts
-            ts=$(date +"%Y%m%d_%H%M%S")
-            echo -e "${BLUE}[*] 正在创建完整备份...${PLAIN}"
-            [[ -f "$CONFIG_PATH" ]] && cp -a "$CONFIG_PATH" "${BACKUP_DIR}/config_manual_${ts}.yaml"
-            [[ -f "$BIN_PATH" ]] && cp -a "$BIN_PATH" "${BACKUP_DIR}/cli-proxy-api_manual_${ts}"
-            if [[ -d "$AUTH_DIR" && $(find "$AUTH_DIR" -type f 2>/dev/null | wc -l) -gt 0 ]]; then
-                tar -czf "${BACKUP_DIR}/auth_manual_${ts}.tar.gz" -C "$WORK_DIR" auth 2>/dev/null || true
-            fi
-            echo -e "${GREEN}[成功] 完整备份已创建在: ${BACKUP_DIR}${PLAIN}"
+manage_service() {
+    [[ -f "$SERVICE_PATH" ]] || { warn "服务尚未安装，请先执行 [1. 安装部署]。"; return 1; }
+    case "$1" in
+        start)
+            svc_ctl status && { info "服务当前已在运行中，无需重复启动。"; return 0; }
+            svc_ctl start && sleep 1 && svc_ctl status && ok "服务启动成功！" \
+                || { err "服务启动失败，请通过菜单 [5. 实时日志] 查看详细报错。"; return 1; }
             ;;
-        2)
-            local cfg_baks=()
-            while IFS= read -r f; do
-                [[ -n "$f" ]] && cfg_baks+=("$f")
-            done < <(find "$BACKUP_DIR" -maxdepth 1 -type f -name "config_*.yaml" 2>/dev/null | sort -r)
-
-            if [[ ${#cfg_baks[@]} -eq 0 ]]; then
-                echo -e "${YELLOW}[提示] 没有找到可恢复的配置文件备份！${PLAIN}"
-                return
-            fi
-            echo -e "可恢复的配置文件列表："
-            local i=1
-            for cb in "${cfg_baks[@]}"; do
-                echo -e "  [${i}] $(basename "$cb")"
-                i=$((i+1))
-            done
-            local pick
-            read -rp "请选择要恢复的配置编号 [1-${#cfg_baks[@]}]: " pick
-            if [[ "$pick" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= ${#cfg_baks[@]} )); then
-                local sel="${cfg_baks[$((pick-1))]}"
-                cp -f "$CONFIG_PATH" "${WORK_DIR}/config.yaml.before_restore" 2>/dev/null || true
-                cp -f "$sel" "$CONFIG_PATH"
-                echo -e "${GREEN}[成功] 已成功还原配置: $(basename "$sel")${PLAIN}"
-                systemctl is-active --quiet cliproxy 2>/dev/null && restart_cliproxy && echo -e "${GREEN}[*] 已重启后端服务使配置生效。${PLAIN}"
-            else
-                echo -e "${RED}[错误] 无效的编号！${PLAIN}"
-            fi
+        stop)
+            svc_ctl status || { info "服务当前已处于停止状态。"; return 0; }
+            svc_ctl stop && ok "服务已停止运行。"
             ;;
-        3)
-            echo -e "\n当前备份目录 (${BACKUP_DIR}) 内容："
-            [[ -d "$BACKUP_DIR" ]] && ls -lh "$BACKUP_DIR" || echo -e "备份目录为空。"
+        restart)
+            restart_cliproxy && ok "服务重启成功！" \
+                || { err "服务重启失败，请通过菜单 [5. 实时日志] 查看详细报错。"; return 1; }
             ;;
-        4)
-            local cfm
-            read -rp "确认清理 ${BACKUP_DIR} 下的所有历史备份文件？[y/N]: " cfm
-            if [[ "$cfm" =~ ^[yY]$ ]]; then
-                if [[ -d "$BACKUP_DIR" ]]; then
-                    rm -rf "${BACKUP_DIR:?}"/* 2>/dev/null || true
-                fi
-                echo -e "${GREEN}[成功] 历史备份已清理。${PLAIN}"
-            fi
-            ;;
-        0) return ;;
-        *) echo -e "${RED}请输入有效选项！${PLAIN}" ;;
     esac
 }
 
-# 9. 官方标准安装与重新部署流程
+# 2. 版本解析与官方发布源获取
+parse_binary_version() {
+    local target="${1:-$BIN_PATH}"
+    [[ -x "$target" ]] || return 1
+    "$target" --help 2>&1 | awk -F'CLIProxyAPI Version: ' '/CLIProxyAPI Version:/ {
+        sub(/,.*/, "", $2); gsub(/[v \r\n]/, "", $2); print $2; exit
+    }'
+}
+
+get_local_version() {
+    [[ -f "$BIN_PATH" ]] || { echo "未安装"; return; }
+    local ver
+    ver=$(parse_binary_version "$BIN_PATH" 2>/dev/null || true)
+    echo "${ver:-未知}"
+}
+
+fmt_ver() {
+    [[ "$1" =~ ^(未安装|未知)$ ]] && echo -e "${YELLOW}$1${PLAIN}" || echo -e "${CYAN}v$1${PLAIN}"
+}
+
+fetch_release_info() {
+    local arch variant=""
+    arch=$(detect_arch) || { err "当前系统架构暂不支持: $(uname -m)"; return 1; }
+    [[ "$OS_ID" == "alpine" ]] && variant="_no-plugin"
+
+    # 优先通过 302 Location 头获取最新 Tag（轻量快速且不受 GitHub API 速率限制）
+    LATEST_TAG=$(curl -sI --max-time 10 "https://github.com/${OFFICIAL_REPO}/releases/latest" 2>/dev/null \
+        | awk -F'/tag/' 'tolower($0) ~ /^location:.*\/tag\// {gsub(/[\r\n ]/, "", $2); print $2; exit}')
+
+    if [[ -z "$LATEST_TAG" ]]; then
+        LATEST_TAG=$(curl -fsSL --max-time 10 "https://api.github.com/repos/${OFFICIAL_REPO}/releases/latest" 2>/dev/null \
+            | grep -oE '"tag_name":[[:space:]]*"[^"]+"' | head -n 1 | cut -d'"' -f4)
+    fi
+    [[ -n "$LATEST_TAG" ]] || { err "无法获取官方最新版本信息，请检查网络连通性！"; return 1; }
+
+    LATEST_VER="${LATEST_TAG#v}"
+    DOWNLOAD_URL="https://github.com/${OFFICIAL_REPO}/releases/download/${LATEST_TAG}/CLIProxyAPI_${LATEST_VER}_linux_${arch}${variant}.tar.gz"
+}
+
+# 3. 核心二进制下载、校验与原子安装
+install_release_binary() {
+    local tmp_dir found test_out example_cfg
+    tmp_dir=$(mktemp -d)
+    trap "rm -rf -- '$tmp_dir'; trap - RETURN" RETURN
+    mkdir -p "$WORK_DIR"
+
+    info "正在下载官方程序包: ${DOWNLOAD_URL}"
+    curl -fsSL -o "${tmp_dir}/pkg.tar.gz" "$DOWNLOAD_URL" || { err "程序包下载失败！"; return 1; }
+    tar -zxf "${tmp_dir}/pkg.tar.gz" -C "$tmp_dir" 2>/dev/null || { err "程序包解压失败！"; return 1; }
+    rm -f "${tmp_dir}/pkg.tar.gz"
+
+    found=$(find "$tmp_dir" -type f \( -iname "cli-proxy-api" -o -iname "cliproxyapi" \) | head -n 1)
+    [[ -n "$found" ]] || { err "解压包内未找到可执行主程序！"; return 1; }
+    chmod +x "$found"
+
+    if ! test_out=$("$found" --help 2>&1); then
+        err "程序兼容性预检未通过，无法在当前系统运行！"
+        echo -e "${YELLOW}${test_out}${PLAIN}"
+        return 1
+    fi
+
+    install -m 755 "$found" "$BIN_PATH"
+    example_cfg=$(find "$tmp_dir" -type f -name "config.example.yaml" | head -n 1)
+    [[ -n "$example_cfg" ]] && cp -f "$example_cfg" "${WORK_DIR}/config.example.yaml" 2>/dev/null || true
+
+    ok "主程序安装完成 (v${LATEST_VER})"
+}
+
+# 4. 备份与轮转管理
+create_backup() {
+    local mode="${1:-auto}" ts cur_v v_tag
+    mkdir -p "$BACKUP_DIR"
+    ts=$(date +"%Y%m%d_%H%M%S")
+    cur_v=$(get_local_version)
+    [[ "$cur_v" =~ ^(未安装|未知)$ ]] && cur_v=""
+    v_tag="${cur_v:+_v${cur_v}}"
+
+    LAST_BIN_BACKUP=""
+    [[ -f "$CONFIG_PATH" ]] && cp -a "$CONFIG_PATH" "${BACKUP_DIR}/config_${mode}${v_tag}_${ts}.yaml"
+    if [[ -f "$BIN_PATH" ]]; then
+        LAST_BIN_BACKUP="${BACKUP_DIR}/cli-proxy-api_${mode}${v_tag}_${ts}"
+        cp -a "$BIN_PATH" "$LAST_BIN_BACKUP"
+    fi
+    if [[ "$mode" == "manual" && -d "$AUTH_DIR" ]] && [[ -n "$(ls -A "$AUTH_DIR" 2>/dev/null)" ]]; then
+        tar -czf "${BACKUP_DIR}/auth_manual_${ts}.tar.gz" -C "$WORK_DIR" auth 2>/dev/null || true
+    fi
+
+    # 自动备份仅保留最新 3 份，手动备份永久保留
+    find "$BACKUP_DIR" -maxdepth 1 -type f -name "config_auto_*" 2>/dev/null | sort -r | tail -n +4 | xargs -r rm -f
+    find "$BACKUP_DIR" -maxdepth 1 -type f -name "cli-proxy-api_auto_*" 2>/dev/null | sort -r | tail -n +4 | xargs -r rm -f
+}
+
+# 5. 安装部署向导
 deploy() {
     clear
-    init_system
-    echo -e "${GREEN}========================================${PLAIN}"
-    echo -e "${GREEN}    CLIProxyAPI 官方标准一键部署流程    ${PLAIN}"
-    echo -e "${GREEN}========================================${PLAIN}"
+    ensure_deps || return 1
+    header "CLIProxyAPI 安装与配置向导"
 
     if [[ -f "$BIN_PATH" && -f "$CONFIG_PATH" ]]; then
-        echo -e "${YELLOW}[提示] 检测到当前系统已存在 CLIProxyAPI 安装与配置！${PLAIN}"
-        echo -e "  当前已安装版本: v$(get_local_version)"
-        echo -e "----------------------------------------"
-        echo -e "  ${GREEN}1.${PLAIN} 执行【无损平滑升级】 (推荐，保留全部现有配置与账号)"
-        echo -e "  ${RED}2.${PLAIN} 重新部署 / 覆盖初始化配置 (原配置将自动备份)"
-        echo -e "  ${PLAIN}0.${PLAIN} 返回主菜单"
-        echo -e "----------------------------------------"
+        warn "检测到系统已安装 CLIProxyAPI ($(fmt_ver "$(get_local_version)"))"
+        echo -e "  ${GREEN}1.${PLAIN} 平滑升级      ${GRAY}保留现有配置与授权凭据 (推荐)${PLAIN}"
+        echo -e "  ${YELLOW}2.${PLAIN} 重新配置      ${GRAY}自动备份原文件并重新生成配置${PLAIN}"
+        echo -e "  ${GREEN}0.${PLAIN} 返回主菜单"
+        echo -e "${LINE}"
         local dep_opt
-        read -rp "请选择操作 [默认: 1]: " dep_opt
-        dep_opt=${dep_opt:-1}
-        case "$dep_opt" in
+        read -rp "请选择操作 [0-2, 默认: 1]: " dep_opt
+        case "${dep_opt:-1}" in
             1) upgrade_lossless; return ;;
-            2) backup_current_state ;;
+            2) create_backup "auto" ;;
             *) return ;;
         esac
     fi
 
-    local old_domain="" old_key="" old_port=""
+    local old_port="" old_key="" PORT SECRET_KEY default_key
     if [[ -f "$CONFIG_PATH" ]]; then
-        old_port=$(awk '/^port:/ {print $2}' "$CONFIG_PATH" 2>/dev/null || true)
-        old_key=$(awk '/^secret-key:/ {gsub(/["'\'' ]/, "", $2); print $2}' "$CONFIG_PATH" 2>/dev/null || true)
-        [[ -f "$CADDYFILE" ]] && old_domain=$(head -n 1 "$CADDYFILE" 2>/dev/null | awk '{print $1}')
+        old_port=$(get_port)
+        old_key=$(awk '/^[[:space:]]*secret-key:/ {gsub(/["'\'' ]/, "", $2); print $2; exit}' "$CONFIG_PATH" 2>/dev/null || true)
+        [[ "$old_key" == \$2[abxy]\$* ]] && old_key=""
     fi
 
-    local DOMAIN SECRET_KEY PORT default_key
-    read -rp "绑定公网域名 [默认: ${old_domain:-api.onc.cc}]: " DOMAIN
-    DOMAIN=${DOMAIN:-${old_domain:-api.onc.cc}}
+    read -rp "请输入监听端口 [1-65535, 默认: ${old_port:-8317}]: " PORT
+    PORT=${PORT:-${old_port:-8317}}
+    if [[ ! "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
+        err "无效的端口号 (${PORT})，请输入 1-65535 之间的整数！"
+        return 1
+    fi
 
-    default_key=${old_key:-$(tr -dc A-Za-z0-9 </dev/urandom 2>/dev/null | head -c 24)}
-    read -rp "管理密钥 Secret Key [默认: ${default_key}]: " SECRET_KEY
+    default_key=${old_key:-$(head -c 256 /dev/urandom 2>/dev/null | tr -dc 'A-Za-z0-9' | head -c 24)}
+    read -rp "请输入管理密钥 Secret Key [默认: ${default_key}]: " SECRET_KEY
     SECRET_KEY=${SECRET_KEY:-$default_key}
 
-    read -rp "本地监听端口 [默认: ${old_port:-8317}]: " PORT
-    PORT=${PORT:-${old_port:-8317}}
-
     mkdir -p "$AUTH_DIR"
-    pkill -9 -f "cli-proxy-api" 2>/dev/null || true
-    fuser -k -9 "${PORT}/tcp" 2>/dev/null || true
+    svc_ctl stop || true
 
-    if [[ -f "$BIN_PATH" ]]; then
-        local update_bin
-        read -rp "检测到本地已有二进制文件，是否从官方更新最新版本？[y/N]: " update_bin
-        [[ "$update_bin" =~ ^[yY]$ ]] && download_official_binary
-    else
-        download_official_binary
+    local update_bin="y"
+    [[ -x "$BIN_PATH" ]] && read -rp "检测到本地已有主程序，是否更新至官方最新版？[Y/n]: " update_bin
+    if [[ ! "$update_bin" =~ ^[nN]$ ]]; then
+        info "正在查询 GitHub 最新发行版本..."
+        fetch_release_info && install_release_binary || return 1
     fi
 
-    echo -e "${BLUE}[*] 生成官方标准 config.yaml...${PLAIN}"
+    info "正在写入配置文件 ${CONFIG_PATH} ..."
     cat << YAML > "$CONFIG_PATH"
-port: ${PORT}
-secret-key: "${SECRET_KEY}"
-remote-management:
+config-version: 8
+
+server:
+  host: ""
+  port: ${PORT}
+
+management:
   allow-remote: true
   secret-key: "${SECRET_KEY}"
-auth-dir: "auth"
-log-level: "info"
-timeout: 120s
+
+oauth:
+  auth-dir: "auth"
 YAML
 
-    echo -e "${BLUE}[*] 配置 systemd 服务守护...${PLAIN}"
-    cat << UNIT > "$SERVICE_PATH"
+    if [[ "$OS_ID" == "alpine" ]]; then
+        info "正在配置 OpenRC 系统服务..."
+        cat << INIT > "$SERVICE_PATH"
+#!/sbin/openrc-run
+
+name="CLIProxyAPI"
+description="CLIProxyAPI Service (${OFFICIAL_REPO})"
+supervisor="supervise-daemon"
+respawn_delay=3
+respawn_max=0
+directory="${WORK_DIR}"
+command="${BIN_PATH}"
+command_args="--config ${CONFIG_PATH}"
+output_log="${LOG_FILE}"
+error_log="${LOG_FILE}"
+rc_ulimit="-n 65535"
+
+depend() {
+    need net
+    after firewall
+}
+INIT
+        chmod +x "$SERVICE_PATH"
+        rc-update add cliproxy default >/dev/null 2>&1 || true
+        svc_ctl restart || svc_ctl start
+    else
+        info "正在配置 systemd 系统服务..."
+        cat << UNIT > "$SERVICE_PATH"
 [Unit]
-Description=CLI Proxy API Service (router-for-me)
-After=network.target
+Description=CLIProxyAPI Service (${OFFICIAL_REPO})
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
 WorkingDirectory=${WORK_DIR}
-ExecStart=${BIN_PATH}
-Restart=always
+ExecStart=${BIN_PATH} --config ${CONFIG_PATH}
+Restart=on-failure
 RestartSec=3
 LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
 UNIT
+        systemctl daemon-reload
+        systemctl enable --now cliproxy
+    fi
 
-    systemctl daemon-reload
-    systemctl enable --now cliproxy
+    if ! sleep 1 || ! svc_ctl status; then
+        err "服务启动失败，请通过菜单 [5. 实时日志] 排查具体原因！"
+        return 1
+    fi
 
-    echo -e "${BLUE}[*] 配置 Caddy 反代与自动 SSL...${PLAIN}"
-    mkdir -p /etc/caddy
-    cat << CADDY > "$CADDYFILE"
-${DOMAIN} {
-    reverse_proxy 127.0.0.1:${PORT} {
-        flush_interval -1
-        transport http {
-            keepalive 30s
-            keepalive_idle_conns 10
-        }
-    }
-    encode gzip zstd
-}
-CADDY
-
-    caddy fmt -w "$CADDYFILE" >/dev/null 2>&1 || true
-    systemctl enable --now caddy
-    systemctl reload caddy 2>/dev/null || systemctl restart caddy 2>/dev/null || true
-
-    echo -e "\n${GREEN}================ 部署完成 ================${PLAIN}"
-    echo -e "管理控制台   : ${BLUE}https://${DOMAIN}/management.html${PLAIN}"
-    echo -e "控制台配置   : 服务地址请填写 ${YELLOW}https://${DOMAIN}${PLAIN} ${RED}(绝不要加 /v1！)${PLAIN}"
-    echo -e "管理密钥     : ${GREEN}${SECRET_KEY}${PLAIN}"
-    echo -e "API 端点规范 : "
-    echo -e "  - OpenAI   : ${BLUE}https://${DOMAIN}/v1/chat/completions${PLAIN}"
-    echo -e "  - Claude   : ${BLUE}https://${DOMAIN}/v1/messages${PLAIN}"
-    echo -e "  - 模型列表 : ${BLUE}https://${DOMAIN}/v1/models${PLAIN}"
-    echo -e "认证数据目录 : ${YELLOW}${AUTH_DIR}${PLAIN} (OAuth 与登录 Session 持久化)"
-    echo -e "==========================================${PLAIN}"
+    local srv_ip
+    srv_ip=$(get_server_ip)
+    header "CLIProxyAPI 部署成功"
+    echo -e "  系统环境   : ${OS_NAME}"
+    echo -e "  当前版本   : $(fmt_ver "$(get_local_version)")"
+    echo -e "  运行状态   : $(fmt_status)"
+    echo -e "  本地地址   : ${YELLOW}http://127.0.0.1:${PORT}${PLAIN} ${GRAY}(反代上游地址)${PLAIN}"
+    echo -e "  管理面板   : ${BLUE}http://${srv_ip}:${PORT}/management.html${PLAIN}"
+    echo -e "  管理密钥   : ${GREEN}${SECRET_KEY}${PLAIN}"
+    echo -e "  配置文件   : ${CONFIG_PATH}"
+    echo -e "  凭据目录   : ${AUTH_DIR}"
+    echo -e "${LINE}"
+    echo -e "  常用接口端点:"
+    echo -e "  - OpenAI   : ${BLUE}http://${srv_ip}:${PORT}/v1/chat/completions${PLAIN}"
+    echo -e "  - Claude   : ${BLUE}http://${srv_ip}:${PORT}/v1/messages${PLAIN}"
+    echo -e "  - 模型列表 : ${BLUE}http://${srv_ip}:${PORT}/v1/models${PLAIN}"
+    echo -e "${GREEN}${SEP}${PLAIN}"
 }
 
-# 10. 查看服务状态与端口
+# 6. 无损平滑升级
+upgrade_lossless() {
+    clear
+    header "CLIProxyAPI 无损平滑升级"
+    ensure_deps || return 1
+
+    if [[ ! -f "$BIN_PATH" ]]; then
+        warn "尚未检测到已安装的 CLIProxyAPI 主程序。"
+        read -rp "是否立即进入安装部署向导？[Y/n]: " do_install
+        [[ ! "$do_install" =~ ^[nN]$ ]] && deploy
+        return
+    fi
+
+    local local_ver
+    local_ver=$(get_local_version)
+    info "本地当前版本: $(fmt_ver "$local_ver")"
+    info "正在查询 GitHub 最新发行版本..."
+    fetch_release_info || return 1
+    info "官方最新版本: ${GREEN}v${LATEST_VER}${PLAIN}"
+
+    if [[ "$local_ver" == "$LATEST_VER" ]]; then
+        ok "当前已是最新版本 (v${local_ver})，无需升级。"
+        read -rp "是否仍要强制重新下载并覆盖安装？[y/N]: " force_up
+        [[ ! "$force_up" =~ ^[yY]$ ]] && { info "已取消升级操作。"; return 0; }
+    else
+        read -rp "确认升级至 v${LATEST_VER}（完整保留现有配置与凭据）？[Y/n]: " confirm_up
+        [[ "$confirm_up" =~ ^[nN]$ ]] && { info "已取消升级操作。"; return 0; }
+    fi
+
+    info "正在自动备份当前版本与配置文件..."
+    create_backup "auto"
+
+    install_release_binary || { err "升级已中止，现有运行服务未受影响。"; return 1; }
+
+    info "正在平滑重启服务..."
+    if ! restart_cliproxy; then
+        err "新版本启动异常，正在触发自动回滚..."
+        if [[ -n "$LAST_BIN_BACKUP" && -f "$LAST_BIN_BACKUP" ]]; then
+            install -m 755 "$LAST_BIN_BACKUP" "$BIN_PATH"
+            if restart_cliproxy; then
+                ok "已自动回滚至稳定版本 ($(fmt_ver "$(get_local_version)"))。"
+                return 1
+            fi
+        fi
+        err "回滚后服务仍未能启动，请通过菜单 [5. 实时日志] 排查原因！"
+        return 1
+    fi
+
+    header "CLIProxyAPI 平滑升级完成"
+    echo -e "  版本变更   : ${YELLOW}v${local_ver}${PLAIN} -> ${GREEN}v$(get_local_version)${PLAIN}"
+    echo -e "  运行状态   : $(fmt_status)"
+    echo -e "  配置文件   : ${CONFIG_PATH} ${GREEN}(已完整保留)${PLAIN}"
+    echo -e "  凭据目录   : ${AUTH_DIR} ${GREEN}(已完整保留)${PLAIN}"
+    echo -e "  参考模板   : ${WORK_DIR}/config.example.yaml"
+    echo -e "${GREEN}${SEP}${PLAIN}"
+}
+
+# 7. 历史版本回滚
+rollback() {
+    clear
+    header "CLIProxyAPI 历史版本回滚"
+
+    local backup_list=() f idx=1 bver choice target_bin
+    [[ -d "$BACKUP_DIR" ]] && mapfile -t backup_list < <(find "$BACKUP_DIR" -maxdepth 1 -type f -name "cli-proxy-api_*" 2>/dev/null | sort -r)
+    [[ ${#backup_list[@]} -gt 0 ]] || { warn "未找到可用的历史主程序备份！"; return 1; }
+
+    echo -e "  当前运行版本: $(fmt_ver "$(get_local_version)")\n"
+    echo -e "  可恢复的历史版本列表："
+    for f in "${backup_list[@]}"; do
+        bver=$(parse_binary_version "$f" 2>/dev/null || echo "未知")
+        printf "  ${GREEN}%2d.${PLAIN} %-42s %b\n" "$idx" "$(basename "$f")" "$(fmt_ver "$bver")"
+        ((idx++))
+    done
+    echo -e "${LINE}\n   ${GREEN}0.${PLAIN} 返回主菜单\n${LINE}"
+
+    read -rp "请选择要恢复的备份编号 [0-${#backup_list[@]}]: " choice
+    [[ -z "$choice" || "$choice" == "0" ]] && { info "已取消版本回滚。"; return 0; }
+    if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#backup_list[@]} )); then
+        err "输入的编号无效！"
+        return 1
+    fi
+
+    target_bin="${backup_list[$((choice-1))]}"
+    info "正在恢复版本备份: $(basename "$target_bin") ..."
+    install -m 755 "$target_bin" "$BIN_PATH"
+
+    if restart_cliproxy; then
+        ok "已成功回滚至 $(fmt_ver "$(get_local_version)")，服务运行正常！"
+    else
+        err "回滚后服务启动失败，请通过菜单 [5. 实时日志] 排查原因！"
+        return 1
+    fi
+}
+
+# 8. 查看状态与实时日志
 view_status() {
-    local cur_port cur_ver auth_count domain cpa_st caddy_st
-    cur_port=$(awk '/^port:/ {print $2}' "$CONFIG_PATH" 2>/dev/null || echo 8317)
+    local cur_port cur_ver auth_count=0 net_cmd="netstat"
+    cur_port=$(get_port)
     cur_ver=$(get_local_version)
-    auth_count=0
     [[ -d "$AUTH_DIR" ]] && auth_count=$(find "$AUTH_DIR" -type f 2>/dev/null | wc -l)
-    cpa_st=$(get_service_status cliproxy)
-    caddy_st=$(get_service_status caddy)
-    domain=""
-    [[ -f "$CADDYFILE" ]] && domain=$(head -n 1 "$CADDYFILE" 2>/dev/null | awk '{print $1}')
 
-    echo -e "\n${GREEN}================== 服务运行状态 ==================${PLAIN}"
-    [[ "$cur_ver" =~ ^(未安装|未知)$ ]] && echo -e "程序当前版本 : ${YELLOW}${cur_ver}${PLAIN}" || echo -e "程序当前版本 : ${BLUE}v${cur_ver#v}${PLAIN}"
-
-    [[ "$cpa_st" == "active" ]] && echo -e "后端服务状态 : ${GREEN}运行中 (active)${PLAIN}" || echo -e "后端服务状态 : ${RED}${cpa_st}${PLAIN}"
-    [[ "$caddy_st" == "active" ]] && echo -e "Caddy 反代状态: ${GREEN}运行中 (active)${PLAIN}" || echo -e "Caddy 反代状态: ${RED}${caddy_st}${PLAIN}"
-
-    echo -e "本地监听端口 : ${YELLOW}${cur_port}${PLAIN}"
-    [[ -n "$domain" ]] && echo -e "绑定公网域名 : ${BLUE}https://${domain}${PLAIN}"
-    echo -e "授权凭据数量 : ${GREEN}${auth_count}${PLAIN} 个 (位于 ${AUTH_DIR})"
-    echo -e "配置文件路径 : ${CONFIG_PATH}"
-    echo -e "--------------------------------------------------"
-    echo -e "端口与进程监听："
-    ss -tulpn 2>/dev/null | grep -iE "${cur_port}|caddy|cli-proxy" || netstat -tulpn 2>/dev/null | grep -iE "${cur_port}|caddy|cli-proxy" || true
-    echo -e "=================================================="
+    header "CLIProxyAPI 服务运行状态"
+    echo -e "  系统环境   : ${OS_NAME}"
+    echo -e "  当前版本   : $(fmt_ver "$cur_ver")"
+    echo -e "  运行状态   : $(fmt_status)"
+    if [[ -f "$CONFIG_PATH" ]] || is_installed; then
+        echo -e "  监听端口   : ${YELLOW}${cur_port}${PLAIN}"
+    else
+        echo -e "  监听端口   : ${GRAY}-${PLAIN}"
+    fi
+    echo -e "  凭据数量   : ${GREEN}${auth_count}${PLAIN} 个 ${GRAY}(${AUTH_DIR})${PLAIN}"
+    echo -e "  配置文件   : ${CONFIG_PATH}"
+    echo -e "  程序路径   : ${BIN_PATH}"
+    echo -e "${LINE}\n  端口监听详情:"
+    command -v ss &>/dev/null && net_cmd="ss"
+    "$net_cmd" -tulpn 2>/dev/null | grep -iE ":${cur_port}([[:space:]]|$)|cli-proxy" | sed 's/^/  /' \
+        || echo -e "  ${GRAY}(当前未检测到端口监听进程)${PLAIN}"
+    echo -e "${GREEN}${SEP}${PLAIN}"
 }
 
-# 11. 交互式运维面板
-while true; do
-    cur_ver=$(get_local_version)
-    cpa_st=$(get_service_status cliproxy)
-    cpa_display="${RED}已停止${PLAIN}"
-    [[ "$cpa_st" == "active" ]] && cpa_display="${GREEN}运行中${PLAIN}"
-    [[ "$cpa_st" == "未安装" ]] && cpa_display="${YELLOW}未安装${PLAIN}"
+view_logs() {
+    [[ -f "$SERVICE_PATH" ]] || { warn "服务尚未安装，暂无运行日志可查看。"; return 1; }
+    info "正在输出最近 50 行日志并持续跟踪 ${YELLOW}(按 Ctrl+C 返回主菜单)${PLAIN}..."
+    echo -e "${LINE}"
+    trap 'echo ""' INT
+    if [[ "$OS_ID" == "alpine" ]]; then
+        [[ -f "$LOG_FILE" ]] || : > "$LOG_FILE"
+        tail -n 50 -f "$LOG_FILE"
+    else
+        journalctl -u cliproxy -n 50 -f
+    fi
+    trap - INT
+}
 
-    ver_display="${YELLOW}${cur_ver}${PLAIN}"
-    [[ ! "$cur_ver" =~ ^(未安装|未知)$ ]] && ver_display="${BLUE}v${cur_ver#v}${PLAIN}"
+# 9. 备份与还原管理
+backup_manage() {
+    clear
+    while true; do
+        header "CLIProxyAPI 备份与还原管理"
+        echo -e "  ${GREEN}1.${PLAIN} 创建完整备份    ${GRAY}归档配置、授权凭据与当前主程序${PLAIN}"
+        echo -e "  ${GREEN}2.${PLAIN} 还原配置文件    ${GRAY}从历史归档恢复 config.yaml${PLAIN}"
+        echo -e "  ${GREEN}3.${PLAIN} 查看备份列表    ${GRAY}查看备份目录文件与磁盘占用${PLAIN}"
+        echo -e "  ${RED}4.${PLAIN} 清空历史备份    ${GRAY}删除 backup 目录下全部备份归档${PLAIN}"
+        echo -e "${LINE}\n  ${GREEN}0.${PLAIN} 返回主菜单\n${GREEN}${SEP}${PLAIN}"
+
+        local bopt
+        read -rp "请输入选项 [0-4]: " bopt
+        case "$bopt" in
+            1)
+                create_backup "manual"
+                ok "完整备份已保存至: ${BACKUP_DIR}"
+                ;;
+            2)
+                local cfg_baks=() f i=1 pick
+                [[ -d "$BACKUP_DIR" ]] && mapfile -t cfg_baks < <(find "$BACKUP_DIR" -maxdepth 1 -type f -name "config_*.yaml" 2>/dev/null | sort -r)
+                [[ ${#cfg_baks[@]} -gt 0 ]] || { warn "暂无可恢复的配置文件备份！"; continue; }
+
+                echo -e "\n  可恢复的配置文件列表："
+                for f in "${cfg_baks[@]}"; do
+                    printf "  ${GREEN}%2d.${PLAIN} %s\n" "$i" "$(basename "$f")"
+                    ((i++))
+                done
+                echo -e "   ${GREEN}0.${PLAIN} 取消还原"
+                read -rp "请选择备份编号 [0-${#cfg_baks[@]}]: " pick
+                [[ -z "$pick" || "$pick" == "0" ]] && { info "已取消还原。"; continue; }
+                if [[ "$pick" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= ${#cfg_baks[@]} )); then
+                    cp -f "${cfg_baks[$((pick-1))]}" "$CONFIG_PATH"
+                    ok "已恢复配置文件: $(basename "${cfg_baks[$((pick-1))]}")"
+                    svc_ctl status && restart_cliproxy && ok "已自动重启服务使配置生效。"
+                else
+                    err "输入的编号无效！"
+                fi
+                ;;
+            3)
+                echo -e "\n  备份目录路径: ${BACKUP_DIR}\n${LINE}"
+                if [[ -d "$BACKUP_DIR" ]] && [[ -n "$(ls -A "$BACKUP_DIR" 2>/dev/null)" ]]; then
+                    ls -lh "$BACKUP_DIR" | tail -n +2 | sed 's/^/  /'
+                else
+                    echo -e "  ${GRAY}(当前暂无任何备份文件)${PLAIN}"
+                fi
+                echo -e "${LINE}"
+                ;;
+            4)
+                local cfm
+                read -rp "确认清空 ${BACKUP_DIR} 下的所有备份归档？此操作不可恢复 [y/N]: " cfm
+                if [[ "$cfm" =~ ^[yY]$ ]]; then
+                    rm -rf "${BACKUP_DIR:?}"/* 2>/dev/null || true
+                    ok "全部历史备份已清理完毕。"
+                else
+                    info "已取消清理操作。"
+                fi
+                ;;
+            0) return ;;
+            *) err "请输入有效选项 [0-4]！" ;;
+        esac
+    done
+}
+
+# 10. 卸载与清理
+uninstall_cliproxy() {
+    header "CLIProxyAPI 卸载与清理"
+    echo -e "  即将移除: 系统服务、主程序、配置文件及历史备份"
+    echo -e "  默认保留: ${AUTH_DIR} 授权凭据目录\n"
+
+    local confirm del_auth
+    read -rp "确认卸载 CLIProxyAPI？[y/N]: " confirm
+    [[ "$confirm" =~ ^[yY]$ ]] || { info "已取消卸载。"; return 0; }
+
+    svc_ctl stop || true
+    if [[ "$OS_ID" == "alpine" ]]; then
+        rc-update del cliproxy default >/dev/null 2>&1 || true
+        rm -f "$SERVICE_PATH" "$LOG_FILE"
+    else
+        systemctl disable cliproxy 2>/dev/null || true
+        rm -f "$SERVICE_PATH"
+        systemctl daemon-reload
+    fi
+    rm -f "$BIN_PATH" "$CONFIG_PATH" "${WORK_DIR}/config.example.yaml"
+    rm -rf "$BACKUP_DIR"
+
+    if [[ -d "$AUTH_DIR" ]] && [[ -n "$(ls -A "$AUTH_DIR" 2>/dev/null)" ]]; then
+        read -rp "是否一并删除 ${AUTH_DIR} 下的所有授权凭据？[y/N]: " del_auth
+        if [[ "$del_auth" =~ ^[yY]$ ]]; then
+            rm -rf "$WORK_DIR"
+            ok "CLIProxyAPI 及全部凭据数据已彻底清理完毕。"
+        else
+            ok "程序已卸载，授权凭据仍保留于: ${AUTH_DIR}"
+        fi
+    else
+        rm -rf "$WORK_DIR" 2>/dev/null || true
+        ok "CLIProxyAPI 已彻底卸载清理完毕。"
+    fi
+}
+
+# 11. 交互式运维主菜单
+while true; do
+    is_installed && port_display="${YELLOW}$(get_port)${PLAIN}" || port_display="${GRAY}-${PLAIN}"
 
     echo -e "
-${GREEN}=== CLIProxyAPI 官方标准运维面板 ===${PLAIN}
-  当前版本: ${ver_display}  |  后端状态: ${cpa_display}
----------------------------------
-  ${GREEN}1.${PLAIN} 一键安装部署 CLIProxyAPI
-  ${GREEN}2.${PLAIN} ${YELLOW}无损平滑升级 CLIProxyAPI (保留全部配置与授权)${PLAIN}
-  ${GREEN}3.${PLAIN} 版本回滚 (恢复至上一版本二进制)
-  ${GREEN}4.${PLAIN} 查看服务状态与端口
-  ${GREEN}5.${PLAIN} 备份与还原管理 (配置/凭据)
-  ${GREEN}6.${PLAIN} 重启所有服务
-  ${GREEN}7.${PLAIN} 停止后端服务
-  ${GREEN}8.${PLAIN} 启动后端服务
-  ${GREEN}9.${PLAIN} 查看 CLIProxyAPI 实时日志
-  ${GREEN}10.${PLAIN} 查看 Caddy 访问/SSL 日志
-  ${GREEN}11.${PLAIN} 彻底卸载清理
-  ${GREEN}0.${PLAIN} 退出脚本
----------------------------------"
-    read -rp "请输入选项 [0-11]: " opt
+${GREEN}${SEP}
+            CLIProxyAPI 运维管理面板${PLAIN}
+  版本: $(fmt_ver "$(get_local_version)")  |  状态: $(fmt_status -s)  |  端口: ${port_display}
+${GREEN}${SEP}${PLAIN}
+  ${CYAN}[部署与版本]${PLAIN}
+   ${GREEN}1.${PLAIN} 安装部署      ${GRAY}初始化安装或重新配置服务${PLAIN}
+   ${GREEN}2.${PLAIN} 平滑升级      ${GRAY}无损更新版本，保留配置与凭据${PLAIN}
+   ${GREEN}3.${PLAIN} 版本回滚      ${GRAY}回退至历史备份版本${PLAIN}
+${GRAY}${LINE}${PLAIN}
+  ${CYAN}[监控与控制]${PLAIN}
+   ${GREEN}4.${PLAIN} 查看状态      ${GRAY}查看运行详情与端口监听状态${PLAIN}
+   ${GREEN}5.${PLAIN} 实时日志      ${GRAY}跟踪运行日志 (Ctrl+C 返回)${PLAIN}
+   ${GREEN}6.${PLAIN} 启动服务      ${GRAY}启动后台守护进程${PLAIN}
+   ${GREEN}7.${PLAIN} 停止服务      ${GRAY}停止后台守护进程${PLAIN}
+   ${GREEN}8.${PLAIN} 重启服务      ${GRAY}重载配置并重启进程${PLAIN}
+${GRAY}${LINE}${PLAIN}
+  ${CYAN}[数据与维护]${PLAIN}
+   ${GREEN}9.${PLAIN} 备份管理      ${GRAY}备份、还原配置或清理归档${PLAIN}
+  ${RED}10.${PLAIN} 卸载清理      ${GRAY}移除服务、主程序及相关文件${PLAIN}
+${GRAY}${LINE}${PLAIN}
+   ${GREEN}0.${PLAIN} 退出脚本
+${GREEN}${SEP}${PLAIN}"
+    read -rp "请输入操作编号 [0-10]: " opt
     case "$opt" in
-        1) deploy ;;
-        2) upgrade_lossless ;;
-        3) rollback ;;
-        4) view_status ;;
-        5) backup_manage ;;
-        6) restart_cliproxy && (systemctl reload caddy 2>/dev/null || systemctl restart caddy 2>/dev/null || true) && echo -e "${GREEN}已完成重启${PLAIN}" ;;
-        7) systemctl stop cliproxy && echo -e "${YELLOW}后端服务已停止${PLAIN}" ;;
-        8) systemctl start cliproxy && echo -e "${GREEN}后端服务已启动${PLAIN}" ;;
-        9) journalctl -u cliproxy -f ;;
-        10) journalctl -u caddy -f ;;
-        11)
-            read -rp "确认彻底卸载 CLIProxyAPI？此操作不会删除已有的 auth 授权数据 [y/N]: " confirm
-            if [[ "$confirm" =~ ^[yY]$ ]]; then
-                systemctl disable --now cliproxy 2>/dev/null || true
-                rm -f "$SERVICE_PATH" "$BIN_PATH" "$CONFIG_PATH" "$VERSION_FILE"
-                systemctl daemon-reload
-                echo -e "${GREEN}程序已卸载。auth 授权数据保留在: ${AUTH_DIR}${PLAIN}"
-            fi
-            ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}请输入有效选项！${PLAIN}" ;;
+        1)  deploy ;;
+        2)  upgrade_lossless ;;
+        3)  rollback ;;
+        4)  view_status ;;
+        5)  view_logs ;;
+        6)  manage_service start ;;
+        7)  manage_service stop ;;
+        8)  manage_service restart ;;
+        9)  backup_manage ;;
+        10) uninstall_cliproxy ;;
+        0)  exit 0 ;;
+        *)  err "请输入有效的操作编号 [0-10]！" ;;
     esac
 done
