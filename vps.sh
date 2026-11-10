@@ -10,8 +10,7 @@
 # 全局变量仅保存检测结果或跨函数事务备份；cleanup_runtime 负责未提交事务回滚。
 #------------------------------------------------------------------------------
 
-RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"
-BLUE="\033[34m"; PURPLE="\033[35m"; CYAN="\033[36m"
+RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"; CYAN="\033[36m"
 GRAY="\033[90m"; BOLD="\033[1m"; RESET="\033[0m"
 
 INFO="${GREEN}[INFO]${RESET}"; WARN="${YELLOW}[WARN]${RESET}"; ERROR="${RED}[ERROR]${RESET}"
@@ -44,6 +43,19 @@ fi
 HOME=/root
 export HOME
 umask 077
+
+SCRIPT_SELF=""
+[ -n "${BASH_SOURCE[0]:-}" ] && SCRIPT_SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+[ -z "$SCRIPT_SELF" ] && SCRIPT_SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+SCRIPT_LINK="/usr/local/bin/vps"
+
+setup_shortcut() {
+    [ -z "$SCRIPT_SELF" ] && return 0
+    [ "$SCRIPT_SELF" = "$SCRIPT_LINK" ] && { chmod +x "$SCRIPT_LINK" 2>/dev/null || true; return 0; }
+    mkdir -p /usr/local/bin 2>/dev/null || true
+    ln -sf "$SCRIPT_SELF" "$SCRIPT_LINK" 2>/dev/null || true
+    chmod +x "$SCRIPT_LINK" 2>/dev/null || true
+}
 
 JAIL_CONF="/etc/fail2ban/jail.local"
 LOG_FILE="/var/log/fail2ban.log"
@@ -899,7 +911,7 @@ restart_f2b() {
         echo -e "${ERROR} Fail2Ban 服务重启命令失败。"
         return 1
     fi
-    for i in {1..5}; do
+    for _ in {1..5}; do
         if fail2ban-client ping >/dev/null 2>&1; then
             echo -e "${INFO} ${GREEN}成功！配置已加载。${RESET}"
             return 0
@@ -930,8 +942,16 @@ fmt_f2b_unit() {
     local val=$1 type=$2
     [ -z "$val" ] && { echo "未设置"; return; }
     if [[ "$val" =~ ^[0-9]+$ ]]; then
-        [ "$type" == "time" ] && echo "${val}秒" || { [ "$type" == "factor" ] && echo "${val}倍" || echo "$val"; }
-    else echo "$val"; fi
+        if [ "$type" = "time" ]; then
+            echo "${val}秒"
+        elif [ "$type" = "factor" ]; then
+            echo "${val}倍"
+        else
+            echo "$val"
+        fi
+    else
+        echo "$val"
+    fi
 }
 
 validate_time() { [[ "$1" =~ ^[1-9][0-9]*[smhdw]?$ ]]; }
@@ -993,7 +1013,7 @@ EOF2
 # 确保 dbfile 和 dbpurgeage 存在（递增功能必需数据库支持）
 migrate_f2b_increment() {
     [ -f "$JAIL_CONF" ] || return 0
-    [ -d "/var/lib/fail2ban" ] || { mkdir -p /var/lib/fail2ban && chmod 755 /var/lib/fail2ban 2>/dev/null || true; }
+    [ -d "/var/lib/fail2ban" ] || { mkdir -p /var/lib/fail2ban; chmod 755 /var/lib/fail2ban 2>/dev/null || true; }
 
     # 1. 移除 [sshd] 段内误放的递增参数
     local tmpf
@@ -1091,7 +1111,7 @@ check_f2b_install() {
 
         # 轮询确认服务真正就绪（首次启动可能稍慢）
         local f2b_up=0
-        for i in {1..5}; do
+        for _ in {1..5}; do
             if fail2ban-client ping >/dev/null 2>&1; then f2b_up=1; break; fi
             sleep 1
         done
@@ -1241,7 +1261,7 @@ check_f2b_install() {
             echo -e "${INFO} 检测到配置变更，正在启动 Fail2Ban..."
             svc_start fail2ban
             local f2b_up=0
-            for i in {1..5}; do
+            for _ in {1..5}; do
                 if fail2ban-client ping >/dev/null 2>&1; then f2b_up=1; break; fi
                 sleep 1
             done
@@ -1258,7 +1278,7 @@ check_f2b_install() {
             echo -e "${WARN} Fail2Ban 服务未运行，正在尝试启动..."
             svc_start fail2ban
             local f2b_up=0
-            for i in {1..5}; do
+            for _ in {1..5}; do
                 if fail2ban-client ping >/dev/null 2>&1; then f2b_up=1; break; fi
                 sleep 1
             done
@@ -1367,7 +1387,7 @@ toggle_f2b_service() {
         read -rp "是否启用并启动 Fail2Ban？(y/N，q=取消): " confirm
         if [[ "$confirm" =~ ^[Yy]$ ]]; then
             svc_enable fail2ban; svc_start fail2ban
-            for i in {1..5}; do
+            for _ in {1..5}; do
                 if fail2ban-client ping >/dev/null 2>&1; then echo -e "${INFO} ${GREEN}服务已成功启动。${RESET}"; sleep 1; return; fi; sleep 1
             done
             echo -e "${ERROR} 启动失败或超时。"
@@ -1389,8 +1409,11 @@ unban_f2b_ip() {
         transient_error "IP 或 CIDR 格式不正确。"
         return 1
     fi
-    fail2ban-client set "$TARGET_JAIL" unbanip "$target_ip"
-    [ $? -eq 0 ] && echo -e "${INFO} ${GREEN}解封成功: $target_ip${RESET}" || echo -e "${ERROR} 操作失败。"
+    if fail2ban-client set "$TARGET_JAIL" unbanip "$target_ip"; then
+        echo -e "${INFO} ${GREEN}解封成功: $target_ip${RESET}"
+    else
+        echo -e "${ERROR} 操作失败。"
+    fi
     sleep 1
 }
 
@@ -1473,9 +1496,9 @@ add_f2b_whitelist() {
 
 view_f2b_logs() {
     clear
-    echo -e "${CYAN}================================================${RESET}"
-    echo -e "${BOLD}${PURPLE}          Fail2Ban 审计日志 (最近 20 条)${RESET}"
-    echo -e "${CYAN}================================================${RESET}"
+    echo ""
+    echo -e "  ${BOLD}Fail2Ban 审计日志 (最近 20 条)${RESET}"
+    echo ""
     local out=""
     if [ "$INIT_SYS" = "systemd" ] && command -v journalctl &>/dev/null; then
         out=$(journalctl -u fail2ban --no-pager -n 200 2>/dev/null | grep -E '(Ban|Unban)' | tail -n 20)
@@ -1493,8 +1516,8 @@ view_f2b_logs() {
             print
         }'
     fi
-    echo -e "${CYAN}================================================${RESET}"
-    read -rp "按回车键返回..."
+    echo ""
+    read -rp "  按回车键返回..."
 }
 
 menu_f2b_exponential() {
@@ -1505,14 +1528,15 @@ menu_f2b_exponential() {
         fac=$(get_f2b_conf "bantime.factor")
         max=$(get_f2b_conf "bantime.maxtime")
         local S_INC; [ "$inc" == "true" ] && S_INC="${GREEN}启用${RESET}" || S_INC="${YELLOW}禁用${RESET}"
-        echo -e "${CYAN}================================================${RESET}"
-        echo -e "${BOLD}${PURPLE}        高级: 指数封禁设置 (针对 sshd)${RESET}"
-        echo -e "${CYAN}================================================${RESET}"
-        echo -e " 说明: 对重复犯错的恶意 IP，封禁时间按设定系数成倍递增"
-        echo -e "  ${GREEN}1.${RESET} 递增模式开关   [${S_INC}]"
-        echo -e "  ${GREEN}2.${RESET} 增长系数       [${YELLOW}$(fmt_f2b_unit "$fac" "factor")${RESET}]"
-        echo -e "  ${GREEN}3.${RESET} 封禁上限       [${YELLOW}$(fmt_f2b_unit "$max" "time")${RESET}]"
-        read_menu_choice "请选择 [1-3]（q=返回）：" '^(1|2|3|[qQ])$' || return
+        echo ""
+        echo -e "  ${BOLD}指数封禁设置 (针对 sshd)${RESET}"
+        echo -e "  ${GRAY}说明: 对重复犯错的恶意 IP，封禁时间按设定系数成倍递增${RESET}"
+        echo ""
+        echo -e "  ${CYAN}1${RESET} 递增模式开关   [${S_INC}]"
+        echo -e "  ${CYAN}2${RESET} 增长系数       [${YELLOW}$(fmt_f2b_unit "$fac" "factor")${RESET}]"
+        echo -e "  ${CYAN}3${RESET} 封禁上限       [${YELLOW}$(fmt_f2b_unit "$max" "time")${RESET}]"
+        echo ""
+        read_menu_choice "  › 请选择 [1-3]（q=返回）：" '^(1|2|3|[qQ])$' || return
         sc="$REPLY"
         is_q "$sc" && return
         case "$sc" in
@@ -1545,20 +1569,20 @@ manage_fail2ban_menu() {
     while true; do
         clear
         VAL_MAX=$(get_f2b_conf "maxretry"); VAL_BAN=$(get_f2b_conf "bantime"); VAL_FIND=$(get_f2b_conf "findtime")
-        echo -e "${CYAN}================================================${RESET}"
-        echo -e "${BOLD}${PURPLE}               Fail2Ban 防护管理${RESET}"
-        echo -e "${CYAN}================================================${RESET}"
-        echo -e "  服务状态: $(get_fail2ban_status)"
-        echo -e "  ${GREEN}1.${RESET} 最大重试次数 [${YELLOW}${VAL_MAX:-默认}${RESET}]"
-        echo -e "  ${GREEN}2.${RESET} 初始封禁时间 [${YELLOW}$(fmt_f2b_unit "${VAL_BAN:-默认}" "time")${RESET}]"
-        echo -e "  ${GREEN}3.${RESET} 检测窗口     [${YELLOW}$(fmt_f2b_unit "${VAL_FIND:-默认}" "time")${RESET}]"
-        echo -e "  ${GREEN}4.${RESET} 手动解封 IP"
-        echo -e "  ${GREEN}5.${RESET} 添加 IP 白名单"
-        echo -e "  ${GREEN}6.${RESET} 查看封禁日志 (最近20条)"
-        echo -e "  ${GREEN}7.${RESET} 指数递增封禁设置 ->"
-        echo -e "  ${GREEN}8.${RESET} 启用 / 停止 服务"
-        echo -e "  ${GREEN}9.${RESET} 卸载 Fail2Ban"
-        read_menu_choice "请选择 [1-9]（q=返回）：" '^([1-9]|[qQ])$' || return
+        echo ""
+        echo -e "  ${BOLD}Fail2Ban 防护管理${RESET}  $(get_fail2ban_status)"
+        echo ""
+        echo -e "  ${CYAN}1${RESET} 最大重试次数   [${YELLOW}${VAL_MAX:-默认}${RESET}]"
+        echo -e "  ${CYAN}2${RESET} 初始封禁时间   [${YELLOW}$(fmt_f2b_unit "${VAL_BAN:-默认}" "time")${RESET}]"
+        echo -e "  ${CYAN}3${RESET} 检测时间窗口   [${YELLOW}$(fmt_f2b_unit "${VAL_FIND:-默认}" "time")${RESET}]"
+        echo -e "  ${CYAN}4${RESET} 手动解封 IP"
+        echo -e "  ${CYAN}5${RESET} 添加 IP 白名单"
+        echo -e "  ${CYAN}6${RESET} 查看封禁日志"
+        echo -e "  ${CYAN}7${RESET} 指数递增封禁设置"
+        echo -e "  ${CYAN}8${RESET} 启用 / 停止 服务"
+        echo -e "  ${RED}9${RESET} 卸载 Fail2Ban"
+        echo ""
+        read_menu_choice "  › 请选择 [1-9]（q=返回）：" '^([1-9]|[qQ])$' || return
         choice="$REPLY"
         is_q "$choice" && return
         case "$choice" in
@@ -1594,29 +1618,29 @@ show_status() {
     local f2b_stat; f2b_stat=$(get_fail2ban_status)
     local key_count; key_count=$(count_authorized_keys)
 
-    echo -e "${CYAN}================================================${RESET}"
-    echo -e "${BOLD}${PURPLE}                SSH 安全配置工具${RESET}"
-    echo -e "${CYAN}================================================${RESET}"
-    echo -e " 系统架构 : ${GREEN}${OS_SHORT} ${OS_VER}${RESET}"
+    echo ""
+    echo -e "  ${BOLD}SSH 安全配置状态${RESET}"
+    echo ""
+    echo -e "  系统架构 : ${GREEN}${OS_SHORT} ${OS_VER}${RESET}"
     if [[ "${pubkey_auth,,}" == "yes" ]]; then
         if [ "$key_count" -gt 0 ]; then
-            echo -e " 密钥登录 : ${GREEN}已启用 (${key_count} 把公钥)${RESET}"
+            echo -e "  密钥登录 : ${GREEN}已启用 (${key_count} 把公钥)${RESET}"
         else
-            echo -e " 密钥登录 : ${YELLOW}已启用 (但无公钥，无法密钥登录)${RESET}"
+            echo -e "  密钥登录 : ${YELLOW}已启用 (但无公钥，无法密钥登录)${RESET}"
         fi
     else
-        echo -e " 密钥登录 : ${YELLOW}已禁用${RESET}"
+        echo -e "  密钥登录 : ${YELLOW}已禁用${RESET}"
     fi
     if [[ "${pwd_auth,,}" == "no" ]]; then
-        echo -e " 密码登录 : ${GREEN}已禁用 (PasswordAuthentication no)${RESET}"
+        echo -e "  密码登录 : ${GREEN}已禁用 (PasswordAuthentication no)${RESET}"
     elif [[ "${root_login,,}" =~ ^(no|prohibit-password|without-password)$ ]]; then
-        echo -e " 密码登录 : ${YELLOW}已启用 (但 PermitRootLogin=${root_login}，root 无法密码登录)${RESET}"
+        echo -e "  密码登录 : ${YELLOW}已启用 (但 PermitRootLogin=${root_login}，root 无法密码登录)${RESET}"
     else
-        echo -e " 密码登录 : ${YELLOW}已启用 (推荐配置密钥后禁用)${RESET}"
+        echo -e "  密码登录 : ${YELLOW}已启用 (推荐配置密钥后禁用)${RESET}"
     fi
-    echo -e " Fail2Ban : ${f2b_stat}"
-    echo -e " SSH 端口 : ${CYAN}${port}${RESET}"
-    echo -e "${CYAN}================================================${RESET}"
+    echo -e "  Fail2Ban : ${f2b_stat}"
+    echo -e "  SSH 端口 : ${CYAN}${port}${RESET}"
+    echo ""
 }
 
 # ============ 密钥生成 ============
@@ -1810,17 +1834,16 @@ install_key_menu() {
             pubkey_label="[${YELLOW}已禁用${RESET}]"
         fi
 
-        echo -e "${CYAN}================================================${RESET}"
-        echo -e "${BOLD}${PURPLE}                SSH 密钥登录管理${RESET}"
-        echo -e "${CYAN}================================================${RESET}"
-        echo -e "${BOLD}选择密钥来源：${RESET}"
-        echo -e "  ${GREEN}1.${RESET} GitHub 公钥"
-        echo -e "  ${GREEN}2.${RESET} 本地生成 ED25519 密钥"
-        echo -e "  ${GREEN}3.${RESET} HTTPS URL 公钥"
-        echo -e "  ${GREEN}4.${RESET} 管理公钥${key_count_label}"
-        echo -e "  ${GREEN}5.${RESET} 密钥登录开关 ${pubkey_label}"
-        echo -e "${CYAN}================================================${RESET}"
-        read_menu_choice "请输入选项 [1-5]（q=返回）：" '^([1-5]|[qQ])$' || return
+        echo ""
+        echo -e "  ${BOLD}SSH 密钥登录管理${RESET}"
+        echo ""
+        echo -e "  ${CYAN}1${RESET} GitHub 公钥导入"
+        echo -e "  ${CYAN}2${RESET} 本地生成 ED25519 密钥"
+        echo -e "  ${CYAN}3${RESET} HTTPS URL 公钥导入"
+        echo -e "  ${CYAN}4${RESET} 管理已存公钥${key_count_label}"
+        echo -e "  ${CYAN}5${RESET} 密钥登录开关 ${pubkey_label}"
+        echo ""
+        read_menu_choice "  › 请输入选项 [1-5]（q=返回）：" '^([1-5]|[qQ])$' || return
         key_opt="$REPLY"
         is_q "$key_opt" && return
 
@@ -1961,9 +1984,9 @@ manage_keys_menu() {
 
     while true; do
         clear
-        echo -e "${CYAN}================================================${RESET}"
-        echo -e "${BOLD}${PURPLE}                SSH 已存公钥管理${RESET}"
-        echo -e "${CYAN}================================================${RESET}"
+        echo ""
+        echo -e "  ${BOLD}SSH 已存公钥管理${RESET}"
+        echo ""
 
         local key_lines=()
         local key_contents=()
@@ -2010,17 +2033,15 @@ manage_keys_menu() {
                 print "未知"
             }')
 
-            printf " ${GREEN}[%2d]${RESET} | ${YELLOW}%19s${RESET} | ${CYAN}%-8s${RESET} | ${PURPLE}%-16s${RESET}\n" "$idx" "$add_time" "$key_type" "$key_tag"
+            printf "  ${CYAN}[%2d]${RESET} %19s  %-8s  %s\n" "$idx" "$add_time" "$key_type" "$key_tag"
             ((idx++))
         done
 
-        echo -e "${CYAN}================================================${RESET}"
-        echo -e " 输入 ${RED}[序号]${RESET} : 删除指定公钥"
-        echo -e " 输入 ${RED}[all]${RESET}  : 清空全部公钥"
-        echo -e " 输入 ${GREEN}[q]${RESET}    : 返回上级菜单"
-        echo -e "${CYAN}================================================${RESET}"
+        echo ""
+        echo -e "  ${GRAY}操作指令: [序号] 删除公钥 · [all] 清空公钥 · [q] 返回上级${RESET}"
+        echo ""
         while true; do
-            read -rp "请输入操作指令（序号/all/q）：" key_action || return
+            read -rp "  › 请输入指令（序号/all/q）：" key_action || return
             if is_q "$key_action" || [ "$key_action" = "all" ] || \
                { [[ "$key_action" =~ ^[0-9]+$ ]] && [ "$key_action" -ge 1 ] && [ "$key_action" -le "${#key_contents[@]}" ]; }; then
                 break
@@ -2411,7 +2432,11 @@ restore_sysctl_conf() {
     else
         local tmp
         tmp=$(mktemp /etc/sysctl.conf.restore.XXXXXX) || return 1
-        cp -a "$SYSCTL_BACKUP_FILE" "$tmp" && mv -f "$tmp" /etc/sysctl.conf || { rm -f "$tmp"; return 1; }
+        if cp -a "$SYSCTL_BACKUP_FILE" "$tmp" && mv -f "$tmp" /etc/sysctl.conf; then
+            :
+        else
+            rm -f "$tmp"; return 1
+        fi
     fi
     rm -f "$SYSCTL_BACKUP_FILE"
     SYSCTL_BACKUP_FILE=""; SYSCTL_BACKUP_MISSING=0
@@ -2426,7 +2451,9 @@ backup_zram_config() {
     local file="$1"
     [ -n "$ZRAM_CONFIG_BACKUP" ] && return 0
     ZRAM_CONFIG_FILE="$file"
-    ZRAM_CONFIG_BACKUP=$(mktemp /run/vps-zram-config.XXXXXX) || return 1
+    local run_dir="/run"
+    [ -d "$run_dir" ] || run_dir="/tmp"
+    ZRAM_CONFIG_BACKUP=$(mktemp "${run_dir}/vps-zram-config.XXXXXX") || return 1
     ZRAM_CONFIG_MISSING=0
     if [ -f "$file" ]; then
         cp -a "$file" "$ZRAM_CONFIG_BACKUP" || { rm -f "$ZRAM_CONFIG_BACKUP"; ZRAM_CONFIG_BACKUP=""; return 1; }
@@ -2442,7 +2469,11 @@ restore_zram_config() {
     else
         local tmp
         tmp=$(mktemp "${ZRAM_CONFIG_FILE}.restore.XXXXXX") || return 1
-        cp -a "$ZRAM_CONFIG_BACKUP" "$tmp" && mv -f "$tmp" "$ZRAM_CONFIG_FILE" || { rm -f "$tmp"; return 1; }
+        if cp -a "$ZRAM_CONFIG_BACKUP" "$tmp" && mv -f "$tmp" "$ZRAM_CONFIG_FILE"; then
+            :
+        else
+            rm -f "$tmp"; return 1
+        fi
     fi
     rm -f "$ZRAM_CONFIG_BACKUP"
     ZRAM_CONFIG_FILE=""; ZRAM_CONFIG_BACKUP=""; ZRAM_CONFIG_MISSING=0
@@ -2590,12 +2621,15 @@ show_vps_status() {
         docker_status="${YELLOW}未安装${RESET}"
     fi
 
-    echo -e "${BOLD}${CYAN}系统优化状态${RESET}"
-    echo -e "系统环境 : ${GREEN}${OS_SHORT} ${OS_VER}${RESET}"
-    echo -e "网络算法 : ${bbr_status}"
-    echo -e "zRAM     : ${zram_status}"
-    echo -e "Docker   : ${docker_status}"
-    echo -e "系统时区 : ${tz}"
+    echo ""
+    echo -e "  ${BOLD}系统综合状态${RESET}"
+    echo ""
+    echo -e "  系统环境 : ${GREEN}${OS_SHORT} ${OS_VER}${RESET}"
+    echo -e "  网络算法 : ${bbr_status}"
+    echo -e "  zRAM     : ${zram_status}"
+    echo -e "  Docker   : ${docker_status}"
+    echo -e "  系统时区 : ${tz}"
+    echo ""
 }
 
 manage_bbr() {
@@ -2997,17 +3031,17 @@ manage_timezone() {
 manage_system_optimization() {
     while true; do
         clear
-        echo -e "${CYAN}================================================${RESET}"
-        echo -e "${BOLD}${PURPLE}                  系统优化管理${RESET}"
-        echo -e "${CYAN}================================================${RESET}"
+        echo ""
+        echo -e "  ${BOLD}系统优化管理${RESET}"
+        echo ""
         show_vps_status
-        echo -e "  ${GREEN}1.${RESET} BBR + FQ"
-        echo -e "  ${GREEN}2.${RESET} zRAM"
-        echo -e "  ${GREEN}3.${RESET} Docker"
-        echo -e "  ${GREEN}4.${RESET} 时区"
-        echo -e "  ${GREEN}5.${RESET} 系统清理"
-        echo -e "${CYAN}================================================${RESET}"
-        read_menu_choice "请选择 [1-5]（q=返回）：" '^([1-5]|[qQ])$' || return
+        echo -e "  ${CYAN}1${RESET} BBR + FQ"
+        echo -e "  ${CYAN}2${RESET} zRAM 内存压缩"
+        echo -e "  ${CYAN}3${RESET} Docker 容器管理"
+        echo -e "  ${CYAN}4${RESET} 系统时区设置"
+        echo -e "  ${CYAN}5${RESET} 系统深度清理"
+        echo ""
+        read_menu_choice "  › 请选择 [1-5]（q=返回）：" '^([1-5]|[qQ])$' || return
         choice="$REPLY"
         is_q "$choice" && return
         case "$choice" in
@@ -3016,12 +3050,12 @@ manage_system_optimization() {
             3) manage_docker ;;
             4) manage_timezone ;;
             5)
-                echo -e "${YELLOW}${BOLD}系统清理将执行 apt autoremove、删除临时文件、清理日志并删除未使用的 Docker 镜像。${RESET}"
-                read -rp "确认继续？(y/N，q=取消): " cleanup_confirm
+                echo -e "\n  ${YELLOW}${BOLD}系统清理将执行 apt autoremove、删除临时文件、清理日志并删除未使用的 Docker 镜像。${RESET}"
+                read -rp "  › 确认继续？(y/N，q=取消): " cleanup_confirm
                 if [[ "$cleanup_confirm" =~ ^[Yy]$ ]]; then
-                    run_system_cleanup || echo -e "${ERROR} 系统清理未完整成功。"
+                    run_system_cleanup || echo -e "  ${ERROR} 系统清理未完整成功。"
                 else
-                    echo -e "${INFO} 已取消系统清理。"
+                    echo -e "  ${INFO} 已取消系统清理。"
                 fi
                 sleep 1
                 ;;
@@ -3032,6 +3066,43 @@ manage_system_optimization() {
 show_combined_status() {
     show_status
     show_vps_status
+}
+
+vps_header() {
+    clear 2>/dev/null || true
+    echo ""
+    local port pwd_auth pubkey_auth root_login
+    port=$(read_sshd_config_val "Port" 2>/dev/null || echo "22")
+    pwd_auth=$(read_sshd_config_val "PasswordAuthentication" 2>/dev/null || echo "yes")
+    pubkey_auth=$(read_sshd_config_val "PubkeyAuthentication" 2>/dev/null || echo "yes")
+    root_login=$(read_sshd_config_val "PermitRootLogin" 2>/dev/null || true)
+    local key_count; key_count=$(count_authorized_keys 2>/dev/null || echo 0)
+
+    local f2b_status="${GRAY}关${RESET}"
+    if get_fail2ban_status 2>/dev/null | grep -q "运行中"; then
+        f2b_status="${GREEN}开${RESET}"
+    fi
+
+    local bbr_status="${GRAY}关${RESET}"
+    if [ "$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)" = "bbr" ]; then
+        bbr_status="${GREEN}开${RESET}"
+    fi
+
+    local pwd_str="${YELLOW}密码 开${RESET}"
+    if [[ "${pwd_auth,,}" == "no" ]]; then
+        pwd_str="${GREEN}密码 关${RESET}"
+    elif [[ "${root_login,,}" =~ ^(no|prohibit-password|without-password)$ ]]; then
+        pwd_str="${YELLOW}密码 免密root${RESET}"
+    fi
+
+    local key_str="${GRAY}密钥 关${RESET}"
+    if [[ "${pubkey_auth,,}" == "yes" ]]; then
+        key_str="${GREEN}密钥 开(${key_count})${RESET}"
+    fi
+
+    echo -e "  ${BOLD}VPS TOOL${RESET}  ${GREEN}● 正常${RESET}  ${GRAY}(快捷命令: ${CYAN}vps${GRAY})${RESET}"
+    echo -e "  ${GRAY}${OS_SHORT:-Linux} ${OS_VER} · SSH: ${port} (${key_str} · ${pwd_str}${GRAY}) · Fail2Ban ${f2b_status}${GRAY} · BBR ${bbr_status}${RESET}"
+    echo ""
 }
 
 #------------------------------------------------------------------------------
@@ -3060,28 +3131,38 @@ case "$OS_ID" in
 esac
 
 check_dependencies || exit 1
+setup_shortcut
+
 while true; do
-    clear
-    echo -e "${CYAN}================================================${RESET}"
-    echo -e "${BOLD}${PURPLE}                VPS 综合管理工具${RESET}"
-    echo -e "${CYAN}================================================${RESET}"
-    echo -e "系统环境：${GREEN}${OS_SHORT} ${OS_VER}${RESET}"
-    echo -e "  ${GREEN}1.${RESET} 系统优化"
-    echo -e "  ${GREEN}2.${RESET} SSH 密钥"
-    echo -e "  ${GREEN}3.${RESET} 密码登录"
-    echo -e "  ${GREEN}4.${RESET} Fail2Ban"
-    echo -e "  ${GREEN}5.${RESET} SSH 端口"
-    echo -e "  ${GREEN}6.${RESET} 系统状态"
-    echo -e "${CYAN}================================================${RESET}"
-    read_menu_choice "请选择 [1-6]（q=退出）：" '^([1-6]|[qQ])$' || exit 0
+    vps_header
+    echo -e "  ${GRAY}安全${RESET}    ${CYAN}1${RESET} SSH 密钥    ${CYAN}2${RESET} 密码登录     ${CYAN}3${RESET} SSH 端口     ${CYAN}4${RESET} Fail2Ban"
+    echo -e "  ${GRAY}优化${RESET}    ${CYAN}5${RESET} BBR 加速    ${CYAN}6${RESET} zRAM 压缩    ${CYAN}7${RESET} Docker 管理  ${CYAN}8${RESET} 系统清理"
+    echo -e "  ${GRAY}系统${RESET}    ${CYAN}9${RESET} 时区设置   ${CYAN}10${RESET} 综合状态"
+    echo -e "  ${GRAY}其他${RESET}    ${CYAN}0${RESET} 退出工具"
+    echo ""
+    read_menu_choice "  › 请选择 [1-10]（q/0=退出）：" '^([0-9]|10|[qQ])$' || exit 0
     choice="$REPLY"
-        is_q "$choice" && { echo -e "\n感谢使用！"; exit 0; }
+    if is_q "$choice" || [ "$choice" = "0" ]; then
+        echo -e "\n  感谢使用！\n"
+        exit 0
+    fi
     case "$choice" in
-        1) manage_system_optimization ;;
-        2) install_key_menu ;;
-        3) toggle_password_login ;;
+        1) install_key_menu ;;
+        2) toggle_password_login ;;
+        3) change_ssh_port ;;
         4) manage_fail2ban_menu ;;
-        5) change_ssh_port ;;
-        6) clear; show_combined_status; read -rp "按回车键返回主菜单..." ;;
+        5) manage_bbr ;;
+        6) manage_zram ;;
+        7) manage_docker ;;
+        8)
+            echo -e "\n  ${YELLOW}${BOLD}系统清理将执行 apt autoremove、删除临时文件、清理日志并删除未使用的 Docker 镜像。${RESET}"
+            read -rp "  › 确认继续？(y/N): " cleanup_confirm
+            if [[ "$cleanup_confirm" =~ ^[Yy]$ ]]; then
+                run_system_cleanup || echo -e "  ${ERROR} 系统清理未完整成功。"
+            fi
+            sleep 1
+            ;;
+        9) manage_timezone ;;
+        10) clear; show_combined_status; read -rp "  按回车键返回主菜单..." ;;
     esac
 done
