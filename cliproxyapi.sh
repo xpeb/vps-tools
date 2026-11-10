@@ -66,7 +66,7 @@ prompt_read() {
     local prompt_str="$1" var_name="$2"
     if [[ -t 0 ]]; then
         read -rp "$prompt_str" "${var_name?}"
-    elif [[ -r /dev/tty ]]; then
+    elif [[ -e /dev/tty ]]; then
         read -rp "$prompt_str" "${var_name?}" < /dev/tty
     else
         return 1
@@ -157,22 +157,25 @@ sanitize_domain() {
     fi
 }
 
+# 兼容新旧两种 config.yaml 结构（顶层 host/port 或 server 块下 host/port）
 enforce_local_binding() {
     [[ -f "$CONFIG_PATH" ]] || return 0
     local tmp="${CONFIG_PATH}.tmp"
     if awk -v h="$LOCKED_HOST" -v p="$LOCKED_PORT" '
-        BEGIN { s=0; found_srv=0 }
+        BEGIN { s=0; has_srv=0; top_h=0; top_p=0 }
         /^server:[[:space:]]*(#.*)?$/ {
             print "server:"
             print "  host: \"" h "\""
             print "  port: " p
-            s=1; found_srv=1; next
+            s=1; has_srv=1; next
         }
         /^[^[:space:]#]/ { s=0 }
-        s && /^  (host|port):[[:space:]]*/ { next }
+        s && /^[[:space:]]+(host|port):[[:space:]]*/ { next }
+        !s && /^host:[[:space:]]*/ { print "host: \"" h "\""; top_h=1; next }
+        !s && /^port:[[:space:]]*/ { print "port: " p; top_p=1; next }
         { print }
         END {
-            if (!found_srv) {
+            if (!has_srv && !top_h && !top_p) {
                 print "\nserver:"
                 print "  host: \"" h "\""
                 print "  port: " p
@@ -189,6 +192,7 @@ write_config() {
     local raw_key="$1"
     local safe_key="${raw_key//\\/\\\\}"
     safe_key="${safe_key//\"/\\\"}"
+    safe_key="${safe_key//&/\\&}"
     safe_key="${safe_key//|/\\|}"
     (umask 077 && cat << 'YAML' | sed -e "s|__HOST__|${LOCKED_HOST}|g" -e "s|__PORT__|${LOCKED_PORT}|g" -e "s|__KEY__|${safe_key}|g" > "$CONFIG_PATH"
 config-version: 8
@@ -224,7 +228,7 @@ wait_for_service() {
     while (( retries > 0 )); do
         if svc_ctl status; then
             if (echo >/dev/tcp/"$LOCKED_HOST"/"$LOCKED_PORT") 2>/dev/null || \
-               curl -fsS --max-time 1 "http://${LISTEN_ADDR}/" &>/dev/null; then
+               curl -sS --max-time 1 "http://${LISTEN_ADDR}/" >/dev/null 2>&1; then
                 return 0
             fi
         fi
@@ -282,8 +286,15 @@ manage_service() {
 
 # --- 2. 版本与二进制管理 ---
 parse_binary_version() {
-    local target="${1:-$BIN_PATH}"
-    [[ -x "$target" ]] && "$target" --help 2>&1 | awk -F'CLIProxyAPI Version: ' '/CLIProxyAPI Version:/ {sub(/,.*/, "", $2); gsub(/[v \r\n]/, "", $2); print $2; exit}'
+    local target="${1:-$BIN_PATH}" out="" ver=""
+    [[ -x "$target" ]] || return 0
+    out=$("$target" --version 2>&1 || true)
+    [[ "$out" =~ ([0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?) ]] && ver="${BASH_REMATCH[1]}"
+    if [[ -z "$ver" ]]; then
+        out=$("$target" --help 2>&1 || true)
+        [[ "$out" =~ ([0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?) ]] && ver="${BASH_REMATCH[1]}"
+    fi
+    [[ -n "$ver" ]] && echo "$ver"
 }
 
 get_local_version() {
@@ -295,10 +306,10 @@ get_local_version() {
 fmt_ver() { [[ "$1" =~ ^(未安装|未知)$ ]] && echo -e "${C_GRAY}$1${C_RESET}" || echo -e "${C_CYAN}v$1${C_RESET}"; }
 
 fetch_release_info() {
-    local arch variant=""
+    local arch_primary arch_alt variant="" api_json=""
     case "$(uname -m)" in
-        x86_64|amd64)  arch="amd64" ;;
-        aarch64|arm64) arch="aarch64" ;;
+        x86_64|amd64)  arch_primary="amd64"; arch_alt="x86_64" ;;
+        aarch64|arm64) arch_primary="arm64"; arch_alt="aarch64" ;;
         *) err "不支持的架构: $(uname -m)"; return 1 ;;
     esac
     [[ "$OS_ID" == "alpine" ]] && variant="_no-plugin"
@@ -307,44 +318,102 @@ fetch_release_info() {
     local api_url="https://api.github.com/repos/${OFFICIAL_REPO}/releases/latest"
     [ -n "$GH_PROXY" ] && { rel_url="${GH_PROXY}${rel_url}"; api_url="${GH_PROXY}${api_url}"; }
 
-    LATEST_TAG=$(curl -fsSLI -o /dev/null -w '%{url_effective}' --max-time 10 "$rel_url" 2>/dev/null \
-        | awk -F'/tag/' '/\/tag\// {gsub(/[\r\n?].*/, "", $2); print $2; exit}')
-    [[ -z "$LATEST_TAG" ]] && LATEST_TAG=$(curl -sI --max-time 10 "$rel_url" 2>/dev/null \
-        | awk -F'/tag/' 'tolower($0) ~ /^location:.*\/tag\// {gsub(/[\r\n ]/, "", $2); print $2; exit}')
-    [[ -z "$LATEST_TAG" ]] && LATEST_TAG=$(curl -fsSL --max-time 10 "$api_url" 2>/dev/null \
-        | grep -oE '"tag_name":[[:space:]]*"[^"]+"' | head -n 1 | cut -d'"' -f4)
-    [[ -n "$LATEST_TAG" ]] || { err "无法获取最新版本信息，请检查网络！"; return 1; }
+    LATEST_TAG=""
+    DOWNLOAD_URL=""
 
+    # 1. 优先尝试从 GitHub API 获取精确的 tag_name 与 browser_download_url
+    api_json=$(curl -fsSL --max-time 10 "$api_url" 2>/dev/null || true)
+    if [[ -n "$api_json" ]]; then
+        LATEST_TAG=$(echo "$api_json" | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' | head -n 1 | cut -d'"' -f4)
+        local dl_urls
+        dl_urls=$(echo "$api_json" | grep -oE '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]+"' | cut -d'"' -f4)
+        if [[ -n "$dl_urls" ]]; then
+            if [[ -n "$variant" ]]; then
+                DOWNLOAD_URL=$(echo "$dl_urls" | grep -i "linux" | grep -E "(${arch_primary}|${arch_alt})" | grep -F "$variant" | grep -E '\.(tar\.gz|tgz)$' | head -n 1)
+            fi
+            if [[ -z "$DOWNLOAD_URL" ]]; then
+                DOWNLOAD_URL=$(echo "$dl_urls" | grep -i "linux" | grep -E "(${arch_primary}|${arch_alt})" | grep -v "no-plugin" | grep -E '\.(tar\.gz|tgz)$' | head -n 1)
+            fi
+            if [[ -z "$DOWNLOAD_URL" ]]; then
+                DOWNLOAD_URL=$(echo "$dl_urls" | grep -i "linux" | grep -E "(${arch_primary}|${arch_alt})" | grep -E '\.(tar\.gz|tgz)$' | head -n 1)
+            fi
+            [[ -n "$DOWNLOAD_URL" && -n "$GH_PROXY" && "$DOWNLOAD_URL" != "${GH_PROXY}"* ]] && DOWNLOAD_URL="${GH_PROXY}${DOWNLOAD_URL}"
+        fi
+    fi
+
+    # 2. 备选：通过 302 Location 或重定向 URL 提取 Tag（不使用 set -o pipefail 阻断）
+    if [[ -z "$LATEST_TAG" ]]; then
+        local hdr
+        hdr=$(curl -sI --max-time 10 "$rel_url" 2>/dev/null || true)
+        LATEST_TAG=$(echo "$hdr" | awk -F'/tag/' 'tolower($0) ~ /^location:.*\/tag\// {gsub(/[\r\n?[:space:]]/, "", $2); print $2; exit}')
+    fi
+    if [[ -z "$LATEST_TAG" ]]; then
+        local eff_url
+        eff_url=$(curl -sSL -o /dev/null -w '%{url_effective}' --max-time 10 "$rel_url" 2>/dev/null || true)
+        LATEST_TAG=$(echo "$eff_url" | awk -F'/tag/' '/\/tag\// {gsub(/[\r\n?[:space:]].*/, "", $2); print $2; exit}')
+    fi
+
+    [[ -n "$LATEST_TAG" ]] || { err "无法获取最新版本信息，请检查网络或配置 GH_PROXY！"; return 1; }
     LATEST_VER="${LATEST_TAG#v}"
-    DOWNLOAD_URL="https://github.com/${OFFICIAL_REPO}/releases/download/${LATEST_TAG}/CLIProxyAPI_${LATEST_VER}_linux_${arch}${variant}.tar.gz"
-    [ -n "$GH_PROXY" ] && DOWNLOAD_URL="${GH_PROXY}${DOWNLOAD_URL}"
+
+    # 3. 备选：构造候选下载链接列表（兼容 arm64 / aarch64 及 _no-plugin 回退）
+    CANDIDATE_URLS=()
+    if [[ -n "$DOWNLOAD_URL" ]]; then
+        CANDIDATE_URLS+=("$DOWNLOAD_URL")
+    fi
+    local base_dl="https://github.com/${OFFICIAL_REPO}/releases/download/${LATEST_TAG}"
+    [ -n "$GH_PROXY" ] && base_dl="${GH_PROXY}${base_dl}"
+
+    local a
+    for a in "$arch_primary" "$arch_alt"; do
+        if [[ -n "$variant" ]]; then
+            CANDIDATE_URLS+=("${base_dl}/CLIProxyAPI_${LATEST_VER}_linux_${a}${variant}.tar.gz")
+        fi
+        CANDIDATE_URLS+=("${base_dl}/CLIProxyAPI_${LATEST_VER}_linux_${a}.tar.gz")
+    done
+    DOWNLOAD_URL="${CANDIDATE_URLS[0]}"
 }
 
 install_release_binary() {
-    local found test_out example_cfg
+    local found="" test_out="" example_cfg="" url dl_ok=0
     cleanup_tmp
     TMP_EXTRACT_DIR=$(mktemp -d)
     mkdir -p "$WORK_DIR" && chmod 700 "$WORK_DIR"
 
     info "正在下载官方程序包 (v${LATEST_VER})..."
-    if ! curl -fsSL -o "${TMP_EXTRACT_DIR}/pkg.tar.gz" "$DOWNLOAD_URL"; then
-        err "下载失败！"; cleanup_tmp; return 1
-    fi
-    if ! tar -zxf "${TMP_EXTRACT_DIR}/pkg.tar.gz" -C "$TMP_EXTRACT_DIR" 2>/dev/null; then
-        err "解压失败！"; cleanup_tmp; return 1
+    for url in "${CANDIDATE_URLS[@]}"; do
+        if curl -fsSL --connect-timeout 10 --max-time 180 -o "${TMP_EXTRACT_DIR}/pkg.tar.gz" "$url" 2>/dev/null; then
+            if tar -zxf "${TMP_EXTRACT_DIR}/pkg.tar.gz" -C "$TMP_EXTRACT_DIR" 2>/dev/null; then
+                dl_ok=1
+                break
+            fi
+        fi
+        rm -f "${TMP_EXTRACT_DIR}/pkg.tar.gz"
+    done
+
+    if [[ "$dl_ok" -ne 1 ]]; then
+        err "程序包下载或解压失败，请检查网络连接！"
+        cleanup_tmp
+        return 1
     fi
 
-    found=$(find "$TMP_EXTRACT_DIR" -type f \( -name "cli-proxy-api" -o -name "cliproxyapi" -o -name "CLIProxyAPI" \) | head -n 1)
+    found=$(find "$TMP_EXTRACT_DIR" -type f \( -iname "cli-proxy-api*" -o -iname "cliproxyapi*" \) ! -name "*.yaml" ! -name "*.yml" ! -name "*.md" ! -name "*.txt" ! -name "*.tar.gz" ! -name "*.sh" | head -n 1)
     if [[ -n "$found" ]]; then
         chmod +x "$found"
     else
-        err "未找到可执行主程序！"; cleanup_tmp; return 1
+        err "压缩包内未找到可执行主程序！"; cleanup_tmp; return 1
     fi
 
-    if ! test_out=$("$found" --help 2>&1); then
-        err "兼容性预检未通过：\n${test_out}"; cleanup_tmp; return 1
+    if ! test_out=$("$found" --help 2>&1) && ! test_out=$("$found" --version 2>&1); then
+        err "二进制兼容性预检未通过：\n${test_out}"; cleanup_tmp; return 1
     fi
-    install -m 755 "$found" "$BIN_PATH"
+
+    # 极其关键：先写入 .new 临时文件再 mv 原子替换，避免进程运行中直接覆盖引发 Text file busy
+    rm -f "${BIN_PATH}.new"
+    if ! (install -m 755 "$found" "${BIN_PATH}.new" && mv -f "${BIN_PATH}.new" "$BIN_PATH"); then
+        err "替换主程序文件失败！"; cleanup_tmp; return 1
+    fi
+
     example_cfg=$(find "$TMP_EXTRACT_DIR" -type f -name "config.example.yaml" | head -n 1)
     if [[ -n "$example_cfg" ]]; then
         install -m 600 "$example_cfg" "${WORK_DIR}/config.example.yaml" 2>/dev/null || true
@@ -406,7 +475,7 @@ deploy() {
     old_domain=$(get_domain)
 
     info "安全策略: 固定监听本地回环 ${C_YELLOW}http://${LISTEN_ADDR}${C_RESET} (禁止外部直连)"
-    default_key=${old_key:-$(tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c 24 || true)}
+    default_key=${old_key:-$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c 24 || true)}
     [[ -z "$default_key" ]] && default_key="cpa_$(date +%s)_secret"
 
     while true; do
@@ -557,7 +626,7 @@ upgrade_lossless() {
     if ! restart_cliproxy; then
         err "新版本启动异常，正在自动回滚..."
         if [[ -n "$LAST_BIN_BACKUP" && -f "$LAST_BIN_BACKUP" ]]; then
-            install -m 755 "$LAST_BIN_BACKUP" "$BIN_PATH"
+            install -m 755 "$LAST_BIN_BACKUP" "${BIN_PATH}.new" && mv -f "${BIN_PATH}.new" "$BIN_PATH"
         fi
         if restart_cliproxy; then
             ok "已回滚至旧版本 ($(fmt_ver "$(get_local_version)"))"
@@ -593,7 +662,7 @@ rollback() {
         err "编号无效！"; pause; return 1
     fi
 
-    install -m 755 "${list[$((choice-1))]}" "$BIN_PATH"
+    install -m 755 "${list[$((choice-1))]}" "${BIN_PATH}.new" && mv -f "${BIN_PATH}.new" "$BIN_PATH"
     if restart_cliproxy; then
         ok "已成功回滚至 $(fmt_ver "$(get_local_version)")！"
     else
@@ -722,7 +791,7 @@ uninstall_cliproxy() {
         systemctl disable cliproxy >/dev/null 2>&1 || true
         rm -f "$SERVICE_PATH" && systemctl daemon-reload
     fi
-    rm -f "$BIN_PATH" "$CONFIG_PATH" "$DOMAIN_FILE" "${WORK_DIR}/config.example.yaml" "$SCRIPT_LINK"
+    rm -f "$BIN_PATH" "${BIN_PATH}.new" "$CONFIG_PATH" "$DOMAIN_FILE" "${WORK_DIR}/config.example.yaml" "$SCRIPT_LINK"
     rm -rf "$BACKUP_DIR"
 
     if [[ -d "$AUTH_DIR" ]] && [[ -n "$(ls -A "$AUTH_DIR" 2>/dev/null)" ]]; then
