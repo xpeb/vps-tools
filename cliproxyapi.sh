@@ -602,7 +602,7 @@ while true; do
 
     echo -e "
 ${RULE}
-  ${C_BOLD}${C_CYAN}CLIProxyAPI 运维管理中心${C_RESET}                ${C_GRAY}[本地反代安全模式]${C_RESET}
+  ${C_BOLD}${C_CYAN}CLIProxyAPI 运维管理中心${C_RESET}             ${C_GRAY}[本地反代安全模式]${C_RESET}
 ${LINE}
   状态: $(fmt_status)    版本: $(fmt_ver "$(get_local_version)")
   监听: ${C_YELLOW}${LISTEN_ADDR}${C_RESET}  域名: ${dom_badge}
