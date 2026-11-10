@@ -1673,14 +1673,15 @@ main() {
     setup_shortcut
     get_public_ip
 
-    local choice
+    local choice core_act
     while true; do
         header
 
+        is_installed && core_act="更新核心" || core_act="安装核心"
         echo -e "  ${C_GRAY}节点${C_RESET}    ${C_CYAN}1${C_RESET} 节点列表    ${C_CYAN}2${C_RESET} 添加节点    ${C_CYAN}3${C_RESET} 修改节点    ${C_CYAN}4${C_RESET} 删除节点"
         echo -e "  ${C_GRAY}服务${C_RESET}    ${C_CYAN}5${C_RESET} 重启服务    ${C_CYAN}6${C_RESET} 启动服务    ${C_CYAN}7${C_RESET} 停止服务    ${C_CYAN}8${C_RESET} 实时日志"
-        echo -e "  ${C_GRAY}系统${C_RESET}    ${C_CYAN}9${C_RESET} 安装更新   ${C_CYAN}10${C_RESET} 开机自启   ${C_CYAN}11${C_RESET} BBR 算法   ${C_CYAN}12${C_RESET} 备份迁移"
-        echo -e "  ${C_GRAY}其他${C_RESET}   ${C_RED}13${C_RESET} 卸载核心    ${C_GRAY}0${C_RESET} 退出面板"
+        echo -e "  ${C_GRAY}系统${C_RESET}    ${C_CYAN}9${C_RESET} ${core_act}   ${C_CYAN}10${C_RESET} 开机自启   ${C_CYAN}11${C_RESET} BBR 算法   ${C_CYAN}12${C_RESET} 备份迁移"
+        echo -e "  ${C_GRAY}危险${C_RESET}   ${C_RED}13${C_RESET} 卸载核心"
         echo ""
 
         read -rp "  › 请选择 [1-13, 回车退出]: " choice || exit 0
