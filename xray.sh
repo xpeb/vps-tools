@@ -132,16 +132,61 @@ get_core_version() {
     [ -n "$XRAY_VER" ] && printf 'v%s' "${XRAY_VER#v}"
 }
 
+get_cached_latest_version() {
+    local cache_file="/tmp/.xray_latest_ver"
+    [ -f "$cache_file" ] || return 1
+    local tag
+    tag=$(cat "$cache_file" 2>/dev/null || true)
+    [[ "$tag" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+ ]] || return 1
+    printf 'v%s' "${tag#v}"
+}
+
+check_xray_update_async() {
+    is_installed || return 0
+    local cache_file="/tmp/.xray_latest_ver"
+    local now mtime=0 age=99999
+    if [ -f "$cache_file" ]; then
+        now=$(date +%s 2>/dev/null || echo 0)
+        mtime=$(stat -c %Y "$cache_file" 2>/dev/null || echo 0)
+        age=$((now - mtime))
+    fi
+    if [ "$age" -gt 3600 ]; then
+        (
+            local tag
+            tag=$(get_latest_xray_version 2>/dev/null || true)
+            if [[ "$tag" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+                printf 'v%s\n' "${tag#v}" > "$cache_file" 2>/dev/null || true
+            fi
+        ) >/dev/null 2>&1 &
+    fi
+}
+
 header() {
     clear 2>/dev/null || true
     echo ""
     local ver status_str="${C_GRAY}○ 未安装${C_RESET}"
     if is_installed; then
         ver=$(get_core_version || true)
+        local latest_ver ver_str=""
+        latest_ver=$(get_cached_latest_version || true)
+        if [ -n "$ver" ]; then
+            if [ -n "$latest_ver" ] && [ "$latest_ver" != "$ver" ]; then
+                local lowest
+                lowest=$(printf '%s\n%s\n' "${ver#v}" "${latest_ver#v}" | sort -V | head -n 1)
+                if [ "$lowest" = "${ver#v}" ]; then
+                    ver_str=" ${C_GRAY}${ver}${C_RESET} ${C_YELLOW}→ ${latest_ver}${C_RESET}"
+                else
+                    ver_str=" ${C_GRAY}${ver}${C_RESET}"
+                fi
+            else
+                ver_str=" ${C_GRAY}${ver}${C_RESET}"
+            fi
+        fi
+
         if is_running; then
-            status_str="${C_GREEN}● 运行中${C_RESET}${ver:+ ${C_GRAY}${ver}${C_RESET}}"
+            status_str="${C_GREEN}● 运行中${C_RESET}${ver_str}"
         else
-            status_str="${C_RED}○ 已停止${C_RESET}${ver:+ ${C_GRAY}${ver}${C_RESET}}"
+            status_str="${C_RED}○ 已停止${C_RESET}${ver_str}"
         fi
     fi
 
@@ -662,6 +707,7 @@ install_xray() {
     [ -f "$tmp_dir/geosite.dat" ] && install -m 644 "$tmp_dir/geosite.dat" "$XRAY_SHARE_DIR/"
     rm -rf "$tmp_dir"
     XRAY_VER=""
+    printf 'v%s\n' "${ver#v}" > /tmp/.xray_latest_ver 2>/dev/null || true
 
     check_mptcp_security
     init_config_if_needed
@@ -1672,6 +1718,7 @@ main() {
     ensure_xray_user
     setup_shortcut
     get_public_ip
+    check_xray_update_async
 
     local choice core_act
     while true; do
