@@ -7,15 +7,20 @@
 
 if [ -z "${BASH_VERSION:-}" ]; then
     [ -f /etc/alpine-release ] && ! command -v bash >/dev/null 2>&1 && [ "$(id -u)" -eq 0 ] && apk add --no-cache bash >/dev/null 2>&1
-    command -v bash >/dev/null 2>&1 && exec bash "$0" "$@"
-    echo "[错误] 请先安装 bash 后再运行此脚本！" >&2; exit 1
+    if command -v bash >/dev/null 2>&1 && [ -f "$0" ]; then
+        exec bash "$0" "$@"
+    fi
+    echo "[错误] 请先安装 bash 并使用 bash 运行此脚本！" >&2; exit 1
 fi
 
 set -o pipefail
 
 SCRIPT_SELF=""
-[ -n "${BASH_SOURCE[0]:-}" ] && SCRIPT_SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
-[ -z "$SCRIPT_SELF" ] && SCRIPT_SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+    SCRIPT_SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+elif [[ -f "$0" ]]; then
+    SCRIPT_SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+fi
 SCRIPT_LINK="/usr/local/bin/cpapi"
 
 # --- 视觉主题与常量定义 ---
@@ -43,23 +48,41 @@ TMP_EXTRACT_DIR=""
 GH_PROXY="${GH_PROXY:-}"
 [ -n "$GH_PROXY" ] && [[ "$GH_PROXY" != */ ]] && GH_PROXY="${GH_PROXY}/"
 
-# --- UI 输出组件 ---
+# --- 全局清理陷阱 ---
+cleanup_tmp() {
+    [[ -n "${TMP_EXTRACT_DIR:-}" && -d "$TMP_EXTRACT_DIR" ]] && rm -rf -- "$TMP_EXTRACT_DIR"
+    TMP_EXTRACT_DIR=""
+}
+trap cleanup_tmp EXIT INT TERM HUP
+
+# --- UI 输出与安全交互组件 ---
 info()   { echo -e "  ${C_CYAN}›${C_RESET} $*"; }
 ok()     { echo -e "  ${C_GREEN}✔${C_RESET} $*"; }
 warn()   { echo -e "  ${C_YELLOW}!${C_RESET} $*"; }
 err()    { echo -e "  ${C_RED}✖${C_RESET} $*" >&2; }
 kv()     { printf "  ${C_GRAY}%-10s${C_RESET}  %b\n" "$1" "$2"; }
-pause()  { echo ""; read -rp "  按回车键继续..." _ || true; }
+
+prompt_read() {
+    local prompt_str="$1" var_name="$2"
+    if [[ -t 0 ]]; then
+        read -rp "$prompt_str" "${var_name?}"
+    elif [[ -r /dev/tty ]]; then
+        read -rp "$prompt_str" "${var_name?}" < /dev/tty
+    else
+        return 1
+    fi
+}
+
+pause() {
+    echo ""
+    local _dummy
+    prompt_read "  按回车键继续..." _dummy || true
+}
 
 header() {
     clear 2>/dev/null || true
     echo ""
     echo -e "  ${C_BOLD}${1}${C_RESET}\n"
-}
-
-cleanup_tmp() {
-    [[ -n "${TMP_EXTRACT_DIR:-}" && -d "$TMP_EXTRACT_DIR" ]] && rm -rf -- "$TMP_EXTRACT_DIR"
-    TMP_EXTRACT_DIR=""
 }
 
 # --- 0. 权限与环境初始化 ---
@@ -79,7 +102,10 @@ check_os() {
 }
 
 setup_shortcut() {
-    [ -f "$SCRIPT_SELF" ] || return 0
+    [[ -n "$SCRIPT_SELF" && "$SCRIPT_SELF" == /* && -f "$SCRIPT_SELF" ]] || return 0
+    case "$SCRIPT_SELF" in
+        /bin/*|/usr/bin/*|/sbin/*|/usr/sbin/*) return 0 ;;
+    esac
     mkdir -p /usr/local/bin
     if [ ! -f "$SCRIPT_LINK" ] || [ "$(readlink -f "$SCRIPT_LINK" 2>/dev/null)" != "$SCRIPT_SELF" ]; then
         ln -sf "$SCRIPT_SELF" "$SCRIPT_LINK" 2>/dev/null || true
@@ -89,14 +115,20 @@ setup_shortcut() {
 
 # --- 1. 核心工具函数 ---
 ensure_deps() {
-    local missing=() cmd
+    local missing=() pkgs=() cmd
     for cmd in curl tar awk; do command -v "$cmd" &>/dev/null || missing+=("$cmd"); done
-    [[ ${#missing[@]} -eq 0 ]] && return 0
-    info "正在安装基础依赖: ${missing[*]} ..."
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        pkgs+=("${missing[@]}")
+    fi
+    if [[ ! -d /etc/ssl/certs ]] || [[ -z "$(ls -A /etc/ssl/certs 2>/dev/null)" ]]; then
+        pkgs+=("ca-certificates")
+    fi
+    [[ ${#pkgs[@]} -eq 0 ]] && return 0
+    info "正在安装基础依赖: ${pkgs[*]} ..."
     if [[ "$OS_ID" == "alpine" ]]; then
-        apk add --no-cache "${missing[@]}"
+        apk add --no-cache "${pkgs[@]}"
     else
-        apt-get update -y && apt-get install -y "${missing[@]}"
+        apt-get update -y && apt-get install -y "${pkgs[@]}"
     fi
 }
 
@@ -129,16 +161,50 @@ enforce_local_binding() {
     [[ -f "$CONFIG_PATH" ]] || return 0
     local tmp="${CONFIG_PATH}.tmp"
     if awk -v h="$LOCKED_HOST" -v p="$LOCKED_PORT" '
-        /^server:[[:space:]]*$/ { s=1; print; next }
+        BEGIN { s=0; found_srv=0 }
+        /^server:[[:space:]]*(#.*)?$/ {
+            print "server:"
+            print "  host: \"" h "\""
+            print "  port: " p
+            s=1; found_srv=1; next
+        }
         /^[^[:space:]#]/ { s=0 }
-        s && /^[[:space:]]*host:/ { print "  host: \"" h "\""; next }
-        s && /^[[:space:]]*port:/ { print "  port: " p; next }
+        s && /^  (host|port):[[:space:]]*/ { next }
         { print }
+        END {
+            if (!found_srv) {
+                print "\nserver:"
+                print "  host: \"" h "\""
+                print "  port: " p
+            }
+        }
     ' "$CONFIG_PATH" > "$tmp" 2>/dev/null; then
         mv -f "$tmp" "$CONFIG_PATH" && chmod 600 "$CONFIG_PATH"
     else
         rm -f "$tmp"
     fi
+}
+
+write_config() {
+    local raw_key="$1"
+    local safe_key="${raw_key//\\/\\\\}"
+    safe_key="${safe_key//\"/\\\"}"
+    safe_key="${safe_key//|/\\|}"
+    (umask 077 && cat << 'YAML' | sed -e "s|__HOST__|${LOCKED_HOST}|g" -e "s|__PORT__|${LOCKED_PORT}|g" -e "s|__KEY__|${safe_key}|g" > "$CONFIG_PATH"
+config-version: 8
+
+server:
+  host: "__HOST__"
+  port: __PORT__
+
+management:
+  allow-remote: true
+  secret-key: "__KEY__"
+
+oauth:
+  auth-dir: "auth"
+YAML
+    )
 }
 
 svc_ctl() {
@@ -153,6 +219,21 @@ svc_ctl() {
     fi
 }
 
+wait_for_service() {
+    local retries=12
+    while (( retries > 0 )); do
+        if svc_ctl status; then
+            if (echo >/dev/tcp/"$LOCKED_HOST"/"$LOCKED_PORT") 2>/dev/null || \
+               curl -fsS --max-time 1 "http://${LISTEN_ADDR}/" &>/dev/null; then
+                return 0
+            fi
+        fi
+        sleep 0.5
+        ((retries--))
+    done
+    svc_ctl status
+}
+
 is_installed() { [[ -f "$SERVICE_PATH" || -x "$BIN_PATH" ]]; }
 
 fmt_status() {
@@ -165,7 +246,7 @@ fmt_status() {
     fi
 }
 
-restart_cliproxy() { [[ -f "$SERVICE_PATH" ]] && enforce_local_binding && svc_ctl restart && sleep 1 && svc_ctl status; }
+restart_cliproxy() { [[ -f "$SERVICE_PATH" ]] && enforce_local_binding && svc_ctl restart && wait_for_service; }
 
 manage_service() {
     [[ -f "$SERVICE_PATH" ]] || { warn "服务尚未安装，请先执行 [5. 安装部署]。"; pause; return 1; }
@@ -175,7 +256,7 @@ manage_service() {
                 info "服务已在运行中。"
             else
                 enforce_local_binding
-                if svc_ctl start && sleep 1 && svc_ctl status; then
+                if svc_ctl start && wait_for_service; then
                     ok "服务已启动！"
                 else
                     err "启动失败，请查看日志。"
@@ -226,7 +307,9 @@ fetch_release_info() {
     local api_url="https://api.github.com/repos/${OFFICIAL_REPO}/releases/latest"
     [ -n "$GH_PROXY" ] && { rel_url="${GH_PROXY}${rel_url}"; api_url="${GH_PROXY}${api_url}"; }
 
-    LATEST_TAG=$(curl -sI --max-time 10 "$rel_url" 2>/dev/null \
+    LATEST_TAG=$(curl -fsSLI -o /dev/null -w '%{url_effective}' --max-time 10 "$rel_url" 2>/dev/null \
+        | awk -F'/tag/' '/\/tag\// {gsub(/[\r\n?].*/, "", $2); print $2; exit}')
+    [[ -z "$LATEST_TAG" ]] && LATEST_TAG=$(curl -sI --max-time 10 "$rel_url" 2>/dev/null \
         | awk -F'/tag/' 'tolower($0) ~ /^location:.*\/tag\// {gsub(/[\r\n ]/, "", $2); print $2; exit}')
     [[ -z "$LATEST_TAG" ]] && LATEST_TAG=$(curl -fsSL --max-time 10 "$api_url" 2>/dev/null \
         | grep -oE '"tag_name":[[:space:]]*"[^"]+"' | head -n 1 | cut -d'"' -f4)
@@ -239,27 +322,34 @@ fetch_release_info() {
 
 install_release_binary() {
     local found test_out example_cfg
+    cleanup_tmp
     TMP_EXTRACT_DIR=$(mktemp -d)
-    trap cleanup_tmp RETURN
     mkdir -p "$WORK_DIR" && chmod 700 "$WORK_DIR"
 
     info "正在下载官方程序包 (v${LATEST_VER})..."
-    curl -fsSL -o "${TMP_EXTRACT_DIR}/pkg.tar.gz" "$DOWNLOAD_URL" || { err "下载失败！"; return 1; }
-    tar -zxf "${TMP_EXTRACT_DIR}/pkg.tar.gz" -C "$TMP_EXTRACT_DIR" 2>/dev/null || { err "解压失败！"; return 1; }
+    if ! curl -fsSL -o "${TMP_EXTRACT_DIR}/pkg.tar.gz" "$DOWNLOAD_URL"; then
+        err "下载失败！"; cleanup_tmp; return 1
+    fi
+    if ! tar -zxf "${TMP_EXTRACT_DIR}/pkg.tar.gz" -C "$TMP_EXTRACT_DIR" 2>/dev/null; then
+        err "解压失败！"; cleanup_tmp; return 1
+    fi
 
     found=$(find "$TMP_EXTRACT_DIR" -type f \( -name "cli-proxy-api" -o -name "cliproxyapi" -o -name "CLIProxyAPI" \) | head -n 1)
     if [[ -n "$found" ]]; then
         chmod +x "$found"
     else
-        err "未找到可执行主程序！"; return 1
+        err "未找到可执行主程序！"; cleanup_tmp; return 1
     fi
 
-    test_out=$("$found" --help 2>&1) || { err "兼容性预检未通过：\n${test_out}"; return 1; }
+    if ! test_out=$("$found" --help 2>&1); then
+        err "兼容性预检未通过：\n${test_out}"; cleanup_tmp; return 1
+    fi
     install -m 755 "$found" "$BIN_PATH"
     example_cfg=$(find "$TMP_EXTRACT_DIR" -type f -name "config.example.yaml" | head -n 1)
     if [[ -n "$example_cfg" ]]; then
         install -m 600 "$example_cfg" "${WORK_DIR}/config.example.yaml" 2>/dev/null || true
     fi
+    cleanup_tmp
     ok "主程序安装完成 (v${LATEST_VER})"
 }
 
@@ -271,7 +361,7 @@ prune_old_backups() {
 }
 
 create_backup() {
-    local mode="${1:-auto}" ts cur_v v_tag=""
+    local mode="${1:-auto}" skip_prune="${2:-0}" ts cur_v v_tag=""
     mkdir -p "$BACKUP_DIR" && chmod 700 "$BACKUP_DIR"
     ts=$(date +"%Y%m%d_%H%M%S")
     cur_v=$(get_local_version)
@@ -286,8 +376,10 @@ create_backup() {
     if [[ "$mode" == "manual" && -d "$AUTH_DIR" ]] && [[ -n "$(ls -A "$AUTH_DIR" 2>/dev/null)" ]]; then
         (umask 077 && tar -czf "${BACKUP_DIR}/auth_manual_${ts}.tar.gz" -C "$WORK_DIR" auth 2>/dev/null) || true
     fi
-    prune_old_backups "config_auto_*"
-    prune_old_backups "cli-proxy-api_auto_*"
+    if [[ "$skip_prune" != "1" ]]; then
+        prune_old_backups "config_auto_*"
+        prune_old_backups "cli-proxy-api_auto_*"
+    fi
 }
 
 # --- 4. 业务功能模块 ---
@@ -300,7 +392,7 @@ deploy() {
         echo -e "  ${C_CYAN}1.${C_RESET} 平滑升级 ${C_GRAY}(保留现有配置与凭据)${C_RESET}"
         echo -e "  ${C_CYAN}2.${C_RESET} 重新配置 ${C_GRAY}(备份并重写配置)${C_RESET}"
         echo -e "  ${C_GRAY}0.${C_RESET} 返回\n"
-        local dep_opt; read -rp "  › 请选择 [0-2, 默认 1]: " dep_opt
+        local dep_opt; prompt_read "  › 请选择 [0-2, 默认 1]: " dep_opt || return
         case "${dep_opt:-1}" in
             1) upgrade_lossless; return ;;
             2) create_backup "auto" ;;
@@ -317,11 +409,18 @@ deploy() {
     default_key=${old_key:-$(tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c 24 || true)}
     [[ -z "$default_key" ]] && default_key="cpa_$(date +%s)_secret"
 
-    read -rp "  › 管理密钥 Secret Key [默认: ${default_key}]: " SECRET_KEY
-    SECRET_KEY=${SECRET_KEY:-$default_key}
+    while true; do
+        prompt_read "  › 管理密钥 Secret Key [默认: ${default_key}]: " SECRET_KEY || return 1
+        SECRET_KEY=${SECRET_KEY:-$default_key}
+        if [[ "$SECRET_KEY" =~ [[:cntrl:]] ]]; then
+            err "密钥不能包含控制字符，请重新输入！"
+        else
+            break
+        fi
+    done
 
     while true; do
-        read -rp "  › 反代域名 (如 api.example.com，留空跳过) [${old_domain:+默认: $old_domain}]: " raw_domain
+        prompt_read "  › 反代域名 (如 api.example.com，留空跳过) [${old_domain:+默认: $old_domain}]: " raw_domain || return 1
         raw_domain=${raw_domain:-$old_domain}
         if PROXY_DOMAIN=$(sanitize_domain "$raw_domain"); then
             break
@@ -339,28 +438,14 @@ deploy() {
     svc_ctl stop || true
 
     local update_bin="y"
-    [[ -x "$BIN_PATH" ]] && read -rp "  › 是否更新主程序至官方最新版？[Y/n]: " update_bin
+    [[ -x "$BIN_PATH" ]] && { prompt_read "  › 是否更新主程序至官方最新版？[Y/n]: " update_bin || return 1; }
     if [[ ! "$update_bin" =~ ^[nN]$ ]]; then
         if ! { fetch_release_info && install_release_binary; }; then
             pause; return 1
         fi
     fi
 
-    (umask 077 && cat << YAML > "$CONFIG_PATH"
-config-version: 8
-
-server:
-  host: "${LOCKED_HOST}"
-  port: ${LOCKED_PORT}
-
-management:
-  allow-remote: true
-  secret-key: "${SECRET_KEY}"
-
-oauth:
-  auth-dir: "auth"
-YAML
-    )
+    write_config "$SECRET_KEY"
 
     if [[ "$OS_ID" == "alpine" ]]; then
         cat << INIT > "$SERVICE_PATH"
@@ -377,6 +462,20 @@ rc_ulimit="-n 65535"
 depend() { need net; after firewall; }
 INIT
         chmod +x "$SERVICE_PATH"
+        if [[ -d /etc/logrotate.d ]]; then
+            cat << LOGROTATE > /etc/logrotate.d/cliproxy
+${LOG_FILE} {
+    daily
+    rotate 7
+    size 20M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+LOGROTATE
+        fi
         rc-update add cliproxy default >/dev/null 2>&1 || true
         svc_ctl restart || svc_ctl start
     else
@@ -402,8 +501,7 @@ UNIT
         systemctl daemon-reload && systemctl enable --now cliproxy >/dev/null 2>&1
     fi
 
-    sleep 1
-    if ! svc_ctl status; then
+    if ! wait_for_service; then
         err "服务启动失败，请通过 [4. 实时日志] 排查原因！"
         pause; return 1
     fi
@@ -445,14 +543,14 @@ upgrade_lossless() {
 
     if [[ "$local_ver" == "$LATEST_VER" ]]; then
         ok "当前已是最新版本。"
-        read -rp "  › 是否强制重新下载覆盖安装？[y/N]: " confirm_up
+        prompt_read "  › 是否强制重新下载覆盖安装？[y/N]: " confirm_up || return 0
         [[ ! "$confirm_up" =~ ^[yY]$ ]] && return 0
     else
-        read -rp "  › 确认平滑升级至 v${LATEST_VER}？[Y/n]: " confirm_up
+        prompt_read "  › 确认平滑升级至 v${LATEST_VER}？[Y/n]: " confirm_up || return 0
         [[ "$confirm_up" =~ ^[nN]$ ]] && return 0
     fi
 
-    create_backup "auto"
+    create_backup "auto" "1"
     install_release_binary || { pause; return 1; }
 
     info "正在重启服务..."
@@ -469,6 +567,8 @@ upgrade_lossless() {
         pause; return 1
     fi
 
+    prune_old_backups "config_auto_*"
+    prune_old_backups "cli-proxy-api_auto_*"
     ok "平滑升级成功：${C_YELLOW}v${local_ver}${C_RESET} -> ${C_GREEN}v$(get_local_version)${C_RESET}"
     pause
 }
@@ -487,7 +587,7 @@ rollback() {
         ((idx++))
     done
     echo -e "\n  ${C_GRAY} 0.${C_RESET} 取消并返回\n"
-    read -rp "  › 请选择备份编号 [0-${#list[@]}]: " choice
+    prompt_read "  › 请选择备份编号 [0-${#list[@]}]: " choice || return 0
     [[ -z "$choice" || "$choice" == "0" ]] && return 0
     if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#list[@]} )); then
         err "编号无效！"; pause; return 1
@@ -504,7 +604,7 @@ rollback() {
 
 view_status() {
     header "服务运行状态详情"
-    local auth_count=0 net_cmd="netstat" cur_domain
+    local auth_count=0 net_cmd="" cur_domain
     cur_domain=$(get_domain)
     [[ -d "$AUTH_DIR" ]] && auth_count=$(find "$AUTH_DIR" -type f 2>/dev/null | wc -l)
 
@@ -517,9 +617,19 @@ view_status() {
     kv "配置文件" "${CONFIG_PATH}"
     echo ""
     echo -e "  ${C_BOLD}本地端口监听套接字:${C_RESET}"
-    command -v ss &>/dev/null && net_cmd="ss"
-    "$net_cmd" -tulpn 2>/dev/null | grep -iE ":${LOCKED_PORT}([[:space:]]|$)|cli-proxy" | sed 's/^/  /' \
-        || echo -e "  ${C_GRAY}(当前未检测到监听进程)${C_RESET}"
+    if command -v ss &>/dev/null; then
+        net_cmd="ss"
+    elif command -v netstat &>/dev/null; then
+        net_cmd="netstat"
+    fi
+    if [[ -n "$net_cmd" ]]; then
+        "$net_cmd" -tulpn 2>/dev/null | grep -iE ":${LOCKED_PORT}([[:space:]]|$)|cli-proxy" | sed 's/^/  /' \
+            || echo -e "  ${C_GRAY}(当前未检测到监听进程)${C_RESET}"
+    elif (echo >/dev/tcp/"$LOCKED_HOST"/"$LOCKED_PORT") 2>/dev/null; then
+        echo -e "  ${C_GREEN}tcp  LISTEN  ${LISTEN_ADDR}${C_RESET} ${C_GRAY}(通过 /dev/tcp 探测可达)${C_RESET}"
+    else
+        echo -e "  ${C_GRAY}(当前未检测到监听端口)${C_RESET}"
+    fi
     echo ""
     pause
 }
@@ -534,7 +644,7 @@ view_logs() {
     else
         journalctl -u cliproxy -n 50 -f
     fi
-    trap - INT
+    trap cleanup_tmp EXIT INT TERM HUP
 }
 
 backup_manage() {
@@ -547,7 +657,7 @@ backup_manage() {
         echo ""
         echo -e "  ${C_GRAY}0.${C_RESET} 返回主菜单\n"
 
-        local bopt; read -rp "  › 请选择 [0-4]: " bopt
+        local bopt; prompt_read "  › 请选择 [0-4]: " bopt || return
         case "$bopt" in
             1) create_backup "manual"; ok "完整备份已保存至: ${BACKUP_DIR}"; pause ;;
             2)
@@ -557,7 +667,7 @@ backup_manage() {
                 echo ""
                 for f in "${baks[@]}"; do printf "  ${C_CYAN}%2d.${C_RESET} %s\n" "$i" "$(basename "$f")"; ((i++)); done
                 echo ""
-                read -rp "  › 请选择要恢复的编号 [0 取消]: " pick
+                prompt_read "  › 请选择要恢复的编号 [0 取消]: " pick || continue
                 [[ -z "$pick" || "$pick" == "0" ]] && continue
                 if [[ "$pick" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= ${#baks[@]} )); then
                     cp -f "${baks[$((pick-1))]}" "$CONFIG_PATH" && enforce_local_binding
@@ -584,7 +694,7 @@ backup_manage() {
                 [[ "$found_files" -eq 0 ]] && info "当前暂无任何备份文件。"
                 pause ;;
             4)
-                local cfm; read -rp "  确认清空所有备份归档？[y/N]: " cfm
+                local cfm; prompt_read "  确认清空所有备份归档？[y/N]: " cfm || continue
                 if [[ "$cfm" =~ ^[yY]$ ]]; then
                     rm -rf "${BACKUP_DIR:?}"/* 2>/dev/null
                     ok "备份已清空。"
@@ -601,13 +711,13 @@ uninstall_cliproxy() {
     header "卸载与清理"
     warn "即将移除系统服务、主程序、配置文件及备份归档。"
     local confirm del_auth
-    read -rp "  确认卸载 CLIProxyAPI？[y/N]: " confirm
+    prompt_read "  确认卸载 CLIProxyAPI？[y/N]: " confirm || return 0
     [[ "$confirm" =~ ^[yY]$ ]] || return 0
 
     svc_ctl stop || true
     if [[ "$OS_ID" == "alpine" ]]; then
         rc-update del cliproxy default >/dev/null 2>&1 || true
-        rm -f "$SERVICE_PATH" "$LOG_FILE"
+        rm -f "$SERVICE_PATH" "$LOG_FILE" /etc/logrotate.d/cliproxy
     else
         systemctl disable cliproxy >/dev/null 2>&1 || true
         rm -f "$SERVICE_PATH" && systemctl daemon-reload
@@ -616,7 +726,7 @@ uninstall_cliproxy() {
     rm -rf "$BACKUP_DIR"
 
     if [[ -d "$AUTH_DIR" ]] && [[ -n "$(ls -A "$AUTH_DIR" 2>/dev/null)" ]]; then
-        read -rp "  是否同时删除 ${AUTH_DIR} 下的所有授权凭据？[y/N]: " del_auth
+        prompt_read "  是否同时删除 ${AUTH_DIR} 下的所有授权凭据？[y/N]: " del_auth || del_auth="n"
         if [[ "$del_auth" =~ ^[yY]$ ]]; then
             rm -rf "$WORK_DIR"
             ok "已彻底卸载并清理全部凭据。"
@@ -638,7 +748,7 @@ proxy_guide() {
     kv "当前域名" "${cur_domain:-未设置}"
     echo ""
 
-    read -rp "  › 输入/更新反代域名 (回车保持 [${cur_domain:-api.example.com}]): " raw_domain
+    prompt_read "  › 输入/更新反代域名 (回车保持 [${cur_domain:-api.example.com}]): " raw_domain || true
     if [[ -n "$raw_domain" ]]; then
         if new_domain=$(sanitize_domain "$raw_domain") && [[ -n "$new_domain" ]]; then
             mkdir -p "$WORK_DIR" && chmod 700 "$WORK_DIR"
@@ -654,12 +764,15 @@ proxy_guide() {
     echo -e "\n  ${C_BOLD}▸ 方案 A：Caddy 配置 (/etc/caddy/Caddyfile)${C_RESET}\n"
     cat << CADDY
 ${d} {
+    # 可选安全加固：限制管理后台仅指定 IP 可访问
+    # @admin path /management*
+    # handle @admin {
+    #     @blocked not remote_ip 127.0.0.1
+    #     respond @blocked 403
+    # }
+
     reverse_proxy ${LISTEN_ADDR} {
         flush_interval -1
-        header_up Host {host}
-        header_up X-Real-IP {remote_host}
-        header_up X-Forwarded-For {remote_host}
-        header_up X-Forwarded-Proto {scheme}
     }
 }
 CADDY
@@ -673,13 +786,19 @@ map \$http_upgrade \$connection_upgrade {
 
 server {
     listen 80;
-    listen 443 ssl;
-    http2 on;
+    listen 443 ssl http2; # 若 Nginx >= 1.25.1，可改为 listen 443 ssl; 并在下方加 http2 on;
     server_name ${d};
 
     # ssl_certificate     /path/to/fullchain.pem;
     # ssl_certificate_key /path/to/privkey.pem;
     client_max_body_size 50m;
+
+    # 可选安全加固：限制管理后台仅指定 IP 可访问
+    # location ~ ^/management {
+    #     allow 127.0.0.1;
+    #     deny all;
+    #     proxy_pass http://${LISTEN_ADDR};
+    # }
 
     location / {
         proxy_pass http://${LISTEN_ADDR};
@@ -728,7 +847,7 @@ main() {
         echo -e "  ${C_GRAY}其他${C_RESET}    ${C_GRAY}0${C_RESET} 退出面板   ${C_RED}11${C_RESET} 卸载清理"
         echo ""
 
-        local opt; read -rp "  › 请选择 [1-11, 回车退出]: " opt || exit 0
+        local opt; prompt_read "  › 请选择 [1-11, 回车退出]: " opt || exit 0
         if [[ -z "$opt" || "$opt" == "0" || "$opt" =~ ^[qQ]$ ]]; then
             clear 2>/dev/null || true
             echo -e "\n  ${C_CYAN}已退出 CLIProxyAPI 管理面板${C_RESET} ${C_GRAY}(输入 cpapi 可再次打开)${C_RESET}\n"
