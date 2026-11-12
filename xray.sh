@@ -32,15 +32,35 @@ info() { echo -e "${C_CYAN}›${C_RESET} $*"; }
 gen_uuid() { cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16; }
 
 setup_shortcut() {
-    local self_path
-    self_path=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")
-    if [ -f "$self_path" ]; then
-        if [ ! -L /usr/local/bin/xraym ] || [ "$(readlink -f /usr/local/bin/xraym 2>/dev/null)" != "$self_path" ]; then
-            mkdir -p /usr/local/bin
-            ln -sf "$self_path" /usr/local/bin/xraym 2>/dev/null || true
-            chmod +x "$self_path" /usr/local/bin/xraym 2>/dev/null || true
+    local target="/usr/local/bin/xraym"
+    local persist_script="$CONF_DIR/xray.sh"
+    mkdir -p "$CONF_DIR" /usr/local/bin 2>/dev/null || true
+
+    local cur_src="${BASH_SOURCE[0]}"
+    local real_src=""
+    [ -n "$cur_src" ] && real_src=$(readlink -f "$cur_src" 2>/dev/null || echo "$cur_src")
+
+    # 如果通过 bash <(curl ...) 或匿名管道执行，当前路径为 /dev/fd/* 或不存在实体文件
+    if [ -z "$real_src" ] || [[ "$real_src" =~ ^/dev/fd/|^/proc/ ]] || [ ! -f "$real_src" ]; then
+        if ! curl -fsSL -m 5 https://raw.githubusercontent.com/xpeb/vps-tools/main/xray.sh -o "$persist_script" 2>/dev/null || [ ! -s "$persist_script" ]; then
+            # 备用回退: 若离线或受限，尝试从当前进程源码流 dump
+            cat "$cur_src" > "$persist_script" 2>/dev/null || true
+        fi
+        if [ -s "$persist_script" ]; then
+            chmod +x "$persist_script" 2>/dev/null || true
+            ln -sf "$persist_script" "$target" 2>/dev/null || cp -f "$persist_script" "$target" 2>/dev/null || true
+        fi
+    else
+        # 从本地实体磁盘文件运行
+        if [ "$real_src" != "$persist_script" ] && [ "$real_src" != "$target" ]; then
+            cp -f "$real_src" "$persist_script" 2>/dev/null || true
+            chmod +x "$persist_script" 2>/dev/null || true
+            ln -sf "$persist_script" "$target" 2>/dev/null || true
+        else
+            ln -sf "$real_src" "$target" 2>/dev/null || true
         fi
     fi
+    chmod +x "$target" 2>/dev/null || true
 }
 
 check_update_async() {
@@ -395,19 +415,14 @@ print_node_links() {
     info "${title} (${tag}):"
 
     if [ -n "$PUB_IPV4" ] && [ -n "$PUB_IPV6" ]; then
-        local link4; link4=$(build_link "$target" "$PUB_IPV4")
-        local link6; link6=$(build_link "$target" "[${PUB_IPV6}]")
-        echo -e "\n${C_BOLD}IPv4 链接:${C_RESET}\n${C_CYAN}${link4}${C_RESET}"
-        echo -e "\n${C_BOLD}IPv6 链接:${C_RESET}\n${C_CYAN}${link6}${C_RESET}\n"
+        echo -e "\n${C_BOLD}IPv4 链接:${C_RESET}\n${C_CYAN}$(build_link "$target" "$PUB_IPV4")${C_RESET}"
+        echo -e "\n${C_BOLD}IPv6 链接:${C_RESET}\n${C_CYAN}$(build_link "$target" "[${PUB_IPV6}]")${C_RESET}\n"
     elif [ -n "$PUB_IPV4" ]; then
-        local link4; link4=$(build_link "$target" "$PUB_IPV4")
-        echo -e "\n${C_CYAN}${link4}${C_RESET}\n"
+        echo -e "\n${C_CYAN}$(build_link "$target" "$PUB_IPV4")${C_RESET}\n"
     elif [ -n "$PUB_IPV6" ]; then
-        local link6; link6=$(build_link "$target" "[${PUB_IPV6}]")
-        echo -e "\n${C_CYAN}${link6}${C_RESET}\n"
+        echo -e "\n${C_CYAN}$(build_link "$target" "[${PUB_IPV6}]")${C_RESET}\n"
     else
-        local link; link=$(build_link "$target" "127.0.0.1")
-        echo -e "\n${C_CYAN}${link}${C_RESET}\n"
+        echo -e "\n${C_CYAN}$(build_link "$target" "127.0.0.1")${C_RESET}\n"
     fi
 }
 
@@ -419,15 +434,9 @@ add_node() {
     echo -e "\n${C_BOLD}入站协议${C_RESET}\n${C_CYAN}1)${C_RESET} VLESS\n${C_CYAN}2)${C_RESET} Hysteria\n${C_CYAN}3)${C_RESET} Trojan\n${C_CYAN}4)${C_RESET} Shadowsocks\n${C_CYAN}5)${C_RESET} VMess\n"
 
     local choice; choice=$(ask "选择协议 [1-5]" "1")
-    local def_p="443"
-    case "$choice" in
-        1) def_p="443" ;;
-        2) def_p="8443" ;;
-        3) def_p="443" ;;
-        4) def_p="8388" ;;
-        5) def_p="80" ;;
-        *) err "无效选项"; return 1 ;;
-    esac
+    local def_ports=("" "443" "8443" "443" "8388" "80")
+    local def_p="${def_ports[$choice]:-}"
+    [ -z "$def_p" ] && { err "无效选项"; return 1; }
     is_port_used "$def_p" && def_p=$(rand_port)
     local port; port=$(ask_port "监听端口" "$def_p")
     local inb_data="" remark=""
@@ -563,14 +572,14 @@ add_node() {
     [ -z "$inb_data" ] && return 1
     apply_inbound "$inb_data" || return 1
     print_node_links "$inb_data" "节点添加成功"
-    read -rp "按回车键继续..." _
+    read -rp "按回车键返回主菜单..." _
 }
 
 # 8. 修改节点功能 (内存级单次计算原子更新)
 edit_node() {
-    [ ! -f "$CONF" ] && { err "配置文件不存在"; return 1; }
+    [ ! -f "$CONF" ] && { err "配置文件不存在"; sleep 1; return 1; }
     local count; count=$(jq '.inbounds | length' "$CONF" 2>/dev/null || echo 0)
-    [ "$count" -eq 0 ] && { info "暂无节点可修改"; read -rp "按回车键返回..." _; return 0; }
+    [ "$count" -eq 0 ] && { info "暂无节点可修改"; sleep 1; return 0; }
 
     echo -e "\n${C_BOLD}修改入站节点${C_RESET}"
     list_inbounds
@@ -578,10 +587,10 @@ edit_node() {
 
     local sel; sel=$(ask "输入要修改的节点编号 (回车返回)" "")
     [ -z "$sel" ] && return 0
-    [[ ! "$sel" =~ ^[0-9]+$ ]] && { err "编号必须是纯数字"; read -rp "按回车键返回..." _; return 1; }
+    [[ ! "$sel" =~ ^[0-9]+$ ]] && { err "编号必须是纯数字"; sleep 1; return 1; }
 
     local target; target=$(jq -c --argjson i "$sel" '.inbounds[$i] // empty' "$CONF" 2>/dev/null)
-    [ -z "$target" ] && { err "无效编号"; read -rp "按回车键返回..." _; return 1; }
+    [ -z "$target" ] && { err "无效编号"; sleep 1; return 1; }
 
     local cur_port cur_proto cur_trans meta new_port new_inb
     cur_port=$(jq -r '.port' <<< "$target")
@@ -592,6 +601,7 @@ edit_node() {
     echo ""
     info "正在修改节点 [${sel}] (${cur_proto}/${cur_trans}):"
     new_port=$(ask_port "监听端口" "$cur_port")
+    new_inb=$(jq --arg port "$new_port" '.port = ($port|tonumber) | .tag = (.tag | sub("-[0-9]+$"; "-" + $port))' <<< "$target")
 
     case "$cur_proto" in
         vless)
@@ -600,16 +610,16 @@ edit_node() {
             if [ "$cur_trans" = "xhttp" ]; then
                 local cur_path; cur_path=$(jq -r '.path // "/xhttp"' <<< "$meta")
                 local new_path; new_path=$(ask "XHTTP 路径" "$cur_path")
-                new_inb=$(jq --arg port "$new_port" --arg sni "$new_sni" --arg path "$new_path"                     '.port = ($port|tonumber) | .tag = (.tag | sub("-[0-9]+$"; "-" + $port)) | .streamSettings.realitySettings.serverNames = [$sni] | .streamSettings.realitySettings.dest = ($sni + ":443") | .streamSettings.xhttpSettings.path = $path | .streamSettings.xhttpSettings.host = $sni | ._meta.sni = $sni | ._meta.path = $path' <<< "$target")
+                new_inb=$(jq --arg sni "$new_sni" --arg path "$new_path"                     '.streamSettings.realitySettings.serverNames = [$sni] | .streamSettings.realitySettings.dest = ($sni + ":443") | .streamSettings.xhttpSettings.path = $path | .streamSettings.xhttpSettings.host = $sni | ._meta.sni = $sni | ._meta.path = $path' <<< "$new_inb")
             else
-                new_inb=$(jq --arg port "$new_port" --arg sni "$new_sni"                     '.port = ($port|tonumber) | .tag = (.tag | sub("-[0-9]+$"; "-" + $port)) | .streamSettings.realitySettings.serverNames = [$sni] | .streamSettings.realitySettings.dest = ($sni + ":443") | ._meta.sni = $sni' <<< "$target")
+                new_inb=$(jq --arg sni "$new_sni"                     '.streamSettings.realitySettings.serverNames = [$sni] | .streamSettings.realitySettings.dest = ($sni + ":443") | ._meta.sni = $sni' <<< "$new_inb")
             fi
             ;;
         trojan)
             local cur_sni; cur_sni=$(jq -r '.sni // "www.nvidia.com"' <<< "$meta")
             local new_sni; new_sni=$(ask "伪装域名" "$cur_sni")
             ensure_self_cert "$new_sni"
-            new_inb=$(jq --arg port "$new_port" --arg sni "$new_sni"                 '.port = ($port|tonumber) | .tag = (.tag | sub("-[0-9]+$"; "-" + $port)) | .streamSettings.tlsSettings.serverName = $sni | ._meta.sni = $sni' <<< "$target")
+            new_inb=$(jq --arg sni "$new_sni"                 '.streamSettings.tlsSettings.serverName = $sni | ._meta.sni = $sni' <<< "$new_inb")
             ;;
         hysteria)
             local cur_pass; cur_pass=$(jq -r '.pass // ""' <<< "$meta")
@@ -617,17 +627,17 @@ edit_node() {
             local cur_sni; cur_sni=$(jq -r '.sni // "www.nvidia.com"' <<< "$meta")
             local new_sni; new_sni=$(ask "伪装域名 (SNI)" "$cur_sni")
             ensure_self_cert "$new_sni"
-            new_inb=$(jq --arg port "$new_port" --arg pass "$new_pass" --arg sni "$new_sni"                 '.port = ($port|tonumber) | .tag = (.tag | sub("-[0-9]+$"; "-" + $port)) | .settings.users[0].auth = $pass | ._meta.pass = $pass | ._meta.sni = $sni' <<< "$target")
+            new_inb=$(jq --arg pass "$new_pass" --arg sni "$new_sni"                 '.settings.users[0].auth = $pass | ._meta.pass = $pass | ._meta.sni = $sni' <<< "$new_inb")
             ;;
         shadowsocks)
             local cur_pass; cur_pass=$(jq -r '.pass // ""' <<< "$meta")
             local new_pass; new_pass=$(ask "密码" "$cur_pass")
-            new_inb=$(jq --arg port "$new_port" --arg pass "$new_pass"                 '.port = ($port|tonumber) | .tag = (.tag | sub("-[0-9]+$"; "-" + $port)) | .settings.password = $pass | ._meta.pass = $pass' <<< "$target")
+            new_inb=$(jq --arg pass "$new_pass" '.settings.password = $pass | ._meta.pass = $pass' <<< "$new_inb")
             ;;
         vmess)
             local cur_path; cur_path=$(jq -r '.path // "/ws"' <<< "$meta")
             local new_path; new_path=$(ask "WebSocket 路径" "$cur_path")
-            new_inb=$(jq --arg port "$new_port" --arg path "$new_path"                 '.port = ($port|tonumber) | .tag = (.tag | sub("-[0-9]+$"; "-" + $port)) | .streamSettings.wsSettings.path = $path | ._meta.path = $path' <<< "$target")
+            new_inb=$(jq --arg path "$new_path" '.streamSettings.wsSettings.path = $path | ._meta.path = $path' <<< "$new_inb")
             ;;
     esac
 
@@ -635,39 +645,46 @@ edit_node() {
     jq --argjson i "$sel" --argjson inb "$new_inb" '.inbounds[$i] = $inb' "$CONF" > "$tmp_cfg"
     if apply_config_test "$tmp_cfg"; then
         ok "节点 [${sel}] 已成功修改并重启生效"
+        sleep 1
     fi
-    read -rp "按回车键继续..." _
 }
 
 # 9. 节点查看与链接输出
 show_nodes() {
-    [ ! -f "$CONF" ] && { err "配置文件不存在"; return 1; }
-    local count; count=$(jq '.inbounds | length' "$CONF" 2>/dev/null || echo 0)
-    if [ "$count" -eq 0 ]; then
-        info "暂无配置任何节点"
-        read -rp "按回车键返回..." _
-        return 0
-    fi
+    [ ! -f "$CONF" ] && { err "配置文件不存在"; sleep 1; return 1; }
 
-    echo -e "\n${C_BOLD}当前节点列表 [${count}]${C_RESET}"
-    list_inbounds
-    echo ""
+    while true; do
+        local count; count=$(jq '.inbounds | length' "$CONF" 2>/dev/null || echo 0)
+        if [ "$count" -eq 0 ]; then
+            info "暂无配置任何节点"
+            sleep 1
+            return 0
+        fi
 
-    local sel; sel=$(ask "输入编号查看分享链接 (回车返回)" "")
-    [ -z "$sel" ] && return 0
-    [[ ! "$sel" =~ ^[0-9]+$ ]] && { err "编号必须是纯数字"; read -rp "按回车键返回..." _; return 1; }
+        echo -e "\n${C_BOLD}当前节点列表 [${count}]${C_RESET}"
+        list_inbounds
+        echo ""
 
-    local target; target=$(jq -c --argjson i "$sel" '.inbounds[$i] // empty' "$CONF" 2>/dev/null)
-    [ -z "$target" ] && { err "无效编号"; read -rp "按回车键返回..." _; return 1; }
+        local sel; sel=$(ask "输入编号查看分享链接 (回车返回)" "")
+        [ -z "$sel" ] && return 0
+        if [[ ! "$sel" =~ ^[0-9]+$ ]]; then
+            err "编号必须是纯数字"; sleep 1; continue
+        fi
 
-    print_node_links "$target" "节点链接"
-    read -rp "按回车键继续..." _
+        local target; target=$(jq -c --argjson i "$sel" '.inbounds[$i] // empty' "$CONF" 2>/dev/null)
+        if [ -z "$target" ]; then
+            err "无效编号"; sleep 1; continue
+        fi
+
+        print_node_links "$target" "节点链接"
+        read -rp "按回车键返回列表..." _
+    done
 }
 
 # 10. 删除节点
 delete_node() {
     local count; count=$(jq '.inbounds | length' "$CONF" 2>/dev/null || echo 0)
-    [ "$count" -eq 0 ] && { info "暂无节点可删"; read -rp "按回车键返回..." _; return 0; }
+    [ "$count" -eq 0 ] && { info "暂无节点可删"; sleep 1; return 0; }
 
     echo -e "\n${C_BOLD}删除节点${C_RESET}"
     list_inbounds 1
@@ -675,25 +692,26 @@ delete_node() {
 
     local sel; sel=$(ask "输入要删除的节点编号 (回车取消)" "")
     [ -z "$sel" ] && return 0
-    [[ ! "$sel" =~ ^[0-9]+$ ]] && { err "编号必须是纯数字"; read -rp "按回车键返回..." _; return 1; }
+    [[ ! "$sel" =~ ^[0-9]+$ ]] && { err "编号必须是纯数字"; sleep 1; return 1; }
 
     local tmp_cfg; tmp_cfg="$(mktemp).json"
     if jq --argjson i "$sel" 'del(.inbounds[$i])' "$CONF" > "$tmp_cfg" 2>/dev/null; then
         apply_config_test "$tmp_cfg" && ok "节点 [${sel}] 已删除"
+        sleep 1
     else
         rm -f "$tmp_cfg"
         err "编号无效，删除失败"
+        sleep 1
     fi
-    read -rp "按回车键继续..." _
 }
 
 # 11. 服务管理菜单
 manage_service() {
     echo -e "\n${C_BOLD}服务操作${C_RESET}\n${C_CYAN}1)${C_RESET} 重启服务\n${C_CYAN}2)${C_RESET} 停止服务\n${C_CYAN}3)${C_RESET} 启动服务\n${C_CYAN}4)${C_RESET} 实时日志\n${C_DIM}0) 返回${C_RESET}\n"
     case "$(ask "请选择" "1")" in
-        1) svc restart && ok "服务已重启" ;;
-        2) svc stop && ok "服务已停止" ;;
-        3) svc start && ok "服务已启动" ;;
+        1) svc restart && ok "服务已重启"; sleep 1 ;;
+        2) svc stop && ok "服务已停止"; sleep 1 ;;
+        3) svc start && ok "服务已启动"; sleep 1 ;;
         4)
             if [ -f /var/log/xray/error.log ]; then tail -n 30 -f /var/log/xray/error.log
             elif command -v journalctl >/dev/null 2>&1; then journalctl -u xray -f -n 30
@@ -701,7 +719,6 @@ manage_service() {
             ;;
         *) return 0 ;;
     esac
-    read -rp "按回车键继续..." _
 }
 
 # 12. 彻底卸载 Xray 与数据
@@ -710,7 +727,7 @@ uninstall_xray() {
     local confirm; confirm=$(ask "确认彻底卸载 Xray 并清除全部数据？[y/N]" "n")
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         info "已取消卸载"
-        read -rp "按回车键返回..." _
+        sleep 1
         return 0
     fi
 
@@ -801,8 +818,8 @@ main_menu() {
             3) edit_node ;;
             4) delete_node ;;
             5) manage_service ;;
-            6) enable_bbr; read -rp "按回车键继续..." _ ;;
-            7) install_core; read -rp "按回车键继续..." _ ;;
+            6) enable_bbr; sleep 1.2 ;;
+            7) install_core; sleep 1.2 ;;
             8) uninstall_xray ;;
             0|q|quit)
                 clear 2>/dev/null || true
