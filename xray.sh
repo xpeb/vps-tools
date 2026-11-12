@@ -19,9 +19,11 @@ C_GREEN="\033[32m"
 C_RED="\033[31m"
 C_YELLOW="\033[33m"
 VER_CACHE="$CONF_DIR/.latest_ver"
+IP_CACHE="$CONF_DIR/.ip_cache"
 
 PUB_IPV4=""
 PUB_IPV6=""
+XRAY_LOCAL_VER=""
 ARCH="64"
 [[ "$(uname -m)" =~ arm64|aarch64 ]] && ARCH="arm64-v8a"
 
@@ -84,6 +86,9 @@ check_update_async() {
 }
 
 check_deps() {
+    # 快速自检，若常用工具均在直接 0ms 瞬间返回
+    command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 && command -v openssl >/dev/null 2>&1 && return 0
+
     local missing="" cmd
     for cmd in curl unzip openssl jq; do
         command -v "$cmd" >/dev/null 2>&1 || missing+=" $cmd"
@@ -103,8 +108,12 @@ check_deps() {
 }
 
 ask() {
-    local prompt="$1" def="$2" val=""
-    read -rp "› ${prompt} [${def}]: " val
+    local prompt="$1" def="${2:-}" val=""
+    if [ -n "$def" ]; then
+        read -rp "› ${prompt} [${def}]: " val
+    else
+        read -rp "› ${prompt}: " val
+    fi
     echo "${val:-$def}"
 }
 
@@ -133,8 +142,41 @@ rand_port() {
 }
 
 refresh_ips() {
-    [ -n "$PUB_IPV4" ] || PUB_IPV4=$(curl -fs4 -m 2 https://api.ipify.org 2>/dev/null || curl -fs4 -m 2 https://icanhazip.com 2>/dev/null || echo "")
-    [ -n "$PUB_IPV6" ] || PUB_IPV6=$(curl -fs6 -m 2 https://api6.ipify.org 2>/dev/null || curl -fs6 -m 2 https://icanhazip.com 2>/dev/null || echo "")
+    [ -n "$PUB_IPV4" ] || [ -n "$PUB_IPV6" ] && return 0
+
+    # 1. 优先读取持久化本地缓存 (0ms)
+    if [ -s "$IP_CACHE" ]; then
+        local now mtime=0
+        now=$(date +%s 2>/dev/null || echo 0)
+        mtime=$(stat -c %Y "$IP_CACHE" 2>/dev/null || echo 0)
+        if [ $((now - mtime)) -le 86400 ]; then
+            PUB_IPV4=$(awk '/^v4:/{print $2}' "$IP_CACHE" 2>/dev/null || true)
+            PUB_IPV6=$(awk '/^v6:/{print $2}' "$IP_CACHE" 2>/dev/null || true)
+            [ -n "$PUB_IPV4" ] || [ -n "$PUB_IPV6" ] && return 0
+        fi
+    fi
+
+    # 2. 毫秒级极速本地路由表侦测 (2ms，免外部网络阻塞)
+    if command -v ip >/dev/null 2>&1; then
+        [ -z "$PUB_IPV4" ] && PUB_IPV4=$(ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -Ev '^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.)' | head -n1 || true)
+        [ -z "$PUB_IPV6" ] && PUB_IPV6=$(ip -o -6 addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -Ev '^(fe80|fd00|::1)' | head -n1 || true)
+    fi
+
+    # 若本地直接获取成功，秒存缓存
+    if [ -n "$PUB_IPV4" ] || [ -n "$PUB_IPV6" ]; then
+        mkdir -p "$CONF_DIR" 2>/dev/null || true
+        printf 'v4: %s\nv6: %s\n' "$PUB_IPV4" "$PUB_IPV6" > "$IP_CACHE" 2>/dev/null || true
+        return 0
+    fi
+
+    # 3. 异步后台网络嗅探 (NAT 内网穿透兜底，绝不阻塞前台渲染)
+    (
+        local v4 v6
+        v4=$(curl -fs4 -m 2 https://api.ipify.org 2>/dev/null || curl -fs4 -m 2 https://icanhazip.com 2>/dev/null || echo "")
+        v6=$(curl -fs6 -m 2 https://api6.ipify.org 2>/dev/null || curl -fs6 -m 2 https://icanhazip.com 2>/dev/null || echo "")
+        mkdir -p "$CONF_DIR" 2>/dev/null || true
+        printf 'v4: %s\nv6: %s\n' "$v4" "$v6" > "$IP_CACHE" 2>/dev/null || true
+    ) >/dev/null 2>&1 &
 }
 
 tune_system() {
@@ -234,11 +276,11 @@ EOF
         systemctl daemon-reload 2>/dev/null || true
         systemctl enable xray 2>/dev/null || true
     elif command -v rc-service >/dev/null 2>&1; then
-        cat << EOF > /etc/init.d/xray
+        cat << 'EOF' > /etc/init.d/xray
 #!/sbin/openrc-run
 description="Xray Core"
-command="${BIN}"
-command_args="run -c ${CONF}"
+command="/usr/local/bin/xray"
+command_args="run -c /usr/local/etc/xray/config.json"
 command_user="xray:xray"
 command_background=true
 pidfile="/run/xray.pid"
@@ -289,6 +331,7 @@ install_core() {
     init_env
     install_service
     tune_system
+    XRAY_LOCAL_VER="${ver}"
     echo "${ver#v}" > "$VER_CACHE" 2>/dev/null || true
     ok "Xray 核心已就绪 (${ver})"
 }
@@ -451,40 +494,45 @@ add_node() {
             local sid; sid=$(openssl rand -hex 4)
             local uid; uid=$(gen_uuid)
 
+            local r_settings="{show: false, dest: (\$sni + \":443\"), xver: 0, serverNames: [\$sni], privateKey: \$priv, shortIds: [\$sid]}"
             if [ "$trans_mode" = "2" ]; then
                 local path; path=$(ask "XHTTP 路径" "/xhttp-$(openssl rand -hex 3)")
                 remark="VLESS-XHTTP-${port}"
-                inb_data=$(jq -n                     --arg port "$port" --arg uid "$uid" --arg priv "$priv" --arg pbk "$pub" --arg sni "$sni" --arg sid "$sid" --arg path "$path" --arg rmk "$remark"                     '{
-                        listen: "::",
-                        port: ($port|tonumber),
-                        protocol: "vless",
-                        tag: $rmk,
-                        settings: {clients: [{id: $uid}], decryption: "none"},
+                inb_data=$(jq -n \
+                    --arg port "$port" --arg uid "$uid" --arg priv "$priv" --arg pbk "$pub" --arg sni "$sni" --arg sid "$sid" --arg path "$path" --arg rmk "$remark" \
+                    "{
+                        listen: \"::\",
+                        port: (\$port|tonumber),
+                        protocol: \"vless\",
+                        tag: \$rmk,
+                        settings: {clients: [{id: \$uid}], decryption: \"none\"},
                         streamSettings: {
-                            network: "xhttp",
-                            security: "reality",
-                            xhttpSettings: {path: $path, host: $sni, mode: "auto"},
-                            realitySettings: {show: false, dest: ($sni + ":443"), xver: 0, serverNames: [$sni], privateKey: $priv, shortIds: [$sid]}
+                            network: \"xhttp\",
+                            security: \"reality\",
+                            xhttpSettings: {path: \$path, host: \$sni, mode: \"auto\"},
+                            realitySettings: ${r_settings}
                         },
-                        sniffing: {enabled: true, destOverride: ["http", "tls", "quic"]},
-                        _meta: {proto: "vless", trans: "xhttp", sec: "reality", pbk: $pbk, sni: $sni, sid: $sid, uid: $uid, path: $path}
-                    }')
+                        sniffing: {enabled: true, destOverride: [\"http\", \"tls\", \"quic\"]},
+                        _meta: {proto: \"vless\", trans: \"xhttp\", sec: \"reality\", pbk: \$pbk, sni: \$sni, sid: \$sid, uid: \$uid, path: \$path}
+                    }")
             else
                 remark="VLESS-Reality-${port}"
-                inb_data=$(jq -n                     --arg port "$port" --arg uid "$uid" --arg priv "$priv" --arg pbk "$pub" --arg sni "$sni" --arg sid "$sid" --arg rmk "$remark"                     '{
-                        listen: "::",
-                        port: ($port|tonumber),
-                        protocol: "vless",
-                        tag: $rmk,
-                        settings: {clients: [{id: $uid, flow: "xtls-rprx-vision"}], decryption: "none"},
+                inb_data=$(jq -n \
+                    --arg port "$port" --arg uid "$uid" --arg priv "$priv" --arg pbk "$pub" --arg sni "$sni" --arg sid "$sid" --arg rmk "$remark" \
+                    "{
+                        listen: \"::\",
+                        port: (\$port|tonumber),
+                        protocol: \"vless\",
+                        tag: \$rmk,
+                        settings: {clients: [{id: \$uid, flow: \"xtls-rprx-vision\"}], decryption: \"none\"},
                         streamSettings: {
-                            network: "raw",
-                            security: "reality",
-                            realitySettings: {show: false, dest: ($sni + ":443"), xver: 0, serverNames: [$sni], privateKey: $priv, shortIds: [$sid]}
+                            network: \"raw\",
+                            security: \"reality\",
+                            realitySettings: ${r_settings}
                         },
-                        sniffing: {enabled: true, destOverride: ["http", "tls", "quic"]},
-                        _meta: {proto: "vless", trans: "raw", sec: "reality", pbk: $pbk, sni: $sni, sid: $sid, uid: $uid, flow: "xtls-rprx-vision"}
-                    }')
+                        sniffing: {enabled: true, destOverride: [\"http\", \"tls\", \"quic\"]},
+                        _meta: {proto: \"vless\", trans: \"raw\", sec: \"reality\", pbk: \$pbk, sni: \$sni, sid: \$sid, uid: \$uid, flow: \"xtls-rprx-vision\"}
+                    }")
             fi
             ;;
 
@@ -654,6 +702,7 @@ show_nodes() {
     [ ! -f "$CONF" ] && { err "配置文件不存在"; sleep 1; return 1; }
 
     while true; do
+        clear 2>/dev/null || true
         local count; count=$(jq '.inbounds | length' "$CONF" 2>/dev/null || echo 0)
         if [ "$count" -eq 0 ]; then
             info "暂无配置任何节点"
@@ -690,7 +739,7 @@ delete_node() {
     list_inbounds 1
     echo ""
 
-    local sel; sel=$(ask "输入要删除的节点编号 (回车取消)" "")
+    local sel; sel=$(ask "输入要删除的节点编号 (回车返回)" "")
     [ -z "$sel" ] && return 0
     [[ ! "$sel" =~ ^[0-9]+$ ]] && { err "编号必须是纯数字"; sleep 1; return 1; }
 
@@ -749,7 +798,7 @@ uninstall_xray() {
 
     info "清除核心程序、配置、证书与全部数据..."
     rm -rf "$BIN" "/usr/local/bin/xraym"
-    rm -rf "$CONF_DIR" "/usr/local/share/xray" "/var/log/xray" "/run/xray.pid" "/etc/logrotate.d/xray"
+    rm -rf "$CONF_DIR" "/usr/local/share/xray" "/var/log/xray" "/run/xray.pid" "/etc/logrotate.d/xray" "$IP_CACHE"
     userdel -r xray 2>/dev/null || deluser xray 2>/dev/null || true
     groupdel xray 2>/dev/null || true
 
@@ -764,6 +813,12 @@ main_menu() {
     check_deps
     refresh_ips
     check_update_async
+
+    # 首次载入并缓存本地核心版本 (避免循环中重复 fork 核心进程)
+    if [ -f "$BIN" ] && [ -z "$XRAY_LOCAL_VER" ]; then
+        XRAY_LOCAL_VER=$("$BIN" version 2>/dev/null | head -n1 | awk '{print $2}')
+    fi
+
     while true; do
         clear 2>/dev/null || true
         local st_color="${C_RED}●${C_RESET}" st_text="停止"
@@ -771,7 +826,7 @@ main_menu() {
 
         local ver="未安装" core_action="安装核心" update_tag=""
         if [ -f "$BIN" ]; then
-            ver=$("$BIN" version 2>/dev/null | head -n1 | awk '{print $2}')
+            [ -n "$XRAY_LOCAL_VER" ] && ver="$XRAY_LOCAL_VER" || ver=$("$BIN" version 2>/dev/null | head -n1 | awk '{print $2}')
             core_action="更新核心"
             if [ -f "$VER_CACHE" ]; then
                 local latest_ver; latest_ver=$(tr -d ' \r\n' < "$VER_CACHE" 2>/dev/null || true)
@@ -798,19 +853,21 @@ main_menu() {
             ip_str="IP: 未检测到"
         fi
 
-        echo -e "${C_BOLD}Xray-Core${C_RESET} ${ver}${update_tag} [${st_color} ${st_text}] ${C_DIM}BBR: ${bbr_st}${C_RESET}"
-        echo -e "节点: ${node_cnt} 个 | ${ip_str}"
-        echo ""
-        echo -e "${C_CYAN}1.${C_RESET} 节点列表"
-        echo -e "${C_CYAN}2.${C_RESET} 添加节点"
-        echo -e "${C_CYAN}3.${C_RESET} 修改节点"
-        echo -e "${C_CYAN}4.${C_RESET} 删除节点"
-        echo -e "${C_CYAN}5.${C_RESET} 服务管理"
-        echo -e "${C_CYAN}6.${C_RESET} BBR 算法"
-        echo -e "${C_CYAN}7.${C_RESET} ${core_action}"
-        echo -e "${C_RED}8.${C_RESET} 卸载 Xray"
-        echo -e "${C_DIM}0. 退出面板${C_RESET}"
-        echo ""
+        # 单次原子渲染输出整块主面板，消除终端逐行抖动
+        printf "%b\n" "\
+${C_BOLD}Xray-Core${C_RESET} ${ver}${update_tag} [${st_color} ${st_text}] ${C_DIM}BBR: ${bbr_st}${C_RESET}
+节点: ${node_cnt} 个 | ${ip_str}
+
+${C_CYAN}1.${C_RESET} 节点列表
+${C_CYAN}2.${C_RESET} 添加节点
+${C_CYAN}3.${C_RESET} 修改节点
+${C_CYAN}4.${C_RESET} 删除节点
+${C_CYAN}5.${C_RESET} 服务管理
+${C_CYAN}6.${C_RESET} BBR 算法
+${C_CYAN}7.${C_RESET} ${core_action}
+${C_RED}8.${C_RESET} 卸载 Xray
+${C_DIM}0. 退出面板${C_RESET}
+"
 
         case "$(ask "请选择" "0")" in
             1) show_nodes ;;
