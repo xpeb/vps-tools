@@ -31,36 +31,37 @@ ARCH="64"
 ok()   { echo -e "${C_GREEN}✓${C_RESET} $*"; }
 err()  { echo -e "${C_RED}✗${C_RESET} $*" >&2; }
 info() { echo -e "${C_CYAN}›${C_RESET} $*"; }
-gen_uuid() { cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16; }
+gen_uuid() {
+    if [ -x "$BIN" ]; then
+        "$BIN" uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16
+    else
+        cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16
+    fi
+}
 
 setup_shortcut() {
     local target="/usr/local/bin/xraym"
-    local persist_script="$CONF_DIR/xray.sh"
-    mkdir -p "$CONF_DIR" /usr/local/bin 2>/dev/null || true
+    mkdir -p /usr/local/bin 2>/dev/null || true
 
     local cur_src="${BASH_SOURCE[0]}"
     local real_src=""
     [ -n "$cur_src" ] && real_src=$(readlink -f "$cur_src" 2>/dev/null || echo "$cur_src")
 
-    # 如果通过 bash <(curl ...) 或匿名管道执行，当前路径为 /dev/fd/* 或不存在实体文件
+    # 如果当前运行的已经是 /usr/local/bin/xraym 实体，确保权限即可
+    if [ "$real_src" = "$target" ] && [ -f "$target" ] && [ ! -L "$target" ]; then
+        chmod +x "$target" 2>/dev/null || true
+        return 0
+    fi
+
+    # 如果通过 bash <(curl ...) 或匿名管道执行，当前路径为 /dev/fd/*
     if [ -z "$real_src" ] || [[ "$real_src" =~ ^/dev/fd/|^/proc/ ]] || [ ! -f "$real_src" ]; then
-        if ! curl -fsSL -m 5 https://raw.githubusercontent.com/xpeb/vps-tools/main/xray.sh -o "$persist_script" 2>/dev/null || [ ! -s "$persist_script" ]; then
-            # 备用回退: 若离线或受限，尝试从当前进程源码流 dump
-            cat "$cur_src" > "$persist_script" 2>/dev/null || true
-        fi
-        if [ -s "$persist_script" ]; then
-            chmod +x "$persist_script" 2>/dev/null || true
-            ln -sf "$persist_script" "$target" 2>/dev/null || cp -f "$persist_script" "$target" 2>/dev/null || true
+        if ! curl -fsSL -m 5 https://raw.githubusercontent.com/xpeb/vps-tools/main/xray.sh -o "$target" 2>/dev/null || [ ! -s "$target" ]; then
+            cat "$cur_src" > "$target" 2>/dev/null || true
         fi
     else
-        # 从本地实体磁盘文件运行
-        if [ "$real_src" != "$persist_script" ] && [ "$real_src" != "$target" ]; then
-            cp -f "$real_src" "$persist_script" 2>/dev/null || true
-            chmod +x "$persist_script" 2>/dev/null || true
-            ln -sf "$persist_script" "$target" 2>/dev/null || true
-        else
-            ln -sf "$real_src" "$target" 2>/dev/null || true
-        fi
+        # 从本地任意实体文件运行（如 /root/xray.sh），直接安装为独立实体程序
+        rm -f "$target" 2>/dev/null || true
+        cp -f "$real_src" "$target" 2>/dev/null || true
     fi
     chmod +x "$target" 2>/dev/null || true
 }
@@ -100,9 +101,9 @@ check_deps() {
     if [ -n "$missing" ]; then
         info "安装必要依赖:${missing}..."
         if command -v apt-get >/dev/null 2>&1; then
-            apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $missing >/dev/null 2>&1
+            apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends ${missing} >/dev/null 2>&1
         elif command -v apk >/dev/null 2>&1; then
-            apk update -q && apk add -q $missing
+            apk update -q && apk add -q ${missing}
         fi
     fi
 }
@@ -117,21 +118,47 @@ ask() {
     echo "${val:-$def}"
 }
 
-ask_port() {
-    local prompt="$1" def="$2" p=""
-    while true; do
-        p=$(ask "$prompt" "$def")
-        if [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ]; then
-            echo "$p"
-            return 0
-        fi
-        err "端口无效，请输入 1-65535 之间的纯数字"
-    done
-}
-
 is_port_used() {
     local p="$1"
-    ss -tlun 2>/dev/null | grep -qw ":${p}\b"
+    ss -tlun 2>/dev/null | grep -E -q "[:.]${p}\b"
+}
+
+ask_port() {
+    local prompt="$1" def="$2" ignore_idx="${3:-}" p=""
+    while true; do
+        p=$(ask "$prompt" "$def")
+        if [[ ! "$p" =~ ^[0-9]+$ ]] || [ "$p" -lt 1 ] || [ "$p" -gt 65535 ]; then
+            err "端口无效，请输入 1-65535 之间的纯数字"
+            continue
+        fi
+
+        # 1. 检查是否与配置中现有的其他节点冲突
+        if [ -s "$CONF" ]; then
+            local conflict_tag
+            conflict_tag=$(jq -r --arg port "$p" --argjson ig "${ignore_idx:--1}" '
+                .inbounds | to_entries[] | select(.key != $ig and .value.port == ($port|tonumber)) | .value.tag // ("节点" + (.key|tostring))
+            ' "$CONF" 2>/dev/null | head -n1)
+            if [ -n "$conflict_tag" ]; then
+                err "端口 ${p} 已被现有节点 [${conflict_tag}] 占用，请更换其他端口"
+                continue
+            fi
+        fi
+
+        # 2. 检查是否被系统外部程序占用
+        if is_port_used "$p"; then
+            local own_port=""
+            if [ -n "$ignore_idx" ] && [ "$ignore_idx" -ge 0 ] 2>/dev/null; then
+                own_port=$(jq -r --argjson ig "$ignore_idx" '.inbounds[$ig].port // empty' "$CONF" 2>/dev/null)
+            fi
+            if [ "$p" != "$own_port" ]; then
+                err "端口 ${p} 已被系统其他程序占用，请更换其他端口"
+                continue
+            fi
+        fi
+
+        echo "$p"
+        return 0
+    done
 }
 
 rand_port() {
@@ -219,12 +246,7 @@ ensure_xray_user() {
 init_env() {
     ensure_xray_user
     if [ ! -s "$CONF" ]; then
-        echo '{
-  "log": {"loglevel": "warning"},
-  "inbounds": [],
-  "outbounds": [{"protocol": "freedom", "tag": "direct"}, {"protocol": "blackhole", "tag": "block"}],
-  "routing": {"domainStrategy": "IPIfNonMatch", "rules": [{"type": "field", "ip": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "fc00::/7", "fe80::/10"], "outboundTag": "block"}]}
-}' > "$CONF"
+        echo '{"log":{"loglevel":"warning"},"inbounds":[],"outbounds":[{"protocol":"freedom","tag":"direct"},{"protocol":"blackhole","tag":"block"}],"routing":{"domainStrategy":"IPIfNonMatch","rules":[{"type":"field","ip":["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","127.0.0.0/8","fc00::/7","fe80::/10"],"outboundTag":"block"}]}}' > "$CONF"
         chown -R xray:xray "$CONF_DIR" 2>/dev/null || true
         chmod 600 "$CONF" 2>/dev/null || true
     fi
@@ -340,26 +362,79 @@ install_core() {
 ensure_self_cert() {
     local domain="${1:-www.nvidia.com}"
     local crt="$CERTS_DIR/cert.crt" key="$CERTS_DIR/priv.key"
+    mkdir -p "$CERTS_DIR" 2>/dev/null || true
+
     if [ ! -s "$crt" ] || [ ! -s "$key" ]; then
-        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -sha256 -days 3650             -keyout "$key" -out "$crt" -subj "/CN=${domain}" >/dev/null 2>&1
+        if [ -x "$BIN" ]; then
+            # 优先使用 Xray 原生内置的 TLS 工具箱生成 ECDSA P-256 证书
+            "$BIN" tls cert -domain="$domain" -name="$domain" -org="$domain" -expire=87600h -file="$CERTS_DIR/cert" >/dev/null 2>&1
+            # Xray tls cert 会生成 cert.crt 和 cert.key，统一为 priv.key 命名规范
+            if [ -f "$CERTS_DIR/cert.key" ]; then
+                mv -f "$CERTS_DIR/cert.key" "$key" 2>/dev/null || true
+            fi
+        fi
+        # 降级兜底方案
+        if [ ! -s "$crt" ] || [ ! -s "$key" ]; then
+            openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -sha256 -days 3650 \
+                -keyout "$key" -out "$crt" -subj "/CN=${domain}" >/dev/null 2>&1
+        fi
         chmod 600 "$key" "$crt" 2>/dev/null || true
         chown xray:xray "$key" "$crt" 2>/dev/null || true
     fi
 }
 
-# 5. 配置检验与原子替换
+# 5. 配置检验与原子替换 (含全局重复端口断言与故障回滚机制)
 apply_config_test() {
     local tmp_cfg="$1" err_msg=""
+    local bak_cfg="${CONF}.bak"
+    local was_online=false
+    is_running && was_online=true
+
+    # 防线 A: 全局端口防冲突断言 (Xray run -test 不校验端口重复绑定，必须严格把关)
+    local dup_port
+    dup_port=$(jq -r '[.inbounds[].port] | group_by(.) | map(select(length > 1)) | .[0][0] // empty' "$tmp_cfg" 2>/dev/null)
+    if [ -n "$dup_port" ]; then
+        rm -f "$tmp_cfg"
+        err "配置冲突: 端口 ${dup_port} 在多个节点中重复绑定，已取消更改"
+        return 1
+    fi
+
     if err_msg=$("$BIN" run -test -format=json -c "$tmp_cfg" 2>&1); then
-        mv "$tmp_cfg" "$CONF"
+        # 1. 备份当前旧配置用于容灾
+        if [ -f "$CONF" ]; then
+            cp -f "$CONF" "$bak_cfg" 2>/dev/null || true
+        fi
+
+        # 2. 覆盖并生效新配置
+        mv -f "$tmp_cfg" "$CONF"
         chown -R xray:xray "$CONF_DIR" 2>/dev/null || true
         chmod 600 "$CONF" 2>/dev/null || true
         svc restart
+
+        # 3. 进程存活性健康检查 (防范端口被系统隐蔽占用导致的启动瞬崩)
+        sleep 0.8
+        if [ "$was_online" = "true" ] && ! is_running; then
+            err "内核启动失败 (检测到端口冲突或底层异常)，正在自动回滚原配置..."
+            if [ -f "$bak_cfg" ]; then
+                mv -f "$bak_cfg" "$CONF"
+                svc restart
+                sleep 0.5
+            fi
+            if is_running; then
+                ok "已成功回滚至原配置，服务恢复正常运行"
+            else
+                err "回滚后仍未恢复，请检查系统端口或日志"
+            fi
+            rm -f "$bak_cfg" "$tmp_cfg" 2>/dev/null || true
+            return 1
+        fi
+
+        rm -f "$bak_cfg" 2>/dev/null || true
         ok "配置已验证并加载"
         return 0
     else
         if grep -q '"protocol": *"hysteria"' "$tmp_cfg" 2>/dev/null && [[ "$err_msg" == *"unknown config id: hysteria"* || "$err_msg" == *"unknown transport protocol: hysteria"* ]]; then
-            mv "$tmp_cfg" "$CONF"
+            mv -f "$tmp_cfg" "$CONF"
             chmod 600 "$CONF"
             svc restart
             ok "配置已保存加载 (注: 当前核心提示非原生 hysteria 协议)"
@@ -398,56 +473,20 @@ list_inbounds() {
 # 6. 单一数据源：统一生成标准客户端分享链接
 build_link() {
     local target="$1" host="$2"
-    local proto port tag meta
-    proto=$(jq -r '.protocol' <<< "$target")
-    port=$(jq -r '.port' <<< "$target")
-    tag=$(jq -r '.tag // "node"' <<< "$target")
-    meta=$(jq -r '._meta // {}' <<< "$target")
-
-    case "$proto" in
-        vless)
-            local uid pbk sni sid trans path enc_path
-            uid=$(jq -r '.uid // empty' <<< "$meta")
-            pbk=$(jq -r '.pbk // empty' <<< "$meta")
-            sni=$(jq -r '.sni // "www.nvidia.com"' <<< "$meta")
-            sid=$(jq -r '.sid // empty' <<< "$meta")
-            trans=$(jq -r '.trans // "raw"' <<< "$meta")
-            if [ "$trans" = "xhttp" ]; then
-                path=$(jq -r '.path // "/xhttp"' <<< "$meta")
-                enc_path=$(printf '%s' "$path" | jq -sRr @uri)
-                echo "vless://${uid}@${host}:${port}?security=reality&encryption=none&pbk=${pbk}&headerType=none&type=xhttp&path=${enc_path}&mode=auto&sni=${sni}&sid=${sid}#${tag}"
+    jq -r --arg host "$host" '
+        .protocol as $p | .port as $port | (.tag // "node") as $tag | (._meta // {}) as $m |
+        if $p == "vless" then
+            if ($m.trans // "raw") == "xhttp" then
+                "vless://" + ($m.uid // "") + "@" + $host + ":" + ($port|tostring) + "?security=reality&encryption=none&pbk=" + ($m.pbk // "") + "&headerType=none&type=xhttp&path=" + (($m.path // "/xhttp")|@uri) + "&mode=auto&sni=" + ($m.sni // "www.nvidia.com") + "&sid=" + ($m.sid // "") + "#" + $tag
             else
-                echo "vless://${uid}@${host}:${port}?security=reality&encryption=none&pbk=${pbk}&headerType=none&type=raw&flow=xtls-rprx-vision&sni=${sni}&sid=${sid}#${tag}"
-            fi
-            ;;
-        trojan)
-            local pass sni
-            pass=$(jq -r '.pass // empty' <<< "$meta")
-            sni=$(jq -r '.sni // "www.nvidia.com"' <<< "$meta")
-            echo "trojan://${pass}@${host}:${port}?security=tls&allowInsecure=1&sni=${sni}#${tag}"
-            ;;
-        hysteria)
-            local pass sni
-            pass=$(jq -r '.pass // empty' <<< "$meta")
-            sni=$(jq -r '.sni // "www.nvidia.com"' <<< "$meta")
-            echo "hysteria2://${pass}@${host}:${port}/?insecure=1&sni=${sni}#${tag}"
-            ;;
-        shadowsocks)
-            local method pass b64
-            method=$(jq -r '.method // "2022-blake3-aes-128-gcm"' <<< "$meta")
-            pass=$(jq -r '.pass // empty' <<< "$meta")
-            b64=$(printf '%s:%s' "$method" "$pass" | base64 | tr -d '\n')
-            echo "ss://${b64}@${host}:${port}#${tag}"
-            ;;
-        vmess)
-            local uid path vmess_json b64_vmess
-            uid=$(jq -r '.uid // empty' <<< "$meta")
-            path=$(jq -r '.path // "/ws"' <<< "$meta")
-            vmess_json=$(jq -cn                 --arg ps "$tag" --arg add "$host" --arg port "$port" --arg id "$uid" --arg path "$path"                 '{v: "2", ps: $ps, add: $add, port: ($port|tonumber), id: $id, aid: 0, net: "ws", type: "none", host: "", path: $path, tls: ""}')
-            b64_vmess=$(printf '%s' "$vmess_json" | base64 | tr -d '\n')
-            echo "vmess://${b64_vmess}"
-            ;;
-    esac
+                "vless://" + ($m.uid // "") + "@" + $host + ":" + ($port|tostring) + "?security=reality&encryption=none&pbk=" + ($m.pbk // "") + "&headerType=none&type=raw&flow=" + ($m.flow // "xtls-rprx-vision") + "&sni=" + ($m.sni // "www.nvidia.com") + "&sid=" + ($m.sid // "") + "#" + $tag
+            end
+        elif $p == "trojan" then "trojan://" + ($m.pass // "") + "@" + $host + ":" + ($port|tostring) + "?security=tls&allowInsecure=1&sni=" + ($m.sni // "www.nvidia.com") + "#" + $tag
+        elif $p == "hysteria" then "hysteria2://" + ($m.pass // "") + "@" + $host + ":" + ($port|tostring) + "/?insecure=1&sni=" + ($m.sni // "www.nvidia.com") + "#" + $tag
+        elif $p == "shadowsocks" then "ss://" + ((($m.method // "2022-blake3-aes-128-gcm") + ":" + ($m.pass // ""))|@base64) + "@" + $host + ":" + ($port|tostring) + "#" + $tag
+        elif $p == "vmess" then "vmess://" + ({v:"2",ps:$tag,add:$host,port:($port|tonumber),id:($m.uid // ""),aid:0,net:"ws",type:"none",host:"",path:($m.path // "/ws"),tls:""}|tojson|@base64)
+        else empty end
+    ' <<< "$target"
 }
 
 print_node_links() {
@@ -494,45 +533,16 @@ add_node() {
             local sid; sid=$(openssl rand -hex 4)
             local uid; uid=$(gen_uuid)
 
-            local r_settings="{show: false, dest: (\$sni + \":443\"), xver: 0, serverNames: [\$sni], privateKey: \$priv, shortIds: [\$sid]}"
+            local r_settings="{show:false,dest:(\$sni+\":443\"),xver:0,serverNames:[\$sni],privateKey:\$priv,shortIds:[\$sid]}"
             if [ "$trans_mode" = "2" ]; then
                 local path; path=$(ask "XHTTP 路径" "/xhttp-$(openssl rand -hex 3)")
                 remark="VLESS-XHTTP-${port}"
-                inb_data=$(jq -n \
-                    --arg port "$port" --arg uid "$uid" --arg priv "$priv" --arg pbk "$pub" --arg sni "$sni" --arg sid "$sid" --arg path "$path" --arg rmk "$remark" \
-                    "{
-                        listen: \"::\",
-                        port: (\$port|tonumber),
-                        protocol: \"vless\",
-                        tag: \$rmk,
-                        settings: {clients: [{id: \$uid}], decryption: \"none\"},
-                        streamSettings: {
-                            network: \"xhttp\",
-                            security: \"reality\",
-                            xhttpSettings: {path: \$path, host: \$sni, mode: \"auto\"},
-                            realitySettings: ${r_settings}
-                        },
-                        sniffing: {enabled: true, destOverride: [\"http\", \"tls\", \"quic\"]},
-                        _meta: {proto: \"vless\", trans: \"xhttp\", sec: \"reality\", pbk: \$pbk, sni: \$sni, sid: \$sid, uid: \$uid, path: \$path}
-                    }")
+                inb_data=$(jq -n --arg port "$port" --arg uid "$uid" --arg priv "$priv" --arg pbk "$pub" --arg sni "$sni" --arg sid "$sid" --arg path "$path" --arg rmk "$remark" \
+                    "{listen:\"::\",port:(\$port|tonumber),protocol:\"vless\",tag:\$rmk,settings:{clients:[{id:\$uid}],decryption:\"none\"},streamSettings:{network:\"xhttp\",security:\"reality\",xhttpSettings:{path:\$path,host:\$sni,mode:\"auto\"},realitySettings:${r_settings}},sniffing:{enabled:true,destOverride:[\"http\",\"tls\",\"quic\"]},_meta:{proto:\"vless\",trans:\"xhttp\",sec:\"reality\",pbk:\$pbk,sni:\$sni,sid:\$sid,uid:\$uid,path:\$path}}")
             else
                 remark="VLESS-Reality-${port}"
-                inb_data=$(jq -n \
-                    --arg port "$port" --arg uid "$uid" --arg priv "$priv" --arg pbk "$pub" --arg sni "$sni" --arg sid "$sid" --arg rmk "$remark" \
-                    "{
-                        listen: \"::\",
-                        port: (\$port|tonumber),
-                        protocol: \"vless\",
-                        tag: \$rmk,
-                        settings: {clients: [{id: \$uid, flow: \"xtls-rprx-vision\"}], decryption: \"none\"},
-                        streamSettings: {
-                            network: \"raw\",
-                            security: \"reality\",
-                            realitySettings: ${r_settings}
-                        },
-                        sniffing: {enabled: true, destOverride: [\"http\", \"tls\", \"quic\"]},
-                        _meta: {proto: \"vless\", trans: \"raw\", sec: \"reality\", pbk: \$pbk, sni: \$sni, sid: \$sid, uid: \$uid, flow: \"xtls-rprx-vision\"}
-                    }")
+                inb_data=$(jq -n --arg port "$port" --arg uid "$uid" --arg priv "$priv" --arg pbk "$pub" --arg sni "$sni" --arg sid "$sid" --arg rmk "$remark" \
+                    "{listen:\"::\",port:(\$port|tonumber),protocol:\"vless\",tag:\$rmk,settings:{clients:[{id:\$uid,flow:\"xtls-rprx-vision\"}],decryption:\"none\"},streamSettings:{network:\"raw\",security:\"reality\",realitySettings:${r_settings}},sniffing:{enabled:true,destOverride:[\"http\",\"tls\",\"quic\"]},_meta:{proto:\"vless\",trans:\"raw\",sec:\"reality\",pbk:\$pbk,sni:\$sni,sid:\$sid,uid:\$uid,flow:\"xtls-rprx-vision\"}}")
             fi
             ;;
 
@@ -542,21 +552,8 @@ add_node() {
             tune_system
             local pass; pass=$(ask "认证密码" "$(openssl rand -hex 8)")
             remark="Hy2-${port}"
-
-            inb_data=$(jq -n                 --arg port "$port" --arg pass "$pass" --arg crt "$CERTS_DIR/cert.crt" --arg key "$CERTS_DIR/priv.key" --arg sni "$sni" --arg rmk "$remark"                 '{
-                    listen: "::",
-                    port: ($port|tonumber),
-                    protocol: "hysteria",
-                    tag: $rmk,
-                    settings: {version: 2, users: [{auth: $pass}]},
-                    streamSettings: {
-                        network: "hysteria",
-                        hysteriaSettings: {version: 2},
-                        security: "tls",
-                        tlsSettings: {certificates: [{certificateFile: $crt, keyFile: $key}], alpn: ["h3"]}
-                    },
-                    _meta: {proto: "hysteria", pass: $pass, sni: $sni}
-                }')
+            inb_data=$(jq -n --arg port "$port" --arg pass "$pass" --arg crt "$CERTS_DIR/cert.crt" --arg key "$CERTS_DIR/priv.key" --arg sni "$sni" --arg rmk "$remark" \
+                '{listen:"::",port:($port|tonumber),protocol:"hysteria",tag:$rmk,settings:{version:2,users:[{auth:$pass}]},streamSettings:{network:"hysteria",hysteriaSettings:{version:2},security:"tls",tlsSettings:{certificates:[{certificateFile:$crt,keyFile:$key}],alpn:["h3"]}},_meta:{proto:"hysteria",pass:$pass,sni:$sni}}')
             ;;
 
         3) # Trojan-TLS
@@ -564,54 +561,24 @@ add_node() {
             ensure_self_cert "$domain"
             local pass; pass=$(openssl rand -hex 8)
             remark="Trojan-${port}"
-
-            inb_data=$(jq -n                 --arg port "$port" --arg pass "$pass" --arg crt "$CERTS_DIR/cert.crt" --arg key "$CERTS_DIR/priv.key" --arg domain "$domain" --arg rmk "$remark"                 '{
-                    listen: "::",
-                    port: ($port|tonumber),
-                    protocol: "trojan",
-                    tag: $rmk,
-                    settings: {clients: [{password: $pass}]},
-                    streamSettings: {
-                        network: "raw",
-                        security: "tls",
-                        tlsSettings: {certificates: [{certificateFile: $crt, keyFile: $key}], serverName: $domain}
-                    },
-                    sniffing: {enabled: true, destOverride: ["http", "tls"]},
-                    _meta: {proto: "trojan", pass: $pass, sni: $domain}
-                }')
+            inb_data=$(jq -n --arg port "$port" --arg pass "$pass" --arg crt "$CERTS_DIR/cert.crt" --arg key "$CERTS_DIR/priv.key" --arg domain "$domain" --arg rmk "$remark" \
+                '{listen:"::",port:($port|tonumber),protocol:"trojan",tag:$rmk,settings:{clients:[{password:$pass}]},streamSettings:{network:"raw",security:"tls",tlsSettings:{certificates:[{certificateFile:$crt,keyFile:$key}],serverName:$domain}},sniffing:{enabled:true,destOverride:["http","tls"]},_meta:{proto:"trojan",pass:$pass,sni:$domain}}')
             ;;
 
         4) # Shadowsocks 2022
             local method="2022-blake3-aes-128-gcm"
             local pass; pass=$(openssl rand -base64 16)
             remark="SS-${port}"
-
-            inb_data=$(jq -n                 --arg port "$port" --arg pass "$pass" --arg method "$method" --arg rmk "$remark"                 '{
-                    listen: "::",
-                    port: ($port|tonumber),
-                    protocol: "shadowsocks",
-                    tag: $rmk,
-                    settings: {method: $method, password: $pass, network: "tcp,udp"},
-                    streamSettings: {network: "raw"},
-                    _meta: {proto: "shadowsocks", method: $method, pass: $pass}
-                }')
+            inb_data=$(jq -n --arg port "$port" --arg pass "$pass" --arg method "$method" --arg rmk "$remark" \
+                '{listen:"::",port:($port|tonumber),protocol:"shadowsocks",tag:$rmk,settings:{method:$method,password:$pass,network:"tcp,udp"},streamSettings:{network:"raw"},_meta:{proto:"shadowsocks",method:$method,pass:$pass}}')
             ;;
 
         5) # VMess-WS
             local path; path=$(ask "WebSocket 路径" "/ws-$(openssl rand -hex 3)")
             local uid; uid=$(gen_uuid)
             remark="VMess-WS-${port}"
-
-            inb_data=$(jq -n                 --arg port "$port" --arg uid "$uid" --arg path "$path" --arg rmk "$remark"                 '{
-                    listen: "::",
-                    port: ($port|tonumber),
-                    protocol: "vmess",
-                    tag: $rmk,
-                    settings: {clients: [{id: $uid, alterId: 0}]},
-                    streamSettings: {network: "ws", security: "none", wsSettings: {path: $path}},
-                    sniffing: {enabled: true, destOverride: ["http", "tls"]},
-                    _meta: {proto: "vmess", uid: $uid, path: $path}
-                }')
+            inb_data=$(jq -n --arg port "$port" --arg uid "$uid" --arg path "$path" --arg rmk "$remark" \
+                '{listen:"::",port:($port|tonumber),protocol:"vmess",tag:$rmk,settings:{clients:[{id:$uid,alterId:0}]},streamSettings:{network:"ws",security:"none",wsSettings:{path:$path}},sniffing:{enabled:true,destOverride:["http","tls"]},_meta:{proto:"vmess",uid:$uid,path:$path}}')
             ;;
 
         *) err "无效选项"; return 1 ;;
@@ -641,14 +608,12 @@ edit_node() {
     [ -z "$target" ] && { err "无效编号"; sleep 1; return 1; }
 
     local cur_port cur_proto cur_trans meta new_port new_inb
-    cur_port=$(jq -r '.port' <<< "$target")
-    cur_proto=$(jq -r '.protocol' <<< "$target")
-    cur_trans=$(jq -r '.streamSettings.network // "raw"' <<< "$target")
+    read -r cur_port cur_proto cur_trans < <(jq -r '[.port, .protocol, (.streamSettings.network // "raw")] | @tsv' <<< "$target")
     meta=$(jq -r '._meta // {}' <<< "$target")
 
     echo ""
     info "正在修改节点 [${sel}] (${cur_proto}/${cur_trans}):"
-    new_port=$(ask_port "监听端口" "$cur_port")
+    new_port=$(ask_port "监听端口" "$cur_port" "$sel")
     new_inb=$(jq --arg port "$new_port" '.port = ($port|tonumber) | .tag = (.tag | sub("-[0-9]+$"; "-" + $port))' <<< "$target")
 
     case "$cur_proto" in
@@ -694,6 +659,8 @@ edit_node() {
     if apply_config_test "$tmp_cfg"; then
         ok "节点 [${sel}] 已成功修改并重启生效"
         sleep 1
+    else
+        read -rp "按回车键返回..." _
     fi
 }
 
