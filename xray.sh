@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -o pipefail
+umask 077
+
+[ "$(id -u)" -ne 0 ] && { echo -e "\033[31m✗\033[0m 请使用 root 权限运行此脚本" >&2; exit 1; }
 
 CONF_DIR="/usr/local/etc/xray"
 CONF="$CONF_DIR/config.json"
@@ -14,6 +17,8 @@ C_DIM="\033[2m"
 C_CYAN="\033[36m"
 C_GREEN="\033[32m"
 C_RED="\033[31m"
+C_YELLOW="\033[33m"
+VER_CACHE="$CONF_DIR/.latest_ver"
 
 PUB_IPV4=""
 PUB_IPV6=""
@@ -26,11 +31,47 @@ err()  { echo -e "${C_RED}✗${C_RESET} $*" >&2; }
 info() { echo -e "${C_CYAN}›${C_RESET} $*"; }
 gen_uuid() { cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16; }
 
+setup_shortcut() {
+    local self_path
+    self_path=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")
+    if [ -f "$self_path" ]; then
+        if [ ! -L /usr/local/bin/xraym ] || [ "$(readlink -f /usr/local/bin/xraym 2>/dev/null)" != "$self_path" ]; then
+            mkdir -p /usr/local/bin
+            ln -sf "$self_path" /usr/local/bin/xraym 2>/dev/null || true
+            chmod +x "$self_path" /usr/local/bin/xraym 2>/dev/null || true
+        fi
+    fi
+}
+
+check_update_async() {
+    [ -f "$BIN" ] || return 0
+    local now mtime=0
+    if [ -f "$VER_CACHE" ]; then
+        now=$(date +%s 2>/dev/null || echo 0)
+        mtime=$(stat -c %Y "$VER_CACHE" 2>/dev/null || echo 0)
+        [ $((now - mtime)) -le 3600 ] && return 0
+    fi
+    (
+        mkdir -p "$CONF_DIR" 2>/dev/null || true
+        local tag
+        tag=$(curl -fsSL -m 3 https://api.github.com/repos/XTLS/Xray-core/releases/latest 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null || true)
+        if [[ "$tag" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            if echo "${tag#v}" > "${VER_CACHE}.tmp.$$" 2>/dev/null; then
+                mv -f "${VER_CACHE}.tmp.$$" "$VER_CACHE" 2>/dev/null || rm -f "${VER_CACHE}.tmp.$$" 2>/dev/null
+            fi
+        fi
+    ) >/dev/null 2>&1 &
+}
+
 check_deps() {
     local missing="" cmd
     for cmd in curl unzip openssl jq; do
         command -v "$cmd" >/dev/null 2>&1 || missing+=" $cmd"
     done
+    command -v setcap >/dev/null 2>&1 || {
+        if command -v apt-get >/dev/null 2>&1; then missing+=" libcap2-bin"
+        elif command -v apk >/dev/null 2>&1; then missing+=" libcap"; fi
+    }
     if [ -n "$missing" ]; then
         info "安装必要依赖:${missing}..."
         if command -v apt-get >/dev/null 2>&1; then
@@ -47,23 +88,33 @@ ask() {
     echo "${val:-$def}"
 }
 
+ask_port() {
+    local prompt="$1" def="$2" p=""
+    while true; do
+        p=$(ask "$prompt" "$def")
+        if [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ]; then
+            echo "$p"
+            return 0
+        fi
+        err "端口无效，请输入 1-65535 之间的纯数字"
+    done
+}
+
+is_port_used() {
+    local p="$1"
+    ss -tlun 2>/dev/null | grep -qw ":${p}\b"
+}
+
 rand_port() {
     local p
     while p=$((RANDOM % 55535 + 10000)); do
-        ss -tlun 2>/dev/null | grep -q ":${p}\b" || { echo "$p"; break; }
+        is_port_used "$p" || { echo "$p"; break; }
     done
 }
 
 refresh_ips() {
     [ -n "$PUB_IPV4" ] || PUB_IPV4=$(curl -fs4 -m 2 https://api.ipify.org 2>/dev/null || curl -fs4 -m 2 https://icanhazip.com 2>/dev/null || echo "")
     [ -n "$PUB_IPV6" ] || PUB_IPV6=$(curl -fs6 -m 2 https://api6.ipify.org 2>/dev/null || curl -fs6 -m 2 https://icanhazip.com 2>/dev/null || echo "")
-}
-
-get_connect_host() {
-    refresh_ips
-    if [ -n "$PUB_IPV4" ]; then echo "$PUB_IPV4"
-    elif [ -n "$PUB_IPV6" ]; then echo "[${PUB_IPV6}]"
-    else echo "127.0.0.1"; fi
 }
 
 tune_system() {
@@ -82,9 +133,29 @@ enable_bbr() {
     if [[ "$cur" == *"bbr"* ]]; then ok "BBR 状态: 开启"; else err "BBR 状态: 关闭"; fi
 }
 
-# 2. 服务管理与初始化
+# 2. 安全用户与服务初始化
+ensure_xray_user() {
+    if ! id -u xray >/dev/null 2>&1; then
+        if command -v useradd >/dev/null 2>&1; then
+            useradd -r -s /usr/sbin/nologin -M -d /nonexistent -U xray 2>/dev/null || useradd -r -s /bin/false -M xray 2>/dev/null || true
+        elif command -v adduser >/dev/null 2>&1; then
+            adduser -S -H -h /dev/null -s /sbin/nologin -D -u 19999 xray 2>/dev/null || adduser -S -D -H xray 2>/dev/null || true
+        fi
+    fi
+    if [ -f "$BIN" ] && command -v setcap >/dev/null 2>&1; then
+        setcap 'cap_net_bind_service=+ep' "$BIN" 2>/dev/null || true
+    fi
+    mkdir -p "$CONF_DIR" "$CERTS_DIR" /var/log/xray
+    chown -R xray:xray "$CONF_DIR" /var/log/xray 2>/dev/null || true
+    chmod 700 "$CONF_DIR" "$CERTS_DIR" 2>/dev/null || true
+    if [ -f "$CONF" ]; then
+        chmod 600 "$CONF" 2>/dev/null || true
+    fi
+    chmod 750 /var/log/xray 2>/dev/null || true
+}
+
 init_env() {
-    mkdir -p "$CONF_DIR" "$CERTS_DIR"
+    ensure_xray_user
     if [ ! -s "$CONF" ]; then
         echo '{
   "log": {"loglevel": "warning"},
@@ -92,6 +163,8 @@ init_env() {
   "outbounds": [{"protocol": "freedom", "tag": "direct"}, {"protocol": "blackhole", "tag": "block"}],
   "routing": {"domainStrategy": "IPIfNonMatch", "rules": [{"type": "field", "ip": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "fc00::/7", "fe80::/10"], "outboundTag": "block"}]}
 }' > "$CONF"
+        chown -R xray:xray "$CONF_DIR" 2>/dev/null || true
+        chmod 600 "$CONF" 2>/dev/null || true
     fi
 }
 
@@ -102,14 +175,21 @@ svc() {
     elif command -v rc-service >/dev/null 2>&1; then
         rc-service "$SVC_NAME" "$act" 2>/dev/null || true
     else
-        pkill -x xray 2>/dev/null || true
-        [ "$act" = "start" ] || [ "$act" = "restart" ] && nohup "$BIN" run -c "$CONF" >/dev/null 2>&1 &
+        pkill -u xray -x xray 2>/dev/null || pkill -x xray 2>/dev/null || true
+        if [ "$act" = "start" ] || [ "$act" = "restart" ]; then
+            if id -u xray >/dev/null 2>&1; then
+                su -s /bin/sh xray -c "nohup '$BIN' run -c '$CONF' >/dev/null 2>&1 &" 2>/dev/null || nohup "$BIN" run -c "$CONF" >/dev/null 2>&1 &
+            else
+                nohup "$BIN" run -c "$CONF" >/dev/null 2>&1 &
+            fi
+        fi
     fi
 }
 
 is_running() { pgrep -x xray >/dev/null 2>&1; }
 
 install_service() {
+    ensure_xray_user
     if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
         cat << EOF > /etc/systemd/system/xray.service
 [Unit]
@@ -117,6 +197,12 @@ Description=Xray Core
 After=network.target
 
 [Service]
+Type=simple
+User=xray
+Group=xray
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
 ExecStart=${BIN} run -c ${CONF}
 Restart=on-failure
 RestartSec=5s
@@ -133,6 +219,7 @@ EOF
 description="Xray Core"
 command="${BIN}"
 command_args="run -c ${CONF}"
+command_user="xray:xray"
 command_background=true
 pidfile="/run/xray.pid"
 depend() { need net; }
@@ -146,11 +233,27 @@ EOF
 install_core() {
     echo ""
     info "查询 Xray 最新版本..."
-    local ver
+    local ver cur_ver=""
     ver=$(curl -fsSL https://api.github.com/repos/XTLS/Xray-core/releases/latest 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null || true)
-    { [ -z "$ver" ] || [ "$ver" = "null" ]; } && ver="v25.1.30"
-    info "下载目标版本: ${ver} (${ARCH})..."
+    { [ -z "$ver" ] || [ "$ver" = "null" ]; } && ver="v26.11.9"
 
+    if [ -f "$BIN" ]; then
+        cur_ver=$("$BIN" version 2>/dev/null | head -n1 | awk '{print $2}')
+        local cur_clean="${cur_ver#v}"
+        local target_clean="${ver#v}"
+        if [ "$cur_clean" = "$target_clean" ]; then
+            ok "当前已是最新版本 (${cur_ver})"
+            local re_inst; re_inst=$(ask "是否重新下载安装？[y/N]" "n")
+            if [[ ! "$re_inst" =~ ^[Yy]$ ]]; then
+                info "已取消安装"
+                return 0
+            fi
+        else
+            info "检测到更新: ${cur_ver} -> ${ver}"
+        fi
+    fi
+
+    info "下载目标版本: ${ver} (${ARCH})..."
     local url="https://github.com/XTLS/Xray-core/releases/download/${ver}/Xray-linux-${ARCH}.zip"
     local tmp; tmp=$(mktemp -d)
     if ! curl -fsSL "$url" -o "$tmp/xray.zip"; then
@@ -166,6 +269,7 @@ install_core() {
     init_env
     install_service
     tune_system
+    echo "${ver#v}" > "$VER_CACHE" 2>/dev/null || true
     ok "Xray 核心已就绪 (${ver})"
 }
 
@@ -176,6 +280,7 @@ ensure_self_cert() {
     if [ ! -s "$crt" ] || [ ! -s "$key" ]; then
         openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -sha256 -days 3650             -keyout "$key" -out "$crt" -subj "/CN=${domain}" >/dev/null 2>&1
         chmod 600 "$key" "$crt" 2>/dev/null || true
+        chown xray:xray "$key" "$crt" 2>/dev/null || true
     fi
 }
 
@@ -184,7 +289,8 @@ apply_config_test() {
     local tmp_cfg="$1" err_msg=""
     if err_msg=$("$BIN" run -test -format=json -c "$tmp_cfg" 2>&1); then
         mv "$tmp_cfg" "$CONF"
-        chmod 600 "$CONF"
+        chown -R xray:xray "$CONF_DIR" 2>/dev/null || true
+        chmod 600 "$CONF" 2>/dev/null || true
         svc restart
         ok "配置已验证并加载"
         return 0
@@ -208,6 +314,22 @@ apply_inbound() {
     tmp_cfg="$(mktemp).json"
     jq --argjson inb "$inbound_json" '.inbounds += [$inb]' "$CONF" > "$tmp_cfg"
     apply_config_test "$tmp_cfg"
+}
+
+list_inbounds() {
+    local simple="${1:-}"
+    jq -c '.inbounds | to_entries[]' "$CONF" 2>/dev/null | while read -r item; do
+        local idx p tag
+        idx=$(jq -r '.key' <<< "$item")
+        p=$(jq -r '.value.port' <<< "$item")
+        tag=$(jq -r '.value.tag // .value._meta.proto // "node"' <<< "$item")
+        if [ "$simple" = "1" ]; then
+            echo -e "[${C_RED}${idx}${C_RESET}] ${tag} (端口: ${p})"
+        else
+            local net; net=$(jq -r '.value.streamSettings.network // "raw"' <<< "$item")
+            echo -e "[${C_CYAN}${idx}${C_RESET}] ${tag} ${C_DIM}(端口: ${p} | 传输: ${net})${C_RESET}"
+        fi
+    done
 }
 
 # 6. 单一数据源：统一生成标准客户端分享链接
@@ -265,6 +387,30 @@ build_link() {
     esac
 }
 
+print_node_links() {
+    local target="$1" title="${2:-节点链接}"
+    refresh_ips
+    local tag; tag=$(jq -r '.tag // "node"' <<< "$target")
+    echo ""
+    info "${title} (${tag}):"
+
+    if [ -n "$PUB_IPV4" ] && [ -n "$PUB_IPV6" ]; then
+        local link4; link4=$(build_link "$target" "$PUB_IPV4")
+        local link6; link6=$(build_link "$target" "[${PUB_IPV6}]")
+        echo -e "\n${C_BOLD}IPv4 链接:${C_RESET}\n${C_CYAN}${link4}${C_RESET}"
+        echo -e "\n${C_BOLD}IPv6 链接:${C_RESET}\n${C_CYAN}${link6}${C_RESET}\n"
+    elif [ -n "$PUB_IPV4" ]; then
+        local link4; link4=$(build_link "$target" "$PUB_IPV4")
+        echo -e "\n${C_CYAN}${link4}${C_RESET}\n"
+    elif [ -n "$PUB_IPV6" ]; then
+        local link6; link6=$(build_link "$target" "[${PUB_IPV6}]")
+        echo -e "\n${C_CYAN}${link6}${C_RESET}\n"
+    else
+        local link; link=$(build_link "$target" "127.0.0.1")
+        echo -e "\n${C_CYAN}${link}${C_RESET}\n"
+    fi
+}
+
 # 7. 入站节点生成器 (严格按照 Xray 官方文档规范)
 add_node() {
     [ ! -f "$BIN" ] && { err "请先安装 Xray 核心 (选项 7)"; return 1; }
@@ -273,9 +419,17 @@ add_node() {
     echo -e "\n${C_BOLD}入站协议${C_RESET}\n${C_CYAN}1)${C_RESET} VLESS\n${C_CYAN}2)${C_RESET} Hysteria\n${C_CYAN}3)${C_RESET} Trojan\n${C_CYAN}4)${C_RESET} Shadowsocks\n${C_CYAN}5)${C_RESET} VMess\n"
 
     local choice; choice=$(ask "选择协议 [1-5]" "1")
-    local def_p; def_p=$(rand_port)
-    local port; port=$(ask "监听端口" "$def_p")
-    local host; host=$(get_connect_host)
+    local def_p="443"
+    case "$choice" in
+        1) def_p="443" ;;
+        2) def_p="8443" ;;
+        3) def_p="443" ;;
+        4) def_p="8388" ;;
+        5) def_p="80" ;;
+        *) err "无效选项"; return 1 ;;
+    esac
+    is_port_used "$def_p" && def_p=$(rand_port)
+    local port; port=$(ask_port "监听端口" "$def_p")
     local inb_data="" remark=""
 
     case "$choice" in
@@ -408,11 +562,7 @@ add_node() {
 
     [ -z "$inb_data" ] && return 1
     apply_inbound "$inb_data" || return 1
-
-    local link; link=$(build_link "$inb_data" "$host")
-    echo ""
-    ok "节点添加成功:"
-    echo -e "${C_CYAN}${link}${C_RESET}\n"
+    print_node_links "$inb_data" "节点添加成功"
     read -rp "按回车键继续..." _
 }
 
@@ -423,17 +573,12 @@ edit_node() {
     [ "$count" -eq 0 ] && { info "暂无节点可修改"; read -rp "按回车键返回..." _; return 0; }
 
     echo -e "\n${C_BOLD}修改入站节点${C_RESET}"
-    jq -c '.inbounds | to_entries[]' "$CONF" | while read -r item; do
-        local idx; idx=$(jq -r '.key' <<< "$item")
-        local p; p=$(jq -r '.value.port' <<< "$item")
-        local tag; tag=$(jq -r '.value.tag // .value._meta.proto // "node"' <<< "$item")
-        local trans; trans=$(jq -r '.value.streamSettings.network // "raw"' <<< "$item")
-        echo -e "[${C_CYAN}${idx}${C_RESET}] ${tag} ${C_DIM}(端口: ${p} | 传输: ${trans})${C_RESET}"
-    done
+    list_inbounds
     echo ""
 
     local sel; sel=$(ask "输入要修改的节点编号 (回车返回)" "")
     [ -z "$sel" ] && return 0
+    [[ ! "$sel" =~ ^[0-9]+$ ]] && { err "编号必须是纯数字"; read -rp "按回车键返回..." _; return 1; }
 
     local target; target=$(jq -c --argjson i "$sel" '.inbounds[$i] // empty' "$CONF" 2>/dev/null)
     [ -z "$target" ] && { err "无效编号"; read -rp "按回车键返回..." _; return 1; }
@@ -446,7 +591,7 @@ edit_node() {
 
     echo ""
     info "正在修改节点 [${sel}] (${cur_proto}/${cur_trans}):"
-    new_port=$(ask "监听端口" "$cur_port")
+    new_port=$(ask_port "监听端口" "$cur_port")
 
     case "$cur_proto" in
         vless)
@@ -505,30 +650,17 @@ show_nodes() {
     fi
 
     echo -e "\n${C_BOLD}当前节点列表 [${count}]${C_RESET}"
-    local host; host=$(get_connect_host)
-
-    jq -c '.inbounds | to_entries[]' "$CONF" | while read -r item; do
-        local idx; idx=$(jq -r '.key' <<< "$item")
-        local p; p=$(jq -r '.value.port' <<< "$item")
-        local tag; tag=$(jq -r '.value.tag // .value._meta.proto // "node"' <<< "$item")
-        local net; net=$(jq -r '.value.streamSettings.network // "raw"' <<< "$item")
-        local sec; sec=$(jq -r '.value.streamSettings.security // "none"' <<< "$item")
-        echo -e "[${C_CYAN}${idx}${C_RESET}] ${tag} ${C_DIM}(端口: ${p} | 传输: ${net} | 安全: ${sec})${C_RESET}"
-    done
+    list_inbounds
     echo ""
 
     local sel; sel=$(ask "输入编号查看分享链接 (回车返回)" "")
     [ -z "$sel" ] && return 0
+    [[ ! "$sel" =~ ^[0-9]+$ ]] && { err "编号必须是纯数字"; read -rp "按回车键返回..." _; return 1; }
 
     local target; target=$(jq -c --argjson i "$sel" '.inbounds[$i] // empty' "$CONF" 2>/dev/null)
     [ -z "$target" ] && { err "无效编号"; read -rp "按回车键返回..." _; return 1; }
 
-    local tag; tag=$(jq -r '.tag // "node"' <<< "$target")
-    local link; link=$(build_link "$target" "$host")
-
-    echo ""
-    info "节点链接 (${tag}):"
-    echo -e "${C_CYAN}${link}${C_RESET}\n"
+    print_node_links "$target" "节点链接"
     read -rp "按回车键继续..." _
 }
 
@@ -538,16 +670,12 @@ delete_node() {
     [ "$count" -eq 0 ] && { info "暂无节点可删"; read -rp "按回车键返回..." _; return 0; }
 
     echo -e "\n${C_BOLD}删除节点${C_RESET}"
-    jq -c '.inbounds | to_entries[]' "$CONF" | while read -r item; do
-        local idx; idx=$(jq -r '.key' <<< "$item")
-        local p; p=$(jq -r '.value.port' <<< "$item")
-        local tag; tag=$(jq -r '.value.tag // .value._meta.proto // "node"' <<< "$item")
-        echo -e "[${C_RED}${idx}${C_RESET}] ${tag} (端口: ${p})"
-    done
+    list_inbounds 1
     echo ""
 
     local sel; sel=$(ask "输入要删除的节点编号 (回车取消)" "")
     [ -z "$sel" ] && return 0
+    [[ ! "$sel" =~ ^[0-9]+$ ]] && { err "编号必须是纯数字"; read -rp "按回车键返回..." _; return 1; }
 
     local tmp_cfg; tmp_cfg="$(mktemp).json"
     if jq --argjson i "$sel" 'del(.inbounds[$i])' "$CONF" > "$tmp_cfg" 2>/dev/null; then
@@ -576,17 +704,68 @@ manage_service() {
     read -rp "按回车键继续..." _
 }
 
-# 12. 极简主界面看板
+# 12. 彻底卸载 Xray 与数据
+uninstall_xray() {
+    echo ""
+    local confirm; confirm=$(ask "确认彻底卸载 Xray 并清除全部数据？[y/N]" "n")
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        info "已取消卸载"
+        read -rp "按回车键返回..." _
+        return 0
+    fi
+
+    info "停止服务并清理进程..."
+    svc stop >/dev/null 2>&1 || true
+    pkill -9 -u xray 2>/dev/null || true
+    pkill -9 -x xray 2>/dev/null || true
+
+    info "移除系统服务配置..."
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable xray 2>/dev/null || true
+        rm -f /etc/systemd/system/xray.service /etc/systemd/system/xray@.service
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl reset-failed 2>/dev/null || true
+    elif command -v rc-service >/dev/null 2>&1; then
+        rc-update del xray default 2>/dev/null || true
+        rm -f /etc/init.d/xray
+    fi
+
+    info "清除核心程序、配置、证书与全部数据..."
+    rm -rf "$BIN" "/usr/local/bin/xraym"
+    rm -rf "$CONF_DIR" "/usr/local/share/xray" "/var/log/xray" "/run/xray.pid" "/etc/logrotate.d/xray"
+    userdel -r xray 2>/dev/null || deluser xray 2>/dev/null || true
+    groupdel xray 2>/dev/null || true
+
+    echo ""
+    ok "Xray 及所有数据文件已彻底卸载清理完毕"
+    exit 0
+}
+
+# 13. 极简主界面看板
 main_menu() {
+    setup_shortcut
     check_deps
     refresh_ips
+    check_update_async
     while true; do
         clear 2>/dev/null || true
         local st_color="${C_RED}●${C_RESET}" st_text="停止"
         is_running && st_color="${C_GREEN}●${C_RESET}" && st_text="运行中"
 
-        local ver="未安装"
-        [ -f "$BIN" ] && ver=$("$BIN" version 2>/dev/null | head -n1 | awk '{print $2}')
+        local ver="未安装" core_action="安装核心" update_tag=""
+        if [ -f "$BIN" ]; then
+            ver=$("$BIN" version 2>/dev/null | head -n1 | awk '{print $2}')
+            core_action="更新核心"
+            if [ -f "$VER_CACHE" ]; then
+                local latest_ver; latest_ver=$(tr -d ' \r\n' < "$VER_CACHE" 2>/dev/null || true)
+                if [ -n "$latest_ver" ]; then
+                    local cur_clean="${ver#v}" target_clean="${latest_ver#v}"
+                    if [ "$cur_clean" != "$target_clean" ] && [ "$(printf '%s\n%s\n' "$cur_clean" "$target_clean" | sort -V | head -n 1)" = "$cur_clean" ]; then
+                        update_tag=" ${C_YELLOW}(可更新: ${target_clean})${C_RESET}"
+                    fi
+                fi
+            fi
+        fi
 
         local node_cnt; node_cnt=$(jq '.inbounds | length' "$CONF" 2>/dev/null || echo 0)
         local bbr_st; bbr_st=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "off")
@@ -602,7 +781,7 @@ main_menu() {
             ip_str="IP: 未检测到"
         fi
 
-        echo -e "${C_BOLD}Xray-Core${C_RESET} ${ver} [${st_color} ${st_text}] ${C_DIM}BBR: ${bbr_st}${C_RESET}"
+        echo -e "${C_BOLD}Xray-Core${C_RESET} ${ver}${update_tag} [${st_color} ${st_text}] ${C_DIM}BBR: ${bbr_st}${C_RESET}"
         echo -e "节点: ${node_cnt} 个 | ${ip_str}"
         echo ""
         echo -e "${C_CYAN}1.${C_RESET} 节点列表"
@@ -610,8 +789,9 @@ main_menu() {
         echo -e "${C_CYAN}3.${C_RESET} 修改节点"
         echo -e "${C_CYAN}4.${C_RESET} 删除节点"
         echo -e "${C_CYAN}5.${C_RESET} 服务管理"
-        echo -e "${C_CYAN}6.${C_RESET} 开启 BBR"
-        echo -e "${C_CYAN}7.${C_RESET} 核心管理"
+        echo -e "${C_CYAN}6.${C_RESET} BBR 算法"
+        echo -e "${C_CYAN}7.${C_RESET} ${core_action}"
+        echo -e "${C_RED}8.${C_RESET} 卸载 Xray"
         echo -e "${C_DIM}0. 退出面板${C_RESET}"
         echo ""
 
@@ -623,12 +803,13 @@ main_menu() {
             5) manage_service ;;
             6) enable_bbr; read -rp "按回车键继续..." _ ;;
             7) install_core; read -rp "按回车键继续..." _ ;;
+            8) uninstall_xray ;;
             0|q|quit)
                 clear 2>/dev/null || true
                 echo -e "\n${C_CYAN}已退出管理面板${C_RESET}\n"
                 exit 0
                 ;;
-            *) err "请输入 0-7 之间的选项"; sleep 0.8 ;;
+            *) err "请输入 0-8 之间的选项"; sleep 0.8 ;;
         esac
     done
 }
