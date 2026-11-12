@@ -173,8 +173,11 @@ check_xray_update_async() {
         local tag tmp_cache="${XRAY_VER_CACHE}.tmp.$$"
         tag=$(get_latest_xray_version 2>/dev/null || true)
         if is_installed && [ -d "$XRAY_CONFIG_DIR" ] && [[ "$tag" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+ ]]; then
-            printf 'v%s\n' "${tag#v}" > "$tmp_cache" 2>/dev/null &&
+            if printf 'v%s\n' "${tag#v}" > "$tmp_cache" 2>/dev/null; then
                 mv -f "$tmp_cache" "$XRAY_VER_CACHE" 2>/dev/null || rm -f "$tmp_cache" 2>/dev/null
+            else
+                rm -f "$tmp_cache" 2>/dev/null
+            fi
         fi
     ) >/dev/null 2>&1 &
 }
@@ -200,16 +203,19 @@ header() {
         fi
     fi
 
-    local auto_str="${C_GRAY}自启 关${C_RESET}" bbr_str="${C_GRAY}BBR 关${C_RESET}" sep="${C_GRAY}·${C_RESET}"
+    local auto_str="${C_GRAY}自启 关${C_RESET}" bbr_str="${C_GRAY}BBR 关${C_RESET}" sep="${C_GRAY}│${C_RESET}"
     is_autostart_enabled && auto_str="${C_GREEN}自启 开${C_RESET}"
     is_bbr_enabled && bbr_str="${C_GREEN}BBR 开${C_RESET}"
     [ -z "$SERVER_IP" ] && get_public_ip
 
     local ip_info="${SERVER_IPV4:-${SERVER_IPV6:-未获取到 IP}}"
-    [ -n "$SERVER_IPV4" ] && [ -n "$SERVER_IPV6" ] && ip_info+=" (IPv6 就绪)"
+    [ -n "$SERVER_IPV4" ] && [ -n "$SERVER_IPV6" ] && ip_info+=" (双栈IPv6)"
 
-    echo -e "  ${C_BOLD}XRAY CORE${C_RESET}  ${status_str}  ${C_GRAY}(快捷命令: ${C_CYAN}xraym${C_GRAY})${C_RESET}"
-    echo -e "  ${C_GRAY}${OS_NAME:-Linux} ${sep} ${ip_info} ${sep} ${bbr_str} ${sep} ${auto_str} ${sep} $(get_node_count) 个节点${C_RESET}\n"
+    echo -e "  ${C_CYAN}┌────────────────────────────────────────────────────────┐${C_RESET}"
+    echo -e "  ${C_CYAN}│${C_RESET}  ${C_BOLD}Xray 管理面板${C_RESET} ${status_str}       ${C_GRAY}快捷命令: ${C_CYAN}xraym${C_RESET}  ${C_CYAN}│${C_RESET}"
+    echo -e "  ${C_CYAN}│${C_RESET}  ${C_GRAY}系统: ${OS_NAME:-Linux} ${sep} IP: ${ip_info}${C_RESET}"
+    echo -e "  ${C_CYAN}│${C_RESET}  ${C_GRAY}状态: ${bbr_str} ${sep} ${auto_str} ${sep} 节点数: $(get_node_count)${C_RESET}"
+    echo -e "  ${C_CYAN}└────────────────────────────────────────────────────────┘${C_RESET}\n"
 }
 
 check_root() { [ "$(id -u)" -eq 0 ] || { log_error "请使用 root 权限运行"; exit 1; }; }
@@ -303,7 +309,9 @@ get_public_ip() {
 
 apply_sysctl_dropin() {
     local sed_pat="$2" content="$3" conf="/etc/sysctl.d/${1}"
-    [ -f /etc/sysctl.conf ] && sed -i "$sed_pat" /etc/sysctl.conf 2>/dev/null || true
+    if [ -f /etc/sysctl.conf ]; then
+        sed -i "$sed_pat" /etc/sysctl.conf 2>/dev/null || true
+    fi
     if [ -d /etc/sysctl.d ]; then
         printf '%b' "$content" > "$conf"
         sysctl -p "$conf" >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1 || true
@@ -541,12 +549,22 @@ service_toggle_autostart() {
         log_warn "当前环境 (${INIT_TYPE}) 不支持开机自启管理"
         return 1
     fi
-    if is_autostart_enabled; then
-        [ "$INIT_TYPE" = "systemd" ] && systemctl disable xray >/dev/null 2>&1 || rc-update del xray default >/dev/null 2>&1
-        log_success "开机自启已关闭"
-    else
-        [ "$INIT_TYPE" = "systemd" ] && systemctl enable xray >/dev/null 2>&1 || rc-update add xray default >/dev/null 2>&1
-        log_success "开机自启已开启"
+    if [ "$INIT_TYPE" = "systemd" ]; then
+        if is_autostart_enabled; then
+            systemctl disable xray >/dev/null 2>&1
+            log_success "开机自启已关闭"
+        else
+            systemctl enable xray >/dev/null 2>&1
+            log_success "开机自启已开启"
+        fi
+    elif [ "$INIT_TYPE" = "openrc" ]; then
+        if is_autostart_enabled; then
+            rc-update del xray default >/dev/null 2>&1
+            log_success "开机自启已关闭"
+        else
+            rc-update add xray default >/dev/null 2>&1
+            log_success "开机自启已开启"
+        fi
     fi
 }
 
@@ -666,6 +684,7 @@ EOF
 verify_zip_dgst() {
     local zip_file="$1" dgst_file="$2" expected actual
     expected=$(awk -F'= *' '/^SHA2-256=/{gsub(/[[:space:]]/, "", $2); print tolower($2); exit}' "$dgst_file" 2>/dev/null)
+    [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || expected=$(grep -iEo '[0-9a-f]{64}' "$dgst_file" 2>/dev/null | head -n 1 | tr '[:upper:]' '[:lower:]')
     [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || return 1
     if command -v sha256sum >/dev/null 2>&1; then
         actual=$(sha256sum "$zip_file" 2>/dev/null | awk '{print tolower($1)}')
@@ -772,14 +791,11 @@ uninstall_xray() {
 }
 
 rand_str() {
-    local len="${1:-16}" s="" chunk="" tries=0
-    while [ "${#s}" -lt "$len" ] && [ "$tries" -lt 10 ]; do
-        tries=$((tries + 1))
-        chunk=$(openssl rand -base64 "$((len * 2))" 2>/dev/null || head -c "$((len * 2))" /dev/urandom 2>/dev/null | base64 2>/dev/null || true)
-        chunk=$(LC_ALL=C printf '%s' "$chunk" | tr -dc 'a-zA-Z0-9')
-        [ -z "$chunk" ] && chunk=$(awk -v l="$len" 'BEGIN{srand(); c="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"; for(i=0;i<l;i++) printf "%s", substr(c, int(rand()*62)+1, 1)}')
-        s+="$chunk"
-    done
+    local len="${1:-16}" s=""
+    s=$(LC_ALL=C tr -dc 'a-zA-Z0-9' < /dev/urandom 2>/dev/null | head -c "$len" || true)
+    if [ "${#s}" -lt "$len" ]; then
+        s=$(openssl rand -base64 "$((len * 2))" 2>/dev/null | tr -dc 'a-zA-Z0-9' || true)
+    fi
     printf '%s' "${s:0:$len}"
 }
 
@@ -895,7 +911,8 @@ get_cert_sha256() {
 generate_self_signed_cert() {
     local domain="${1:-www.cloudflare.com}" safe_sni
     safe_sni=$(sanitize_sni "$domain")
-    mkdir -p "$XRAY_CERTS_DIR" && chmod 700 "$XRAY_CERTS_DIR" 2>/dev/null || true
+    mkdir -p "$XRAY_CERTS_DIR"
+    chmod 700 "$XRAY_CERTS_DIR" 2>/dev/null || true
 
     CERT_CRT="$XRAY_CERTS_DIR/self_${safe_sni}.crt"
     CERT_KEY="$XRAY_CERTS_DIR/self_${safe_sni}.key"
@@ -917,7 +934,8 @@ request_acme_cert() {
     is_valid_domain "$domain" || { log_error "无效的域名格式: $domain"; return 1; }
     safe_sni=$(sanitize_sni "$domain")
 
-    mkdir -p "$XRAY_CERTS_DIR" && chmod 700 "$XRAY_CERTS_DIR" 2>/dev/null || true
+    mkdir -p "$XRAY_CERTS_DIR"
+    chmod 700 "$XRAY_CERTS_DIR" 2>/dev/null || true
     CERT_CRT="$XRAY_CERTS_DIR/acme_${safe_sni}.crt"
     CERT_KEY="$XRAY_CERTS_DIR/acme_${safe_sni}.key"
 
@@ -933,12 +951,20 @@ request_acme_cert() {
         "$acme_bin" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
     fi
 
-    local port80_was_running=0
+    local port80_was_running=0 port80_proc=""
     if is_port_used 80 tcp; then
-        if is_running; then
+        if command -v ss >/dev/null 2>&1; then
+            port80_proc=$(ss -tlnp 2>/dev/null | grep -E '[:.]80\s' | grep -o 'users:(("[^"]+"' | head -n 1 | cut -d'"' -f2 || true)
+        elif command -v lsof >/dev/null 2>&1; then
+            port80_proc=$(lsof -i :80 -sTCP:LISTEN -t 2>/dev/null | head -n 1 | xargs -r ps -o comm= 2>/dev/null || true)
+        fi
+
+        if is_running && { [ "$port80_proc" = "xray" ] || [ "$port80_proc" = "xray-core" ] || [ -z "$port80_proc" ]; }; then
             log_info "临时停止 Xray 服务以释放 80 端口验证证书..."
             svc stop
             port80_was_running=1
+        elif [ -n "$port80_proc" ]; then
+            log_warn "端口 80 已被 ${port80_proc} 占用，若证书申请失败请先停止该服务"
         else
             log_warn "端口 80 已被其他程序占用，如验证失败请先停用占用 80 端口的服务"
         fi
@@ -975,7 +1001,8 @@ request_acme_cert() {
 validate_and_apply_config() {
     local new_config="$1" tmp_dir tmp_cfg err_msg
     [ -z "$new_config" ] && { log_error "配置为空，已拒绝写入"; return 1; }
-    mkdir -p "$XRAY_CONFIG_DIR" && chmod 700 "$XRAY_CONFIG_DIR" 2>/dev/null || true
+    mkdir -p "$XRAY_CONFIG_DIR"
+    chmod 700 "$XRAY_CONFIG_DIR" 2>/dev/null || true
 
     tmp_dir=$(umask 077 && mktemp -d "$XRAY_CONFIG_DIR/.tmp.XXXXXX" 2>/dev/null) || {
         log_error "无法创建临时配置目录"
@@ -1104,10 +1131,17 @@ add_node_wizard() {
         def_port="$cur_port"
     else
         case "$protocol" in
-            shadowsocks) def_port=$(rand_port) ;;
+            shadowsocks) def_port="8388" ;;
             socks)       def_port="1080" ;;
             hysteria)    def_port="8443" ;;
-            *)           [ "$security" = "none" ] && def_port="80" ;;
+            trojan|vless|vmess)
+                if [ "$security" = "none" ]; then
+                    def_port="80"
+                else
+                    def_port="443"
+                fi ;;
+            *)
+                [ "$security" = "none" ] && def_port="80" || def_port="443" ;;
         esac
         is_port_used "$def_port" "$port_proto" && def_port=$(rand_port)
     fi
@@ -1152,7 +1186,8 @@ add_node_wizard() {
                     log_warn "证书或私钥文件不存在"
                     confirm "重新输入文件路径？" "y" || return 1
                 done
-                mkdir -p "$XRAY_CERTS_DIR" && chmod 700 "$XRAY_CERTS_DIR" 2>/dev/null || true
+                mkdir -p "$XRAY_CERTS_DIR"
+    chmod 700 "$XRAY_CERTS_DIR" 2>/dev/null || true
                 cert_id=$(rand_str 6)
                 cert_file="$XRAY_CERTS_DIR/custom_${safe_sni}_${cert_id}.crt"
                 key_file="$XRAY_CERTS_DIR/custom_${safe_sni}_${cert_id}.key"
@@ -1260,7 +1295,10 @@ parse_node_meta() {
 get_connect_host() {
     [ -n "$NODE_ADDR" ] && { format_url_host "$NODE_ADDR"; return; }
     if [ -n "$NODE_SNI" ]; then
-        { [ "$NODE_SEC" = "tls" ] && [ "$NODE_INSEC" != "1" ]; } || [ "$NODE_SEC" = "none" ] && { echo "$NODE_SNI"; return; }
+        if { [ "$NODE_SEC" = "tls" ] && [ "$NODE_INSEC" != "1" ]; } || [ "$NODE_SEC" = "none" ]; then
+            echo "$NODE_SNI"
+            return
+        fi
     fi
     [ -z "$SERVER_IP" ] && get_public_ip
     format_url_host "${SERVER_IP:-127.0.0.1}"
@@ -1268,7 +1306,11 @@ get_connect_host() {
 
 build_share_link() {
     local connect_host link="" trans_q="" _e=()
-    connect_host=$([ -n "${1:-}" ] && format_url_host "$1" || get_connect_host)
+    if [ -n "${1:-}" ]; then
+        connect_host=$(format_url_host "$1")
+    else
+        connect_host=$(get_connect_host)
+    fi
 
     mapfile -t _e < <(jq -rn \
         --arg rmk "$NODE_RMK" --arg path "$NODE_PATH" --arg cred "$NODE_CRED" \
@@ -1330,7 +1372,11 @@ build_share_link() {
 
 print_share_link() {
     local label="$1" host="${2:-}" link connect_host
-    connect_host=$([ -n "$host" ] && format_url_host "$host" || get_connect_host)
+    if [ -n "$host" ]; then
+        connect_host=$(format_url_host "$host")
+    else
+        connect_host=$(get_connect_host)
+    fi
     link=$(build_share_link "$host")
     echo -e "  ${C_BOLD}${label}${C_RESET}\n  ${C_CYAN}${link}${C_RESET}"
 
@@ -1445,7 +1491,8 @@ view_node_detail() {
 }
 
 render_node_table() {
-    printf "\n  ${C_GRAY}%-4s %-14s %-8s %-12s %-12s %s${C_RESET}\n\n" "#" "协议" "端口" "传输" "安全" "备注"
+    printf "\n  ${C_GRAY}%-4s %-14s %-8s %-12s %-12s %s${C_RESET}\n" "序号" "协议" "端口" "传输" "安全" "备注"
+    echo -e "  ${C_GRAY}────────────────────────────────────────────────────────────${C_RESET}"
     local i=1 p_port p_proto p_trans p_sec p_rmk
     while IFS=$'\t' read -r p_port p_proto p_trans p_sec p_rmk; do
         [ -z "$p_port" ] && continue
@@ -1633,7 +1680,9 @@ edit_single_node() {
 
 export_backup_archive() {
     [ ! -f "$XRAY_CONFIG" ] && { log_warn "当前暂无配置文件可备份"; pause; return 1; }
-    local out_file="/root/xray_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
+    local ts out_file
+    ts=$(date +%Y%m%d_%H%M%S 2>/dev/null || echo "$$")
+    out_file="/root/xray_backup_${ts}.tar.gz"
     mkdir -p /root
     if tar -czf "$out_file" -C /usr/local/etc xray 2>/dev/null; then
         chmod 600 "$out_file" 2>/dev/null || true
@@ -1682,22 +1731,37 @@ import_backup_archive() {
 
     ensure_xray_user
     get_public_ip force
+
+    # 跨机迁移端口冲突前置提示
+    local conflict_ports="" p proto
+    while IFS= read -r p; do
+        [ -z "$p" ] && continue
+        proto="both"
+        is_port_used "$p" "$proto" && conflict_ports+=" ${p}"
+    done < <(jq -r '.inbounds[]?.port // empty' "$XRAY_CONFIG" 2>/dev/null)
+    [ -n "$conflict_ports" ] && log_warn "检测到恢复节点端口在当前系统已处于占用状态:${conflict_ports}，可能导致服务启动失败"
+
     log_success "配置与证书已成功恢复！"
     is_running && { service_ctrl restart || true; }
     pause
 }
 
 backup_and_restore_menu() {
-    header
-    echo -e "  ${C_BOLD}Xray 配置备份与跨机迁移${C_RESET}\n"
-    echo -e "  ${C_CYAN}1.${C_RESET} 导出备份包 (打包当前 config.json 与证书目录)"
-    echo -e "  ${C_CYAN}2.${C_RESET} 导入恢复包 (从 .tar.gz 恢复配置与证书)\n"
     local sel
-    read -rp "  › 请选择 [1-2, 回车返回]: " sel || return 0
-    case "$sel" in
-        1) export_backup_archive ;;
-        2) import_backup_archive ;;
-    esac
+    while true; do
+        header
+        echo -e "  ${C_BOLD}配置备份与跨机迁移${C_RESET}\n"
+        echo -e "    ${C_CYAN}1.${C_RESET} 导出备份包  ${C_GRAY}(打包当前 config.json 及全部证书)${C_RESET}"
+        echo -e "    ${C_CYAN}2.${C_RESET} 导入恢复包  ${C_GRAY}(从 .tar.gz 恢复配置并校验端口)${C_RESET}"
+        echo -e "    ${C_GRAY}0. 返回主菜单 (回车)${C_RESET}\n"
+        read -rp "  › 请选择 [1-2, 回车返回]: " sel || return 0
+        [ -z "$sel" ] || is_cancel "$sel" && return 0
+        case "$sel" in
+            1) export_backup_archive ;;
+            2) import_backup_archive ;;
+            *) log_warn "请输入 1-2，或按回车返回" && sleep 0.8 ;;
+        esac
+    done
 }
 
 enable_bbr() {
@@ -1755,12 +1819,18 @@ main() {
     while true; do
         header
         is_installed && core_act="更新核心" || core_act="安装核心"
-        echo -e "  ${C_GRAY}节点${C_RESET}    ${C_CYAN}1${C_RESET} 节点列表    ${C_CYAN}2${C_RESET} 添加节点    ${C_CYAN}3${C_RESET} 修改节点    ${C_CYAN}4${C_RESET} 删除节点"
-        echo -e "  ${C_GRAY}服务${C_RESET}    ${C_CYAN}5${C_RESET} 重启服务    ${C_CYAN}6${C_RESET} 启动服务    ${C_CYAN}7${C_RESET} 停止服务    ${C_CYAN}8${C_RESET} 实时日志"
-        echo -e "  ${C_GRAY}系统${C_RESET}    ${C_CYAN}9${C_RESET} ${core_act}   ${C_CYAN}10${C_RESET} 开机自启   ${C_CYAN}11${C_RESET} BBR 算法   ${C_CYAN}12${C_RESET} 备份迁移"
-        echo -e "  ${C_GRAY}危险${C_RESET}   ${C_RED}13${C_RESET} 卸载核心\n"
+        echo -e "  ${C_BOLD}节点配置${C_RESET}"
+        echo -e "    ${C_CYAN}1.${C_RESET} 节点列表      ${C_CYAN}2.${C_RESET} 添加节点      ${C_CYAN}3.${C_RESET} 修改节点      ${C_CYAN}4.${C_RESET} 删除节点"
+        echo ""
+        echo -e "  ${C_BOLD}服务控制${C_RESET}"
+        echo -e "    ${C_CYAN}5.${C_RESET} 重启服务      ${C_CYAN}6.${C_RESET} 启动服务      ${C_CYAN}7.${C_RESET} 停止服务      ${C_CYAN}8.${C_RESET} 实时日志"
+        echo ""
+        echo -e "  ${C_BOLD}高级管理${C_RESET}"
+        echo -e "    ${C_CYAN}9.${C_RESET} ${core_act}     ${C_CYAN}10.${C_RESET} 开机自启    ${C_CYAN}11.${C_RESET} BBR 算法     ${C_CYAN}12.${C_RESET} 备份与迁移"
+        echo ""
+        echo -e "    ${C_RED}13.${C_RESET} 卸载 Xray    ${C_GRAY}0.${C_RESET} 退出面板 (回车)\n"
 
-        read -rp "  › 请选择 [1-13, 回车退出]: " choice || exit 0
+        read -rp "  › 请选择 [0-13, 回车退出]: " choice || exit 0
         if [ -z "$choice" ] || is_cancel "$choice"; then
             clear 2>/dev/null || true
             echo -e "\n  ${C_CYAN}已退出 Xray 管理面板${C_RESET} ${C_GRAY}(输入 xraym 可再次打开)${C_RESET}\n"
