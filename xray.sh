@@ -87,9 +87,6 @@ check_update_async() {
 }
 
 check_deps() {
-    # 快速自检，若常用工具均在直接 0ms 瞬间返回
-    command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 && command -v openssl >/dev/null 2>&1 && return 0
-
     local missing="" cmd
     for cmd in curl unzip openssl jq; do
         command -v "$cmd" >/dev/null 2>&1 || missing+=" $cmd"
@@ -119,12 +116,18 @@ ask() {
 }
 
 is_port_used() {
-    local p="$1"
-    ss -tlun 2>/dev/null | grep -E -q "[:.]${p}\b"
+    local p="$1" proto="${2:-}"
+    if [ "$proto" = "udp" ]; then
+        ss -uln 2>/dev/null | grep -E -q "[:.]${p}\b"
+    elif [ "$proto" = "tcp" ]; then
+        ss -tln 2>/dev/null | grep -E -q "[:.]${p}\b"
+    else
+        ss -tlun 2>/dev/null | grep -E -q "[:.]${p}\b"
+    fi
 }
 
 ask_port() {
-    local prompt="$1" def="$2" ignore_idx="${3:-}" p=""
+    local prompt="$1" def="$2" ignore_idx="${3:-}" check_proto="${4:-tcp}" p=""
     while true; do
         p=$(ask "$prompt" "$def")
         if [[ ! "$p" =~ ^[0-9]+$ ]] || [ "$p" -lt 1 ] || [ "$p" -gt 65535 ]; then
@@ -132,26 +135,30 @@ ask_port() {
             continue
         fi
 
-        # 1. 检查是否与配置中现有的其他节点冲突
+        # 1. 检查是否与配置中现有的其他节点发生协议层冲突 (TCP 与 UDP 互不干扰)
         if [ -s "$CONF" ]; then
             local conflict_tag
-            conflict_tag=$(jq -r --arg port "$p" --argjson ig "${ignore_idx:--1}" '
-                .inbounds | to_entries[] | select(.key != $ig and .value.port == ($port|tonumber)) | .value.tag // ("节点" + (.key|tostring))
+            conflict_tag=$(jq -r --arg port "$p" --argjson ig "${ignore_idx:--1}" --arg cur_t "$check_proto" '
+                def inb_type: if .protocol == "hysteria" then "udp" elif .protocol == "shadowsocks" then "both" else "tcp" end;
+                .inbounds | to_entries[] |
+                select(.key != $ig and .value.port == ($port|tonumber)) |
+                select($cur_t == "both" or (.value | inb_type) == "both" or (.value | inb_type) == $cur_t) |
+                .value.tag // ("节点" + (.key|tostring))
             ' "$CONF" 2>/dev/null | head -n1)
             if [ -n "$conflict_tag" ]; then
-                err "端口 ${p} 已被现有节点 [${conflict_tag}] 占用，请更换其他端口"
+                err "端口 ${p} 已被同协议族现有节点 [${conflict_tag}] 占用，请更换其他端口"
                 continue
             fi
         fi
 
-        # 2. 检查是否被系统外部程序占用
-        if is_port_used "$p"; then
+        # 2. 检查是否被系统外部程序占用 (精细匹配 TCP/UDP)
+        if is_port_used "$p" "$check_proto"; then
             local own_port=""
             if [ -n "$ignore_idx" ] && [ "$ignore_idx" -ge 0 ] 2>/dev/null; then
                 own_port=$(jq -r --argjson ig "$ignore_idx" '.inbounds[$ig].port // empty' "$CONF" 2>/dev/null)
             fi
             if [ "$p" != "$own_port" ]; then
-                err "端口 ${p} 已被系统其他程序占用，请更换其他端口"
+                err "端口 ${p} 已被系统外部程序占用，请更换其他端口"
                 continue
             fi
         fi
@@ -162,9 +169,9 @@ ask_port() {
 }
 
 rand_port() {
-    local p
+    local proto="${1:-tcp}" p
     while p=$((RANDOM % 55535 + 10000)); do
-        is_port_used "$p" || { echo "$p"; break; }
+        is_port_used "$p" "$proto" || { echo "$p"; break; }
     done
 }
 
@@ -391,11 +398,18 @@ apply_config_test() {
     is_running && was_online=true
 
     # 防线 A: 全局端口防冲突断言 (Xray run -test 不校验端口重复绑定，必须严格把关)
+    # 全局传输层冲突断言 (仅当端口相同且同为 TCP 或同为 UDP 时才判定冲突)
     local dup_port
-    dup_port=$(jq -r '[.inbounds[].port] | group_by(.) | map(select(length > 1)) | .[0][0] // empty' "$tmp_cfg" 2>/dev/null)
+    dup_port=$(jq -r '
+        def inb_type: if .protocol == "hysteria" then "udp" elif .protocol == "shadowsocks" then "both" else "tcp" end;
+        [.inbounds | to_entries[] | {idx: .key, port: .value.port, type: (.value | inb_type)}] as $items |
+        $items[] as $a | $items[] as $b |
+        select($a.idx < $b.idx and $a.port == $b.port and ($a.type == "both" or $b.type == "both" or $a.type == $b.type)) |
+        $a.port
+    ' "$tmp_cfg" 2>/dev/null | head -n1)
     if [ -n "$dup_port" ]; then
         rm -f "$tmp_cfg"
-        err "配置冲突: 端口 ${dup_port} 在多个节点中重复绑定，已取消更改"
+        err "配置冲突: 端口 ${dup_port} 在同协议族多个节点中重复绑定，已取消更改"
         return 1
     fi
 
@@ -476,15 +490,19 @@ build_link() {
     jq -r --arg host "$host" '
         .protocol as $p | .port as $port | (.tag // "node") as $tag | (._meta // {}) as $m |
         if $p == "vless" then
-            if ($m.trans // "raw") == "xhttp" then
-                "vless://" + ($m.uid // "") + "@" + $host + ":" + ($port|tostring) + "?security=reality&encryption=none&pbk=" + ($m.pbk // "") + "&headerType=none&type=xhttp&path=" + (($m.path // "/xhttp")|@uri) + "&mode=auto&sni=" + ($m.sni // "www.nvidia.com") + "&sid=" + ($m.sid // "") + "#" + $tag
+            (.settings.clients[0].id // $m.uid // "") as $uid |
+            (.streamSettings.realitySettings.shortIds[0] // $m.sid // "") as $sid |
+            (.streamSettings.realitySettings.serverNames[0] // $m.sni // "www.nvidia.com") as $sni |
+            ($m.pbk // "") as $pbk |
+            if (.streamSettings.network // $m.trans // "raw") == "xhttp" then
+                "vless://" + $uid + "@" + $host + ":" + ($port|tostring) + "?security=reality&encryption=none&pbk=" + $pbk + "&headerType=none&type=xhttp&path=" + ((.streamSettings.xhttpSettings.path // $m.path // "/xhttp")|@uri) + "&mode=auto&sni=" + $sni + "&sid=" + $sid + "#" + $tag
             else
-                "vless://" + ($m.uid // "") + "@" + $host + ":" + ($port|tostring) + "?security=reality&encryption=none&pbk=" + ($m.pbk // "") + "&headerType=none&type=raw&flow=" + ($m.flow // "xtls-rprx-vision") + "&sni=" + ($m.sni // "www.nvidia.com") + "&sid=" + ($m.sid // "") + "#" + $tag
+                "vless://" + $uid + "@" + $host + ":" + ($port|tostring) + "?security=reality&encryption=none&pbk=" + $pbk + "&headerType=none&type=raw&flow=" + (.settings.clients[0].flow // $m.flow // "xtls-rprx-vision") + "&sni=" + $sni + "&sid=" + $sid + "#" + $tag
             end
-        elif $p == "trojan" then "trojan://" + ($m.pass // "") + "@" + $host + ":" + ($port|tostring) + "?security=tls&allowInsecure=1&sni=" + ($m.sni // "www.nvidia.com") + "#" + $tag
-        elif $p == "hysteria" then "hysteria2://" + ($m.pass // "") + "@" + $host + ":" + ($port|tostring) + "/?insecure=1&sni=" + ($m.sni // "www.nvidia.com") + "#" + $tag
-        elif $p == "shadowsocks" then "ss://" + ((($m.method // "2022-blake3-aes-128-gcm") + ":" + ($m.pass // ""))|@base64) + "@" + $host + ":" + ($port|tostring) + "#" + $tag
-        elif $p == "vmess" then "vmess://" + ({v:"2",ps:$tag,add:$host,port:($port|tonumber),id:($m.uid // ""),aid:0,net:"ws",type:"none",host:"",path:($m.path // "/ws"),tls:""}|tojson|@base64)
+        elif $p == "trojan" then "trojan://" + (.settings.clients[0].password // $m.pass // "") + "@" + $host + ":" + ($port|tostring) + "?security=tls&allowInsecure=1&sni=" + (.streamSettings.tlsSettings.serverName // $m.sni // "www.nvidia.com") + "#" + $tag
+        elif $p == "hysteria" then "hysteria2://" + (.settings.users[0].auth // $m.pass // "") + "@" + $host + ":" + ($port|tostring) + "/?insecure=1&sni=" + ($m.sni // "www.nvidia.com") + "#" + $tag
+        elif $p == "shadowsocks" then "ss://" + (((.settings.method // $m.method // "2022-blake3-aes-128-gcm") + ":" + (.settings.password // $m.pass // ""))|@base64) + "@" + $host + ":" + ($port|tostring) + "#" + $tag
+        elif $p == "vmess" then "vmess://" + ({v:"2",ps:$tag,add:$host,port:($port|tonumber),id:(.settings.clients[0].id // $m.uid // ""),aid:0,net:"ws",type:"none",host:"",path:(.streamSettings.wsSettings.path // $m.path // "/ws"),tls:""}|tojson|@base64)
         else empty end
     ' <<< "$target"
 }
@@ -517,10 +535,12 @@ add_node() {
 
     local choice; choice=$(ask "选择协议 [1-5]" "1")
     local def_ports=("" "443" "8443" "443" "8388" "80")
+    local def_protos=("" "tcp" "udp" "tcp" "both" "tcp")
     local def_p="${def_ports[$choice]:-}"
+    local cur_proto_type="${def_protos[$choice]:-tcp}"
     [ -z "$def_p" ] && { err "无效选项"; return 1; }
-    is_port_used "$def_p" && def_p=$(rand_port)
-    local port; port=$(ask_port "监听端口" "$def_p")
+    is_port_used "$def_p" "$cur_proto_type" && def_p=$(rand_port "$cur_proto_type")
+    local port; port=$(ask_port "监听端口" "$def_p" "" "$cur_proto_type")
     local inb_data="" remark=""
 
     case "$choice" in
@@ -553,7 +573,7 @@ add_node() {
             local pass; pass=$(ask "认证密码" "$(openssl rand -hex 8)")
             remark="Hy2-${port}"
             inb_data=$(jq -n --arg port "$port" --arg pass "$pass" --arg crt "$CERTS_DIR/cert.crt" --arg key "$CERTS_DIR/priv.key" --arg sni "$sni" --arg rmk "$remark" \
-                '{listen:"::",port:($port|tonumber),protocol:"hysteria",tag:$rmk,settings:{version:2,users:[{auth:$pass}]},streamSettings:{network:"hysteria",hysteriaSettings:{version:2},security:"tls",tlsSettings:{certificates:[{certificateFile:$crt,keyFile:$key}],alpn:["h3"]}},_meta:{proto:"hysteria",pass:$pass,sni:$sni}}')
+                '{listen:"::",port:($port|tonumber),protocol:"hysteria",tag:$rmk,settings:{version:2,users:[{auth:$pass}]},streamSettings:{network:"hysteria",security:"tls",tlsSettings:{certificates:[{certificateFile:$crt,keyFile:$key}],alpn:["h3"]}},_meta:{proto:"hysteria",pass:$pass,sni:$sni}}')
             ;;
 
         3) # Trojan-TLS
@@ -613,7 +633,10 @@ edit_node() {
 
     echo ""
     info "正在修改节点 [${sel}] (${cur_proto}/${cur_trans}):"
-    new_port=$(ask_port "监听端口" "$cur_port" "$sel")
+    local inb_proto="tcp"
+    [ "$cur_proto" = "hysteria" ] && inb_proto="udp"
+    [ "$cur_proto" = "shadowsocks" ] && inb_proto="both"
+    new_port=$(ask_port "监听端口" "$cur_port" "$sel" "$inb_proto")
     new_inb=$(jq --arg port "$new_port" '.port = ($port|tonumber) | .tag = (.tag | sub("-[0-9]+$"; "-" + $port))' <<< "$target")
 
     case "$cur_proto" in
@@ -623,16 +646,18 @@ edit_node() {
             if [ "$cur_trans" = "xhttp" ]; then
                 local cur_path; cur_path=$(jq -r '.path // "/xhttp"' <<< "$meta")
                 local new_path; new_path=$(ask "XHTTP 路径" "$cur_path")
-                new_inb=$(jq --arg sni "$new_sni" --arg path "$new_path"                     '.streamSettings.realitySettings.serverNames = [$sni] | .streamSettings.realitySettings.dest = ($sni + ":443") | .streamSettings.xhttpSettings.path = $path | .streamSettings.xhttpSettings.host = $sni | ._meta.sni = $sni | ._meta.path = $path' <<< "$new_inb")
+                new_inb=$(jq --arg sni "$new_sni" --arg path "$new_path" \
+                    '.streamSettings.realitySettings.serverNames = [$sni] | .streamSettings.realitySettings.dest = ($sni + ":443") | .streamSettings.xhttpSettings.path = $path | .streamSettings.xhttpSettings.host = $sni | ._meta.sni = $sni | ._meta.path = $path' <<< "$new_inb")
             else
-                new_inb=$(jq --arg sni "$new_sni"                     '.streamSettings.realitySettings.serverNames = [$sni] | .streamSettings.realitySettings.dest = ($sni + ":443") | ._meta.sni = $sni' <<< "$new_inb")
+                new_inb=$(jq --arg sni "$new_sni" \
+                    '.streamSettings.realitySettings.serverNames = [$sni] | .streamSettings.realitySettings.dest = ($sni + ":443") | ._meta.sni = $sni' <<< "$new_inb")
             fi
             ;;
         trojan)
             local cur_sni; cur_sni=$(jq -r '.sni // "www.nvidia.com"' <<< "$meta")
             local new_sni; new_sni=$(ask "伪装域名" "$cur_sni")
             ensure_self_cert "$new_sni"
-            new_inb=$(jq --arg sni "$new_sni"                 '.streamSettings.tlsSettings.serverName = $sni | ._meta.sni = $sni' <<< "$new_inb")
+            new_inb=$(jq --arg sni "$new_sni" '.streamSettings.tlsSettings.serverName = $sni | ._meta.sni = $sni' <<< "$new_inb")
             ;;
         hysteria)
             local cur_pass; cur_pass=$(jq -r '.pass // ""' <<< "$meta")
@@ -640,7 +665,7 @@ edit_node() {
             local cur_sni; cur_sni=$(jq -r '.sni // "www.nvidia.com"' <<< "$meta")
             local new_sni; new_sni=$(ask "伪装域名 (SNI)" "$cur_sni")
             ensure_self_cert "$new_sni"
-            new_inb=$(jq --arg pass "$new_pass" --arg sni "$new_sni"                 '.settings.users[0].auth = $pass | ._meta.pass = $pass | ._meta.sni = $sni' <<< "$new_inb")
+            new_inb=$(jq --arg pass "$new_pass" --arg sni "$new_sni" '.settings.users[0].auth = $pass | ._meta.pass = $pass | ._meta.sni = $sni' <<< "$new_inb")
             ;;
         shadowsocks)
             local cur_pass; cur_pass=$(jq -r '.pass // ""' <<< "$meta")
