@@ -491,25 +491,47 @@ render_node_table() {
     local count; count=$(jq '.inbounds | length' "$CONF" 2>/dev/null || echo 0)
     [ "$count" -eq 0 ] && { echo -e "${C_DIM}(暂无任何配置的入站节点)${C_RESET}"; return 0; }
 
-    echo -e "${C_DIM}序号  协议类型            端口     传输     别名 / 目标${C_RESET}"
+    echo -e "${C_DIM}序号  协议              端口    传输     别名             伪装目标 / 路径${C_RESET}"
     draw_line "-" "${C_DIM}"
     jq -c '.inbounds | to_entries[]' "$CONF" 2>/dev/null | while read -r item; do
-        local idx port proto net tag target_desc proto_label
+        local idx port proto net tag target_desc proto_label trans_label
         idx=$(jq -r '.key' <<< "$item")
         port=$(jq -r '.value.port' <<< "$item")
         proto=$(jq -r '.value.protocol' <<< "$item")
         net=$(jq -r '.value.streamSettings.network // "tcp"' <<< "$item")
         tag=$(jq -r '.value.tag // "node"' <<< "$item")
-        proto_label="$proto"
+        trans_label="${net^^}"
         case "$proto" in
-            vless)       [ "$net" = "xhttp" ] && proto_label="VLESS (XHTTP)" || proto_label="VLESS (Vision)"; target_desc=$(jq -r '.value.streamSettings.realitySettings.serverNames[0] // "-"' <<< "$item") ;;
-            hysteria)    proto_label="Hysteria 2"; net="udp/h3"; target_desc=$(jq -r '.value._meta.sni // "自签TLS"' <<< "$item") ;;
-            trojan)      proto_label="Trojan"; target_desc=$(jq -r '.value.streamSettings.tlsSettings.serverName // "-"' <<< "$item") ;;
-            shadowsocks) proto_label="Shadowsocks"; net="tcp,udp"; target_desc="2022-blake3" ;;
-            vmess)       proto_label="VMess (WS)"; target_desc=$(jq -r '.value.streamSettings.wsSettings.path // "/ws"' <<< "$item") ;;
-            *)           target_desc="-" ;;
+            vless)
+                if [ "$net" = "xhttp" ]; then proto_label="VLESS-XHTTP"; else proto_label="VLESS-Vision"; fi
+                target_desc=$(jq -r '.value.streamSettings.realitySettings.serverNames[0] // "-"' <<< "$item")
+                ;;
+            hysteria)
+                proto_label="Hysteria 2"
+                trans_label="UDP/H3"
+                target_desc=$(jq -r '.value._meta.sni // "自签TLS"' <<< "$item")
+                ;;
+            trojan)
+                proto_label="Trojan-TLS"
+                target_desc=$(jq -r '.value.streamSettings.tlsSettings.serverName // "-"' <<< "$item")
+                ;;
+            shadowsocks)
+                proto_label="Shadowsocks"
+                trans_label="TCP,UDP"
+                target_desc="2022-blake3"
+                ;;
+            vmess)
+                proto_label="VMess-WS"
+                trans_label="WS"
+                target_desc=$(jq -r '.value.streamSettings.wsSettings.path // "/ws"' <<< "$item")
+                ;;
+            *)
+                proto_label="$proto"
+                target_desc="-"
+                ;;
         esac
-        printf "%02d    %-18b  ${C_YELLOW}%-7s${C_RESET}  %-7s  %s ${C_DIM}(%s)${C_RESET}\n" "$idx" "$proto_label" "$port" "$net" "$tag" "$target_desc"
+        printf "${C_CYAN}%02d${C_RESET}    %-16s  ${C_YELLOW}%-6s${C_RESET}  %-8s %-16s ${C_DIM}%s${C_RESET}\n" \
+            "$idx" "$proto_label" "$port" "$trans_label" "$tag" "$target_desc"
     done
     draw_line "-" "${C_DIM}"
 }
@@ -896,14 +918,18 @@ ${C_BOLD}Xray Core${C_RESET} ${C_CYAN}${ver}${C_RESET}${update_hint} ${st_badge}
 节点: ${node_cnt} 个 | 网络: ${ip_summary}"
         draw_line "-"
         printf "%b\n" "\
+${C_BOLD}[节点配置]${C_RESET}
 ${C_CYAN}1.${C_RESET} 节点列表
 ${C_CYAN}2.${C_RESET} 添加节点
 ${C_CYAN}3.${C_RESET} 修改节点
 ${C_CYAN}4.${C_RESET} 删除节点
+
+${C_BOLD}[服务与系统]${C_RESET}
 ${C_CYAN}5.${C_RESET} 服务管理
-${C_CYAN}6.${C_RESET} BBR 加速
-${C_CYAN}7.${C_RESET} $([ "$ver" = "未安装" ] && echo "安装核心" || echo "核心更新")
-${C_RED}8.${C_RESET} 卸载清除
+${C_CYAN}6.${C_RESET} $([ "$ver" = "未安装" ] && echo "安装核心" || echo "核心更新")
+${C_CYAN}7.${C_RESET} BBR 加速
+${C_RED}8.${C_RESET} 彻底卸载
+
 ${C_DIM}0. 退出面板${C_RESET}"
         draw_line "-"
 
@@ -913,8 +939,8 @@ ${C_DIM}0. 退出面板${C_RESET}"
             3) edit_node ;;
             4) delete_node ;;
             5) manage_service ;;
-            6) enable_bbr; sleep 1 ;;
-            7) install_core ;;
+            6) install_core ;;
+            7) enable_bbr; sleep 1 ;;
             8) uninstall_xray ;;
             0|q|quit)
                 clear 2>/dev/null || true
