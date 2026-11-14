@@ -629,10 +629,10 @@ add_node() {
     echo -e "${C_CYAN}3.${C_RESET} Trojan-TLS (自签证书)"
     echo -e "${C_CYAN}4.${C_RESET} Shadowsocks (2022-blake3)"
     echo -e "${C_CYAN}5.${C_RESET} VMess-WS (WebSocket)"
-    echo -e "${C_DIM}0. 取消返回${C_RESET}"
+    echo -e "${C_DIM}0. 返回菜单${C_RESET}"
     draw_line "-"
 
-    local choice; choice=$(ask "选择协议 [1-5]" "1")
+    local choice; choice=$(ask "选择协议 [1-5]" "0")
     [ "$choice" = "0" ] && return 0
 
     local def_ports=("" "443" "8443" "443" "8388" "80")
@@ -701,7 +701,7 @@ edit_node() {
     render_node_table
     echo ""
 
-    local sel; sel=$(ask "输入要修改的节点序号 (直接回车取消)" "")
+    local sel; sel=$(ask "输入要修改的节点序号 (直接回车返回菜单)" "")
     [ -z "$sel" ] && return 0
     [[ ! "$sel" =~ ^[0-9]+$ ]] && { err "序号须为纯数字"; sleep 1; return 1; }
 
@@ -772,7 +772,7 @@ delete_node() {
     render_node_table
     echo ""
 
-    local sel; sel=$(ask "输入要删除的节点序号 (直接回车取消)" "")
+    local sel; sel=$(ask "输入要删除的节点序号 (直接回车返回菜单)" "")
     [ -z "$sel" ] && return 0
     [[ ! "$sel" =~ ^[0-9]+$ ]] && { err "序号须为纯数字"; sleep 1; return 1; }
 
@@ -796,7 +796,7 @@ show_nodes() {
     render_node_table
 
     echo ""
-    local opt; opt=$(ask "输入序号查看链接 (sub 导出订阅, 回车返回)" "")
+    local opt; opt=$(ask "输入序号查看链接 (sub 导出订阅, 回车返回菜单)" "")
     [ -z "$opt" ] && return 0
 
     if [ "$opt" = "sub" ]; then
