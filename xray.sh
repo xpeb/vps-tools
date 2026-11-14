@@ -358,7 +358,6 @@ EOF
 # 3. 核心安装与证书生成
 # ------------------------------------------------------------------------------
 install_core() {
-    echo ""
     info "查询 Xray 最新版本..."
     local ver cur_ver; ver=$(latest_ver); cur_ver=$(cur_core_ver)
 
@@ -390,7 +389,8 @@ install_core() {
     init_env; install_service
     echo "${ver#v}" > "$VER_CACHE" 2>/dev/null || true
     [ "$was_running" = "true" ] && svc start
-    echo ""; ok "Xray 核心已成功就绪 (${ver})"
+    ok "Xray 核心已成功就绪 (${ver})"
+    sleep 1
 }
 
 ensure_self_cert() {
@@ -597,7 +597,7 @@ export_subscription() {
 # 6. 入站节点增删改 (极简直觉流)
 # ------------------------------------------------------------------------------
 add_node() {
-    [ ! -f "$BIN" ] && { err "请先安装 Xray 核心 (菜单 7)"; pause_tip; return 1; }
+    [ ! -f "$BIN" ] && { err "请先安装 Xray 核心 (菜单 7)"; sleep 1.2; return 1; }
     init_env
 
     echo -e "\n${C_BOLD}添加节点 - 选择协议${C_RESET}"
@@ -616,7 +616,7 @@ add_node() {
     local def_ports=("" "443" "8443" "443" "8388" "80")
     local def_protos=("" "tcp" "udp" "tcp" "both" "tcp")
     local def_p="${def_ports[$choice]:-}" cur_proto_type="${def_protos[$choice]:-tcp}"
-    [ -z "$def_p" ] && { err "无效选择"; pause_tip; return 1; }
+    [ -z "$def_p" ] && { err "无效选择"; sleep 1; return 1; }
 
     is_port_used "$def_p" "$cur_proto_type" && def_p=$(rand_port "$cur_proto_type")
     local port; port=$(ask_port "监听端口" "$def_p" "" "$cur_proto_type")
@@ -671,9 +671,9 @@ add_node() {
 }
 
 edit_node() {
-    [ ! -f "$CONF" ] && { err "配置文件不存在"; pause_tip; return 1; }
+    [ ! -f "$CONF" ] && { err "配置文件不存在"; sleep 1; return 1; }
     local count; count=$(jq '.inbounds | length' "$CONF" 2>/dev/null || echo 0)
-    [ "$count" -eq 0 ] && { info "当前暂无配置节点可修改"; pause_tip; return 0; }
+    [ "$count" -eq 0 ] && { info "当前暂无配置节点可修改"; sleep 1; return 0; }
 
     echo -e "\n${C_BOLD}修改节点${C_RESET}"
     render_node_table
@@ -681,10 +681,10 @@ edit_node() {
 
     local sel; sel=$(ask "输入要修改的节点序号 (直接回车取消)" "")
     [ -z "$sel" ] && return 0
-    [[ ! "$sel" =~ ^[0-9]+$ ]] && { err "序号须为纯数字"; pause_tip; return 1; }
+    [[ ! "$sel" =~ ^[0-9]+$ ]] && { err "序号须为纯数字"; sleep 1; return 1; }
 
     local target; target=$(jq -c --argjson i "$sel" '.inbounds[$i] // empty' "$CONF" 2>/dev/null)
-    [ -z "$target" ] && { err "序号不存在"; pause_tip; return 1; }
+    [ -z "$target" ] && { err "序号不存在"; sleep 1; return 1; }
 
     local cur_port cur_proto cur_tag meta
     read -r cur_port cur_proto _ cur_tag <<< "$(jq -r '[.port, .protocol, (.streamSettings.network // "tcp"), (.tag // "node")] | @tsv' <<< "$target")"
@@ -736,13 +736,15 @@ edit_node() {
     esac
 
     # shellcheck disable=SC2016
-    mutate_config '.inbounds[$i] = $inb' --argjson i "$sel" --argjson inb "$new_inb" && ok "节点 [${sel}] 配置已更新生效"
-    pause_tip
+    if mutate_config '.inbounds[$i] = $inb' --argjson i "$sel" --argjson inb "$new_inb"; then
+        ok "节点 [${sel}] 配置已更新生效"
+        sleep 1
+    fi
 }
 
 delete_node() {
     local count; count=$(jq '.inbounds | length' "$CONF" 2>/dev/null || echo 0)
-    [ "$count" -eq 0 ] && { info "当前暂无配置节点可删除"; pause_tip; return 0; }
+    [ "$count" -eq 0 ] && { info "当前暂无配置节点可删除"; sleep 1; return 0; }
 
     echo -e "\n${C_BOLD}删除节点${C_RESET}"
     render_node_table
@@ -750,36 +752,43 @@ delete_node() {
 
     local sel; sel=$(ask "输入要删除的节点序号 (直接回车取消)" "")
     [ -z "$sel" ] && return 0
-    [[ ! "$sel" =~ ^[0-9]+$ ]] && { err "序号须为纯数字"; pause_tip; return 1; }
+    [[ ! "$sel" =~ ^[0-9]+$ ]] && { err "序号须为纯数字"; sleep 1; return 1; }
 
     local tag; tag=$(jq -r --argjson i "$sel" '.inbounds[$i].tag // empty' "$CONF" 2>/dev/null)
-    [ -z "$tag" ] && { err "序号不存在"; pause_tip; return 1; }
+    [ -z "$tag" ] && { err "序号不存在"; sleep 1; return 1; }
 
-    [[ "$(ask "确认删除节点 [${sel}] (${tag})？[y/N]" "n")" =~ ^[Yy]$ ]] || { info "已取消删除"; pause_tip; return 0; }
+    [[ "$(ask "确认删除节点 [${sel}] (${tag})？[y/N]" "n")" =~ ^[Yy]$ ]] || { info "已取消删除"; sleep 0.8; return 0; }
     # shellcheck disable=SC2016
-    mutate_config 'del(.inbounds[$i])' --argjson i "$sel" && ok "节点 [${sel}] (${tag}) 已删除"
-    pause_tip
+    if mutate_config 'del(.inbounds[$i])' --argjson i "$sel"; then
+        ok "节点 [${sel}] (${tag}) 已删除"
+        sleep 1
+    fi
 }
 
 show_nodes() {
-    [ ! -f "$CONF" ] && { err "配置文件不存在"; pause_tip; return 1; }
+    [ ! -f "$CONF" ] && { err "配置文件不存在"; sleep 1; return 1; }
     local count; count=$(jq '.inbounds | length' "$CONF" 2>/dev/null || echo 0)
+    [ "$count" -eq 0 ] && { info "当前暂无配置节点"; sleep 1; return 0; }
 
     echo -e "\n${C_BOLD}[节点列表] 共 ${count} 个节点${C_RESET}"
     render_node_table
-    [ "$count" -eq 0 ] && { pause_tip; return 0; }
 
     echo ""
     local opt; opt=$(ask "输入序号查看链接 (sub 导出订阅, 回车返回)" "")
     [ -z "$opt" ] && return 0
 
     if [ "$opt" = "sub" ]; then
-        export_subscription; pause_tip
+        export_subscription
+        pause_tip
     elif [[ "$opt" =~ ^[0-9]+$ ]] && [ "$opt" -lt "$count" ]; then
         local target; target=$(jq -c --argjson i "$opt" '.inbounds[$i] // empty' "$CONF" 2>/dev/null)
-        [ -n "$target" ] && { print_node_card "$target" "节点详细信息"; pause_tip; }
+        if [ -n "$target" ]; then
+            print_node_card "$target" "节点详细信息"
+            pause_tip
+        fi
     else
-        err "无效序号: ${opt}"; pause_tip
+        err "无效序号: ${opt}"
+        sleep 1
     fi
 }
 
@@ -799,18 +808,18 @@ manage_service() {
     echo -e "${C_DIM}0. 返回菜单${C_RESET}"
     draw_line "-"
 
-    case "$(ask "请选择操作" "1")" in
+    case "$(ask "请选择操作" "0")" in
         1)
             if svc restart; then ok "服务已重启"; else err "重启失败，请检查日志"; fi
-            pause_tip
+            sleep 0.8
             ;;
         2)
             if svc stop; then ok "服务已停止"; else err "停止失败"; fi
-            pause_tip
+            sleep 0.8
             ;;
         3)
             if svc start; then ok "服务已启动"; else err "启动失败，请检查端口与日志"; fi
-            pause_tip
+            sleep 0.8
             ;;
         4)
             if [ -f /var/log/xray/error.log ]; then
@@ -818,7 +827,7 @@ manage_service() {
             elif command -v journalctl >/dev/null 2>&1; then
                 info "Ctrl+C 退出日志监控"; journalctl -u xray -f -n 40
             else
-                warn "未发现日志文件"; pause_tip
+                warn "未发现日志文件"; sleep 1
             fi
             ;;
         *) return 0 ;;
@@ -845,7 +854,7 @@ uninstall_xray() {
     rm -rf "$BIN" "/usr/local/bin/xraym" "$CONF_DIR" "/usr/local/share/xray" "/var/log/xray" "/run/xray.pid"
     userdel -r xray 2>/dev/null || deluser xray 2>/dev/null || true
 
-    echo ""; ok "Xray 环境已彻底卸载清除"; exit 0
+    ok "Xray 环境已彻底卸载清除"; exit 0
 }
 
 # ------------------------------------------------------------------------------
@@ -904,8 +913,8 @@ ${C_DIM}0. 退出面板${C_RESET}"
             3) edit_node ;;
             4) delete_node ;;
             5) manage_service ;;
-            6) enable_bbr; pause_tip ;;
-            7) install_core; pause_tip ;;
+            6) enable_bbr; sleep 1 ;;
+            7) install_core ;;
             8) uninstall_xray ;;
             0|q|quit)
                 clear 2>/dev/null || true
